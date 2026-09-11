@@ -86,14 +86,16 @@ config RING_WATCHDOG_TIMEOUT_MS
 	range 1000 100000
 	depends on RING_WATCHDOG
 	help
-	  Must comfortably exceed the longest blocking path in one pass of
-	  the main loop. The audit lives next to the feed call in main.c --
-	  update it there if you add a blocking call, because exceeding this
-	  reboots a working board.
+	  Must comfortably exceed the longest span between two
+	  ring_wdt_feed() calls, because exceeding it reboots a board that
+	  is merely slow.
 
-	  Worst case measured by inspection is about 4.2 s (a 3 s charger
-	  LED indication plus a 0.8 s GSR settle in the same pass), so the
-	  10 s default leaves roughly 2.4x margin.
+	  THE AUDIT LIVES BESIDE THE FEED CALL IN main.c, and that is the
+	  only copy. A duplicate of the numbers used to sit here and went
+	  stale immediately: it counted only the k_msleep() delays, missed
+	  that a stalled I2C bus costs 500 ms per transaction, and claimed
+	  a margin that did not exist. Read main.c rather than trusting a
+	  figure quoted here.
 
 endmenu
 
