@@ -124,6 +124,21 @@ static uint32_t samples[FIFO_DEPTH];
 /* Cleared when the PPG stops answering, so ppg_on() knows to re-probe. */
 static bool ppg_present;
 
+/*
+ * Consecutive failed FIFO reads.
+ *
+ * A part that wedged after a successful boot probe used to log an error
+ * forever: ppg_present stayed true, so ppg_on() never re-probed and
+ * RING_FLAG_PPG_OK never cleared, and the app was told the sensor was
+ * healthy. Only a reset recovered it -- and a part wedging mid-run is the
+ * failure this board actually shows, see POSTMORTEM.md.
+ *
+ * Five in a row at the 20 ms poll interval is a tenth of a second: short
+ * enough to recover quickly, long enough not to fire on one bad read.
+ */
+static uint8_t ppg_fail_count;
+#define PPG_FAIL_LIMIT		5
+
 static enum ring_state state = RING_IDLE;
 static uint32_t measure_window_ms = MEASURE_WINDOW_MS;
 static uint32_t measure_period_ms = MEASURE_PERIOD_MS;
@@ -257,12 +272,23 @@ static void report(uint32_t raw)
  * Boot used to sit here for up to 30 s (60 attempts, 500 ms apart) before
  * anything else ran, including BLE. A sensor that is absent at boot is now
  * simply recorded as absent and retried when it is actually needed.
+ *
+ * Feeds the watchdog per attempt, and that is not cheating: the loop is
+ * bounded and making definite progress. It is slow for a specific reason --
+ * every failing I2C transaction costs CONFIG_I2C_NRFX_TRANSFER_TIMEOUT
+ * (500 ms), and one maxm86161_probe() can issue eight of them across its two
+ * candidate addresses, so roughly 4 s per attempt on a stalled bus. Without a
+ * feed here the watchdog would reset the board from inside the routine that
+ * exists to recover it.
  */
 static int ppg_probe(int attempts, int gap_ms)
 {
 	for (int i = 1; i <= attempts; i++) {
+		ring_wdt_feed();
+
 		if (maxm86161_probe(&ppg, I2C_BUS) == 0) {
 			ppg_present = true;
+			ppg_fail_count = 0;
 			subsystem_flags |= RING_FLAG_PPG_OK;
 			return 0;
 		}
@@ -271,6 +297,7 @@ static int ppg_probe(int attempts, int gap_ms)
 		}
 	}
 
+	ring_wdt_feed();
 	ppg_present = false;
 	subsystem_flags &= ~RING_FLAG_PPG_OK;
 	return -ENODEV;
@@ -289,10 +316,14 @@ static int ppg_on(void)
 
 	/*
 	 * Give a missing sensor another chance now that it is actually needed.
-	 * This also recovers a part that was wedged when the board booted --
-	 * previously that state persisted until the next reset.
+	 * With ppg_fail_count this also covers a part that wedged mid-run, not
+	 * just one that was already dead at boot.
+	 *
+	 * ONE attempt, not two. On a stalled bus each attempt costs up to 4 s in
+	 * I2C timeouts, and retrying 50 ms after eight consecutive timeouts tells
+	 * you nothing the next measurement window will not.
 	 */
-	if (!ppg_present && ppg_probe(2, 50) != 0) {
+	if (!ppg_present && ppg_probe(1, 0) != 0) {
 		(void)regulator_disable(VLED_BOOST);
 		return -ENODEV;
 	}
@@ -528,25 +559,33 @@ int main(void)
 		int64_t now = k_uptime_get();
 
 		/*
-		 * Fed here and nowhere else. Feeding from a timer or a separate
-		 * thread would keep the board alive while this loop was wedged,
-		 * which is precisely the failure it exists to catch.
+		 * Fed from this loop only -- never from a timer or a separate
+		 * thread, which would keep the board alive while this loop was
+		 * wedged, precisely the failure the watchdog exists to catch.
 		 *
 		 * BLOCKING AUDIT -- keep this current, because exceeding the
-		 * timeout reboots a working board.
+		 * timeout reboots a board that is merely slow.
 		 *
-		 * The two long paths are mutually exclusive. maxm86161_indicate()
-		 * blocks 3 s, but only on the pass that enters RING_CHARGING, and
-		 * slow_sense() is gated on state != RING_CHARGING, so its 800 ms
-		 * GSR settle cannot land in that same pass.
+		 * What dominates is NOT the k_msleep() calls, it is I2C timeouts:
+		 * CONFIG_I2C_NRFX_TRANSFER_TIMEOUT is 500 ms and every transaction
+		 * on a stalled bus costs the full amount. An earlier version of
+		 * this comment counted only the sleeps, concluded "3x margin", and
+		 * missed that one pass could reach ~10 s.
 		 *
-		 *   charger attach : ~55 ms pmic + 3000 ms indicate + ~50 ms = 3.1 s
-		 *   ordinary pass  : ~55 ms pmic + ~900 ms slow_sense      = 1.0 s
-		 *   measuring      : FIFO read, filters, notifies          < 50 ms
+		 * Feed points, so the longest UN-FED span is what matters:
+		 *   here, at the top of every pass
+		 *   after the charger block  (it holds the 3 s LED indication)
+		 *   after slow_sense()       (~1.3 s: battery reads + GSR settle)
+		 *   inside ppg_probe(), per attempt (~4 s each on a stalled bus)
 		 *
-		 * Worst case ~3.1 s against a 10 s budget, so roughly 3x margin.
-		 * Add a longer blocking call and raise
-		 * CONFIG_RING_WATCHDOG_TIMEOUT_MS with it.
+		 * Longest un-fed span, stalled bus:
+		 *   charger attach  : ~0.5 s pmic + 3.0 s indicate        = 3.5 s
+		 *   window opening  : ~0.5 s imu + 4.0 s one probe attempt = 4.5 s
+		 *   measuring       : FIFO read, filters, notifies        < 0.1 s
+		 *
+		 * ~4.5 s against the 10 s budget. Add a blocking call longer than
+		 * the remaining margin and either add a feed beside it or raise
+		 * CONFIG_RING_WATCHDOG_TIMEOUT_MS.
 		 */
 		ring_wdt_feed();
 
@@ -557,48 +596,73 @@ int main(void)
 
 			next_pmic = now + PMIC_POLL_MS;
 
-			/*
-			 * Report what is actually true. This flag used to be
-			 * set unconditionally, right next to a call whose only
-			 * return value was "charging" -- so an unreachable PMIC
-			 * and a healthy battery-powered board both came out as
-			 * "PMIC OK, not charging" and the app believed it.
-			 */
-			if (pmic_rc == 0) {
-				subsystem_flags |= RING_FLAG_PMIC_OK;
-			} else {
+			if (pmic_rc != 0) {
+				/*
+				 * Unreachable. Report it and change nothing else.
+				 *
+				 * `charging` is still its false initialiser here,
+				 * and acting on that reads as "charger removed":
+				 * the ring would leave RING_CHARGING and start the
+				 * PPG and the 5 V boost while still sitting on a
+				 * 20 mA charger -- the one thing that state exists
+				 * to prevent. A single transient -116 on this
+				 * board's bus was enough to trigger it.
+				 *
+				 * A value that could not be read must not move the
+				 * state machine.
+				 */
 				subsystem_flags &= ~RING_FLAG_PMIC_OK;
-			}
+			} else {
+				/*
+				 * Report what is actually true. This flag used to
+				 * be set unconditionally, right next to a call
+				 * whose only return value was "charging" -- so an
+				 * unreachable PMIC and a healthy battery-powered
+				 * board both came out as "PMIC OK, not charging"
+				 * and the app believed it.
+				 */
+				subsystem_flags |= RING_FLAG_PMIC_OK;
 
-			if (charging && state != RING_CHARGING) {
-				if (state == RING_MEASURING) {
-					ppg_off();
-				}
-				LOG_INF("state -> %s", state_name[RING_CHARGING]);
-				(void)regulator_enable(VLED_BOOST);
-				k_msleep(20);
-				(void)maxm86161_indicate(&ppg, LEDC_LED3, 3000);
-				(void)regulator_disable(VLED_BOOST);
+				if (charging && state != RING_CHARGING) {
+					if (state == RING_MEASURING) {
+						ppg_off();
+					}
+					LOG_INF("state -> %s",
+						state_name[RING_CHARGING]);
+					(void)regulator_enable(VLED_BOOST);
+					k_msleep(20);
+					(void)maxm86161_indicate(&ppg, LEDC_LED3,
+								3000);
+					(void)regulator_disable(VLED_BOOST);
 #if BENCH_POWER_LED
-				/* indicate() ends in leds_off; put green back. */
-				(void)maxm86161_led_solid(&ppg, LEDC_LED1,
-							 BENCH_LED_PA);
+					/* indicate() ends in leds_off; relight. */
+					(void)maxm86161_led_solid(&ppg, LEDC_LED1,
+								 BENCH_LED_PA);
 #endif
-				state = RING_CHARGING;
-				publish_status();
-			} else if (!charging && state == RING_CHARGING) {
-				LOG_INF("state -> %s", state_name[RING_IDLE]);
-				state = RING_IDLE;
-				next_window = now;
-				publish_status();
+					state = RING_CHARGING;
+					publish_status();
+				} else if (!charging &&
+					   state == RING_CHARGING) {
+					LOG_INF("state -> %s",
+						state_name[RING_IDLE]);
+					state = RING_IDLE;
+					next_window = now;
+					publish_status();
+				}
 			}
 		}
+
+		/* The charger block above can hold the LED on for 3 s. */
+		ring_wdt_feed();
 
 		/* --- battery and GSR, slow and cheap to skip --- */
 		if (now >= next_slow && state != RING_CHARGING) {
 			slow_sense();
 			next_slow = now + SLOW_SENSE_MS;
 			publish_status();
+
+			/* Battery reads plus the 800 ms GSR settle. */
+			ring_wdt_feed();
 		}
 
 		/*
@@ -620,6 +684,21 @@ int main(void)
 
 		case RING_IDLE: {
 			int mg = imu_magnitude_mg();
+
+			/*
+			 * Keep the IMU flag current, the way the PPG and PMIC
+			 * flags now are. It used to be set once at boot and never
+			 * re-evaluated, so three health bits in the same status
+			 * byte meant three different things: a cold joint on U4
+			 * (HANDOFF.md section 6) or a stuck SDA taking all three
+			 * devices down still reported the IMU as healthy, and a
+			 * phone could not tell that from a ring held still.
+			 */
+			if (mg < 0) {
+				subsystem_flags &= ~RING_FLAG_IMU_OK;
+			} else {
+				subsystem_flags |= RING_FLAG_IMU_OK;
+			}
 
 			/* Gravity alone reads ~1000 mg; deviation is motion. */
 			if (mg >= 0 && abs(mg - 1000) > STILL_MG) {
@@ -666,12 +745,35 @@ int main(void)
 							ARRAY_SIZE(samples));
 
 			if (count > 0) {
+				ppg_fail_count = 0;
 				ble_publish_ppg(samples, (uint8_t)count);
 				for (int i = 0; i < count; i++) {
 					report(samples[i]);
 				}
 			} else if (count < 0) {
 				LOG_ERR("FIFO read failed (%d)", count);
+
+				/*
+				 * Logging this forever was the whole bug. Give up
+				 * after PPG_FAIL_LIMIT in a row, mark the part
+				 * absent and fall back to idle so the next window
+				 * re-probes it -- and so the status flag stops
+				 * claiming a sensor that has not answered in a
+				 * tenth of a second is healthy.
+				 */
+				if (ppg_fail_count < PPG_FAIL_LIMIT &&
+				    ++ppg_fail_count == PPG_FAIL_LIMIT) {
+					LOG_WRN("PPG unresponsive after %d reads -- "
+						"marking absent, will re-probe next "
+						"window", PPG_FAIL_LIMIT);
+					ppg_off();
+					ppg_present = false;
+					subsystem_flags &= ~RING_FLAG_PPG_OK;
+					state = RING_IDLE;
+					next_window = now + measure_period_ms;
+					publish_status();
+					break;
+				}
 			}
 
 			if (ble_imu_streaming()) {

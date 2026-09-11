@@ -27,7 +27,32 @@ image. Rebuild either with `git checkout v0.1-bench`, then set
 
 ---
 
-## v0.2-phase1 -- NOT YET RUN ON HARDWARE
+## v0.3-review-fixes -- NOT YET RUN ON HARDWARE
+
+Seven code-review fixes on top of Phase 1, two of them for bugs Phase 1
+introduced. **Compile-verified only**, across four configurations. Supersedes
+v0.2-phase1 -- flash these, not those.
+
+| File | Build |
+|---|---|
+| `ring-fw-v0.3-production.hex` | `.\build.ps1` -- no bench instruments |
+| `ring-fw-v0.3-bench.hex` | `.\build.ps1 -Bench` -- instrumented |
+
+The one that matters if you leave a board on a charger: an unreachable PMIC
+used to read as "charger removed", so a single transient I2C error pulled the
+ring out of `RING_CHARGING` and started the PPG and the 5 V boost while still
+on a 20 mA charger. **Do not leave a v0.2-phase1 image running unattended on
+a charger.**
+
+Also fixed: the watchdog could reset a board that was merely slow (a stalled
+I2C bus costs 500 ms per transaction, and a re-probe issues up to sixteen);
+a PPG that wedged mid-run never recovered and kept reporting healthy; the
+probe's known bus-wedging bare read is now bench-only; and the IMU health
+flag tracks reachability like the other two.
+
+---
+
+## v0.2-phase1 -- SUPERSEDED, has the charger bug above
 
 Phase 1 survivability work. **Every one of these changes is compile-verified
 only.** No board was available when they were written, so treat the first

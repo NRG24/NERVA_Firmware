@@ -43,13 +43,14 @@ int maxm86161_write_reg(struct maxm86161 *dev, uint8_t reg, uint8_t val)
 }
 
 /*
- * Probe one address three different ways and report each, because they do
- * not fail together:
+ * Probe one address more than one way, because the ways do not fail
+ * together:
  *
- *   bare   - i2c_read(): address phase only, no register pointer
  *   split  - write the pointer, STOP, then a separate read transaction
  *   restart- i2c_write_read(): pointer then repeated START (what the
  *            datasheet documents in Figures 14/15)
+ *   bare   - i2c_read(): address phase only, no register pointer.
+ *            BENCH ONLY, see below.
  *
  * A part that ACKs "bare" but rejects "restart" is answering its address
  * while its transfer state machine is wedged.
@@ -57,12 +58,29 @@ int maxm86161_write_reg(struct maxm86161 *dev, uint8_t reg, uint8_t val)
 static int try_addr(struct maxm86161 *dev, uint8_t addr, uint8_t *part_id)
 {
 	uint8_t reg = REG_PART_ID;
-	uint8_t dummy = 0, id_split = 0, id_restart = 0;
-	int e_bare, e_ptr, e_split = -1, e_restart;
+	uint8_t id_split = 0, id_restart = 0;
+	int e_ptr, e_split = -1, e_restart;
 
 	dev->addr = addr;
 
-	e_bare = i2c_read(dev->i2c, &dummy, 1, addr);
+#if defined(CONFIG_RING_BENCH)
+	/*
+	 * A register-pointer-less read is the access pattern that WEDGES this
+	 * part -- it returns -EIO and leaves the device unable to answer
+	 * register reads until the bus idles. That cost two days and two
+	 * boards; POSTMORTEM.md is the whole story.
+	 *
+	 * It survives here only because being able to compare it against the
+	 * other two is what identified the fault, and it is bench-gated
+	 * because probing is no longer boot-only: ppg_on() re-probes whenever
+	 * a measurement window opens with the sensor missing. In a shipped
+	 * image this would fire every 60 s and could hold the part in exactly
+	 * the state the re-probe is trying to clear -- or defeat the restart
+	 * read a few lines below, in the same call.
+	 */
+	uint8_t dummy = 0;
+	int e_bare = i2c_read(dev->i2c, &dummy, 1, addr);
+#endif
 
 	e_ptr = i2c_write(dev->i2c, &reg, 1, addr);
 	if (e_ptr == 0) {
@@ -71,8 +89,13 @@ static int try_addr(struct maxm86161 *dev, uint8_t addr, uint8_t *part_id)
 
 	e_restart = i2c_write_read(dev->i2c, addr, &reg, 1, &id_restart, 1);
 
+#if defined(CONFIG_RING_BENCH)
 	LOG_INF("0x%02x  bare=%d  ptr_write=%d  split=%d(0x%02x)  restart=%d(0x%02x)",
 		addr, e_bare, e_ptr, e_split, id_split, e_restart, id_restart);
+#else
+	LOG_INF("0x%02x  ptr_write=%d  split=%d(0x%02x)  restart=%d(0x%02x)",
+		addr, e_ptr, e_split, id_split, e_restart, id_restart);
+#endif
 
 	/* Take whichever access pattern actually returned the part ID. */
 	if (e_restart == 0) {
@@ -84,7 +107,12 @@ static int try_addr(struct maxm86161 *dev, uint8_t addr, uint8_t *part_id)
 		return 0;
 	}
 
-	return (e_restart != 0) ? e_restart : e_bare;
+	/*
+	 * e_restart is always non-zero here -- the zero case returned above.
+	 * The old fallback to e_bare was dead code, and would have referenced
+	 * a value that no longer exists in a production build.
+	 */
+	return e_restart;
 }
 
 int maxm86161_probe(struct maxm86161 *dev, const struct device *i2c)

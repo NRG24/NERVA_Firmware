@@ -1,7 +1,7 @@
 # App integration guide
 
-Everything a phone app needs to talk to the ring. Firmware as of
-2026-08-23.
+Everything a phone app needs to talk to the ring. Firmware as of v0.3
+(2026-09-11).
 
 ---
 
@@ -86,13 +86,30 @@ measuring and on every state change.
 |---|---|
 | 0 | finger present (`ppg_dc` above the wear threshold) |
 | 1 | charger attached |
-| 2 | PPG sensor initialised OK |
-| 3 | IMU initialised OK |
-| 4 | PMIC reachable |
+| 2 | PPG sensor responding |
+| 3 | IMU responding |
+| 4 | PMIC responding |
 
-Bits 2-4 are set once at boot. If any is clear, that subsystem failed to
-initialise and its data will be absent or stale — worth surfacing in a
-diagnostics screen rather than silently showing zeros.
+Bits 2-4 are **live**, not latched at boot. Each one tracks whether that
+subsystem is answering right now:
+
+| Bit | Cleared when |
+|---|---|
+| 2 PPG | five consecutive FIFO reads fail, or a re-probe finds nothing |
+| 3 IMU | an accelerometer read fails while idle |
+| 4 PMIC | a PMIC transaction fails |
+
+Each is set again as soon as the device answers, so a bit that flickers is
+reporting a real intermittent fault — a cold joint or a marginal bus — not
+noise in the firmware. Surface them in a diagnostics screen rather than
+silently showing zeros.
+
+> This changed in v0.3. These bits used to be set once at boot and never
+> re-evaluated, so a device that died mid-session still reported healthy.
+> `RING_FLAG_PMIC_OK` was worse than latched: it was set unconditionally
+> every poll, including when the PMIC could not be reached at all. If your
+> app assumed "set once at boot", it needs no change to keep working, but it
+> can now trust these to mean something.
 
 ### Signal quality
 

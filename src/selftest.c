@@ -507,12 +507,19 @@ int selftest_gsr_mv(void)
 }
 
 #if defined(CONFIG_RING_BENCH)
+#if defined(CONFIG_RING_GSR_MONITOR)
 /*
  * Skin conductance in tenths of a microsiemens.
  *
  * Conductance, not resistance, is the conventional EDA unit, and it is what
  * this topology produces directly. Returns 0 below the bias point, which is
  * where an open circuit and amplifier offset both land.
+ *
+ * Guarded on GSR_MONITOR rather than BENCH because selftest_gsr_monitor() is
+ * its only caller. Under the wider guard, the perfectly legal combination
+ * RING_BENCH=y + RING_GSR_MONITOR=n left it defined and unused, which is a
+ * -Wunused-function warning -- and warnings are the only verification this
+ * project has while there is no hardware.
  */
 static int gsr_conductance_us_x10(int mv)
 {
@@ -524,6 +531,7 @@ static int gsr_conductance_us_x10(int mv)
 	return ((mv - GSR_VREF_MV) * 10000) /
 	       ((GSR_VREF_MV * (GSR_R5_OHMS / 100)) / 10);
 }
+#endif /* CONFIG_RING_GSR_MONITOR */
 
 /* Sample AIN1 once, assuming GSR_PWR is already on and settled. */
 static int gsr_sample_mv(void)
