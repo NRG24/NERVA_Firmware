@@ -7,14 +7,37 @@
 
 LOG_MODULE_REGISTER(maxm86161, LOG_LEVEL_INF);
 
+/*
+ * Refuse to touch the bus until a probe has succeeded.
+ *
+ * maxm86161_probe() sets dev->addr = 0 when it finds nothing, and 0x00 is
+ * the I2C GENERAL CALL address, not a harmless no-op: a write there is
+ * broadcast to every device on the bus and the second byte is a command,
+ * 0x06 being "reset and reload". ppg_off() runs unconditionally at boot, so
+ * a board whose PPG did not answer was quietly general-calling the bus that
+ * the IMU and the PMIC share.
+ */
+static inline bool addr_valid(const struct maxm86161 *dev)
+{
+	return dev->addr != 0U;
+}
+
 int maxm86161_read_reg(struct maxm86161 *dev, uint8_t reg, uint8_t *val)
 {
+	if (!addr_valid(dev)) {
+		return -ENODEV;
+	}
+
 	return i2c_write_read(dev->i2c, dev->addr, &reg, 1, val, 1);
 }
 
 int maxm86161_write_reg(struct maxm86161 *dev, uint8_t reg, uint8_t val)
 {
 	uint8_t buf[2] = { reg, val };
+
+	if (!addr_valid(dev)) {
+		return -ENODEV;
+	}
 
 	return i2c_write(dev->i2c, buf, sizeof(buf), dev->addr);
 }
@@ -309,6 +332,10 @@ int maxm86161_fifo_read(struct maxm86161 *dev, uint32_t *out, uint8_t max_sample
 	uint8_t reg = REG_FIFO_DATA;
 	int count;
 	int err;
+
+	if (!addr_valid(dev)) {
+		return -ENODEV;
+	}
 
 	count = maxm86161_fifo_count(dev);
 	if (count <= 0) {

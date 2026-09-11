@@ -86,7 +86,7 @@ against a 500 ns half-period at 1 MHz -- about 2.6x margin. Fine at 1 MHz,
 marginal above 2 MHz. If connects are flaky, halve it:
 
 ```powershell
-.uild.ps1 -Rtt -Freq 500000
+.\build.ps1 -Rtt -Freq 500000
 ```
 
 Do not connect the probe to an unpowered board. With 1V8 down, the drive
@@ -153,27 +153,58 @@ don't keep lowering the clock, look at the link instead.
 ## Build and flash
 
 Toolchain used: **nRF Connect SDK v3.4.0** (Zephyr 4.4.0), installed to
-`C:
-cs` with `nrfutil sdk-manager`. The toolchain bundle brings its own
+`C:\ncs` with `nrfutil sdk-manager`. The toolchain bundle brings its own
 CMake, Ninja, Python, west and ARM GCC, so nothing else needs to be on PATH.
 
 ```powershell
-.uild.ps1
+.\build.ps1
 ```
 
 ```powershell
-.uild.ps1 -Rtt
+.\build.ps1 -Rtt
 ```
 
 `-Flash` builds and flashes, `-Rtt` builds, flashes, and attaches the RTT
-viewer. Under the hood that is:
+viewer.
+
+### Production vs bench
+
+```powershell
+.\build.ps1            # production
+.\build.ps1 -Bench     # bench instrumentation
+```
+
+The two differ **only by Kconfig**. No edited source, no second copy of
+`main.c`. They build into separate directories (`build/` and
+`build-bench/`), so a bench image cannot end up where a production one is
+expected.
+
+`-Bench` adds `bench.conf` (`CONFIG_RING_BENCH=y`), which turns on:
+
+| Option | Effect |
+|---|---|
+| `RING_BENCH_POWER_LED` | Green LED1 held solid; the 5 V boost never sleeps |
+| `RING_IMU_WAKE_DIAG` | Wake diagnostics that read latched registers and pulse INT1 |
+| `RING_GSR_MONITOR` | Live GSR readout that holds GSR_PWR on continuously |
+| (implied) | The full boot self-test: battery, IMU, GSR sweeps, pin probes |
+
+Every one of those either perturbs what it measures or defeats the power
+model. None is in a default build, and the difference is about 7 kB of
+flash.
+
+This replaces the old arrangement, where "production" meant hand-editing
+`BENCH_POWER_LED` in `main.c` and `IMU_WAKE_DIAG` in `imu.c` while keeping a
+duplicate `main.c.bench` alongside. Two files kept in step by hand is how a
+bench instrument survives into a shipped image, and the duplicate rotted
+almost immediately.
+
+Under the hood the build is:
 
 ```bash
 west build -b ring_anna/nrf52833 -p always -d build . -- -DBOARD_ROOT=<app dir>
 ```
 
-run with west's cwd inside `C:
-cs3.4.0`, because the app lives outside
+run with west's cwd inside `C:\ncs\v3.4.0`, because the app lives outside
 the workspace. `BOARD_ROOT` has to be explicit: in NCS 3.x sysbuild is the
 top-level CMake source, so the app directory is not picked up as a board
 root on its own and the board lookup fails with "No board named 'ring_anna'".

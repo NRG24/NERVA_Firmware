@@ -10,4 +10,5 @@ target_sources(app PRIVATE
 	src/selftest.c
 	src/ble.c
 	src/imu.c
+	src/wdt.c
 )

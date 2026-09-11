@@ -108,6 +108,76 @@ static void pmic_enable_i2c(void)
 	k_msleep(10);
 }
 
+/*
+ * Everything the BQ25120A needs written before it will charge at all.
+ *
+ * Deliberately separate from test_pmic(): these are not diagnostics. They
+ * used to live inside the self-test suite, which meant bench-gating that
+ * suite would also have removed the charge-current and TS writes and
+ * stopped charging working, with nothing in the log to say why.
+ *
+ * Returns 0, or a negative errno if the PMIC could not be reached.
+ */
+int pmic_configure(const struct device *i2c)
+{
+	uint8_t chg = 0, ts = 0, faults = 0;
+	int err;
+
+	pmic_enable_i2c();
+
+	err = reg_read(i2c, PMIC_ADDR, PMIC_REG_FAULTS, &faults, 1);
+	if (err) {
+		LOG_ERR("PMIC  BQ25120A @0x%02x unreachable (%d) -- not "
+			"configured; charging will not work", PMIC_ADDR, err);
+		return err;
+	}
+
+	/*
+	 * Charge current. The part powers up at its orderable default of
+	 * 10 mA because ISET (C1) is tied to GND. ICHRG_RANGE (b7): 0 means
+	 * 5 mA + code x 1 mA, 1 means 40 mA + code x 10 mA.
+	 */
+	if (reg_read(i2c, PMIC_ADDR, PMIC_REG_FASTCHG, &chg, 1) == 0) {
+		uint8_t code = (chg >> 2) & 0x1f;
+		int ichrg_ma = (chg & BIT(7)) ? (40 + code * 10) : (5 + code);
+
+		if (ichrg_ma != 20) {
+			uint8_t w[2] = { PMIC_REG_FASTCHG, PMIC_FASTCHG_20MA };
+
+			if (i2c_write(i2c, w, sizeof(w), PMIC_ADDR) == 0) {
+				LOG_INF("PMIC  charge current %d mA -> 20 mA",
+					ichrg_ma);
+			}
+		}
+	}
+
+	/*
+	 * TS (ball C3) is unconnected on this board, so the NTC monitor reads
+	 * out of range and suspends charging with TS_FAULT = 01 while the
+	 * fault register reads clean. With no thermistor fitted, disabling the
+	 * monitor is the only way to charge at all.
+	 *
+	 * HARDWARE_NOTES.md item 9 records that the battery connector has only
+	 * BAT+ and GND -- there is no thermistor in the pack, so TS never had
+	 * anything to measure and clearing TS_EN gives up no protection that
+	 * existed. It does mean charging runs with no temperature limit at all,
+	 * on a cell worn against skin, so it is warned every boot rather than
+	 * logged once at info level. The fix is a fixed divider on TS.
+	 */
+	if (reg_read(i2c, PMIC_ADDR, PMIC_REG_TSCTRL, &ts, 1) == 0 &&
+	    (ts & PMIC_TS_EN)) {
+		uint8_t w[2] = { PMIC_REG_TSCTRL, (uint8_t)(ts & ~PMIC_TS_EN) };
+
+		if (i2c_write(i2c, w, sizeof(w), PMIC_ADDR) == 0) {
+			LOG_WRN("PMIC  TS monitor disabled -- charging with no "
+				"battery temperature limit");
+		}
+	}
+
+	return 0;
+}
+
+#if defined(CONFIG_RING_BENCH)
 static void test_pmic(const struct device *i2c)
 {
 	uint8_t status, faults;
@@ -237,6 +307,7 @@ static void test_pmic(const struct device *i2c)
 		LOG_WRN("PMIC  battery overcurrent");
 	}
 }
+#endif /* CONFIG_RING_BENCH */
 
 int selftest_battery_mv(const struct device *i2c, uint8_t *percent_of_vbatreg)
 {
@@ -310,6 +381,7 @@ uint8_t battery_gauge_pct(int mv)
 	return (uint8_t)(((mv - 3300) * 100) / (4200 - 3300));
 }
 
+#if defined(CONFIG_RING_BENCH)
 static void test_battery(const struct device *i2c)
 {
 	uint8_t pct_of_reg = 0;
@@ -375,6 +447,7 @@ static void test_imu(const struct device *i2c)
 		"%d %d %d mg", part, IMU_ADDR, who, ax, ay, az,
 		(ax * 2000) / 32768, (ay * 2000) / 32768, (az * 2000) / 32768);
 }
+#endif /* CONFIG_RING_BENCH */
 
 int selftest_gsr_mv(void)
 {
@@ -433,6 +506,7 @@ int selftest_gsr_mv(void)
 	return (int)mv;
 }
 
+#if defined(CONFIG_RING_BENCH)
 /*
  * Skin conductance in tenths of a microsiemens.
  *
@@ -819,7 +893,9 @@ static void test_gsr(void)
 	gsr_ain_scan();
 	gsr_pin_probe();	/* last: it drives P0.03 */
 }
+#endif /* CONFIG_RING_BENCH */
 
+#if defined(CONFIG_RING_GSR_MONITOR)
 /*
  * Live GSR readout for bench work.
  *
@@ -891,7 +967,9 @@ void selftest_gsr_monitor(void)
 		}
 	}
 }
+#endif /* CONFIG_RING_GSR_MONITOR */
 
+#if defined(CONFIG_RING_BENCH)
 static void test_pins(void)
 {
 	const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
@@ -911,6 +989,7 @@ static void test_pins(void)
 		cd, cd ? "Active Battery, I2C enabled" : "Hi-Z, PMIC I2C OFF",
 		acc_int);
 }
+#endif /* CONFIG_RING_BENCH */
 
 /*
  * CD has to move with the charger, and the two states conflict:
@@ -922,17 +1001,36 @@ static void test_pins(void)
  * VIN is valid, then park CD wherever that answer requires. Raising CD
  * briefly interrupts charging, which at this interval is negligible.
  */
-bool pmic_service(const struct device *i2c)
+int pmic_service(const struct device *i2c, bool *charging)
 {
 	const struct device *gpio1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 	static int last_state = -1;
 	uint8_t faults = 0;
+	int err;
+
+	if (charging) {
+		*charging = false;
+	}
 
 	gpio_pin_configure(gpio1, CD_PIN, GPIO_OUTPUT_ACTIVE);
 	k_msleep(5);
 
-	if (reg_read(i2c, PMIC_ADDR, PMIC_REG_FAULTS, &faults, 1) != 0) {
-		return false;	/* leave CD high; at least I2C stays alive */
+	err = reg_read(i2c, PMIC_ADDR, PMIC_REG_FAULTS, &faults, 1);
+	if (err) {
+		/*
+		 * Leave CD high so I2C at least stays alive, and report the
+		 * error rather than "not charging".
+		 *
+		 * These two used to be the same answer: this function returned
+		 * bool, so a dead bus and a healthy battery-powered board were
+		 * indistinguishable, and main.c set RING_FLAG_PMIC_OK either
+		 * way. The app was told the PMIC was fine while I2C was down.
+		 */
+		if (last_state != -2) {
+			LOG_WRN("PMIC  unreachable (%d)", err);
+			last_state = -2;
+		}
+		return err;
 	}
 
 	bool charger = (faults & BIT(6)) == 0;
@@ -953,9 +1051,14 @@ bool pmic_service(const struct device *i2c)
 		last_state = (int)charger;
 	}
 
-	return charger;
+	if (charging) {
+		*charging = charger;
+	}
+
+	return 0;
 }
 
+#if defined(CONFIG_RING_BENCH)
 void selftest_run(const struct device *i2c)
 {
 	LOG_INF("---- board self-test ----");
@@ -966,3 +1069,4 @@ void selftest_run(const struct device *i2c)
 	test_pins();
 	LOG_INF("---- self-test done ----");
 }
+#endif /* CONFIG_RING_BENCH */

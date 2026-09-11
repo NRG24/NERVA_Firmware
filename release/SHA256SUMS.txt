@@ -1,2 +1,4 @@
 5bab20692564bf01905194a21b7d8d08815e128f71ee39c1ccf954a78f1655f0 *release/ring-fw-v0.1-bench-greenled.hex
 3dfee000c4db49a2a88264c68e240693fbfb3892852b8f42764e178cae389997 *release/ring-fw-v0.1-bench-noled.hex
+0f0188c4fa215930118cb4bbff5ad6bdb0beb76f2088842ddfd61e520a2b35ef *release/ring-fw-v0.2-phase1-bench.hex
+65a14c86c6738a7cb8940763a740ce1b15fc5dfdb3c5566bca33382bc473dde4 *release/ring-fw-v0.2-phase1-production.hex

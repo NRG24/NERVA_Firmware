@@ -1,0 +1,100 @@
+# Ring firmware application options.
+#
+# This file becomes KCONFIG_ROOT for the application (see Zephyr's
+# cmake/modules/kconfig.cmake), so it MUST end by sourcing Kconfig.zephyr or
+# no Zephyr symbol resolves at all.
+#
+# Everything bench-only lives here rather than as a #define inside a .c
+# file. That is deliberate: the flags used to be scattered across main.c and
+# imu.c, and "production" was produced by hand-editing main.c and keeping a
+# main.c.bench copy alongside it. Two files that have to be edited in step
+# is a bug waiting to happen, and the duplicate rotted immediately.
+#
+# Now both images come from one tree with no file edits:
+#
+#   .\build.ps1            production
+#   .\build.ps1 -Bench     bench instrumentation
+
+mainmenu "Ring firmware"
+
+menu "Ring firmware"
+
+config RING_BENCH
+	bool "Bench instrumentation (NOT for anything worn or shipped)"
+	help
+	  Master switch for every bench-only instrument in this firmware.
+
+	  These instruments perturb what they measure and defeat the power
+	  model, which is fine on a desk with a debugger attached and wrong
+	  everywhere else. Off by default so an ordinary build is shippable.
+
+if RING_BENCH
+
+config RING_BENCH_POWER_LED
+	bool "Hold the green LED on as a power indicator"
+	default y
+	help
+	  Holds MAXM86161 LED1 solid so "is the board actually running?" is
+	  answerable by looking at it rather than by attaching a debugger.
+	  Hours went into faults that turned out to be an unpowered board
+	  presenting as a dead SWD link.
+
+	  Costs real current and keeps the 5 V boost enabled permanently,
+	  so the idle power model does not apply while this is set.
+
+config RING_IMU_WAKE_DIAG
+	bool "IMU wake-path diagnostics"
+	default y
+	help
+	  Samples the INT1 pin before reading the latched wake source, which
+	  separates "the IMU never fired" from "the IMU fired and the pin did
+	  not move". This is what localised the cold joint on U4.
+
+	  It reads latched registers and pulses INT1, so it perturbs the very
+	  interrupt path the firmware depends on. Never leave it on outside
+	  bring-up.
+
+config RING_GSR_MONITOR
+	bool "Live GSR monitor"
+	default y
+	help
+	  Samples GSR in every state and holds GSR_PWR on continuously so the
+	  front end stays settled and a meter can reach it.
+
+	  Holding GSR_PWR on defeats duty cycling and keeps the analog front
+	  end powered for as long as the board is.
+
+endif # RING_BENCH
+
+config RING_WATCHDOG
+	bool "Hardware watchdog"
+	default y
+	select WATCHDOG
+	help
+	  Resets the SoC if the main loop stops feeding it. Without this a
+	  wedged I2C bus or a hung loop is an unrecoverable brick that only a
+	  power cycle clears -- and on a sealed ring, that means waiting for
+	  the battery to die.
+
+	  The nRF52833 watchdog CANNOT be stopped once started; only a
+	  power-on reset clears it. It is therefore started last, after all
+	  initialisation has succeeded.
+
+config RING_WATCHDOG_TIMEOUT_MS
+	int "Watchdog timeout (ms)"
+	default 10000
+	range 1000 100000
+	depends on RING_WATCHDOG
+	help
+	  Must comfortably exceed the longest blocking path in one pass of
+	  the main loop. The audit lives next to the feed call in main.c --
+	  update it there if you add a blocking call, because exceeding this
+	  reboots a working board.
+
+	  Worst case measured by inspection is about 4.2 s (a 3 s charger
+	  LED indication plus a 0.8 s GSR settle in the same pass), so the
+	  10 s default leaves roughly 2.4x margin.
+
+endmenu
+
+source "Kconfig.zephyr"

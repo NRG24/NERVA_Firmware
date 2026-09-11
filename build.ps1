@@ -1,8 +1,13 @@
 # Build (and optionally flash) the ring firmware.
 #
-#   .\build.ps1            # build
+#   .\build.ps1            # build (production: no bench instruments)
+#   .\build.ps1 -Bench     # build with bench instrumentation
 #   .\build.ps1 -Flash     # build, then flash over the Debug Probe
 #   .\build.ps1 -Rtt       # build, flash, then attach the RTT viewer
+#
+# Bench and production differ only by Kconfig, never by edited source. They
+# used to be two hand-edited copies of main.c kept in step by hand, and the
+# duplicate rotted immediately. See Kconfig and bench.conf.
 #
 # The app lives outside the NCS workspace, so west runs with its cwd inside
 # C:\ncs\v3.4.0 and takes the app path as an argument. BOARD_ROOT has to be
@@ -17,19 +22,32 @@
 param(
 	[switch]$Flash,
 	[switch]$Rtt,
+	[switch]$Bench,
 	[int]$Freq          = 1000000,
 	[string]$NcsVersion = "v3.4.0",
 	[string]$Ncs        = "C:\ncs"
 )
 
 $app       = $PSScriptRoot
-$build     = Join-Path $app "build"
 $nrfutil   = Join-Path $Ncs "tools\nrfutil.exe"
 $workspace = Join-Path $Ncs $NcsVersion
-$hex       = Join-Path $build "ring-fw\zephyr\zephyr.hex"
+
+# Separate build directories, so switching between the two does not force a
+# full rebuild and a bench image can never be left sitting where a
+# production one is expected.
+if ($Bench) {
+	$build = Join-Path $app "build-bench"
+	$extra = @("-DBOARD_ROOT=$app", "-DEXTRA_CONF_FILE=bench.conf")
+	Write-Output "=== BENCH build: instrumented, not shippable ==="
+} else {
+	$build = Join-Path $app "build"
+	$extra = @("-DBOARD_ROOT=$app")
+}
+
+$hex = Join-Path $build "ring-fw\zephyr\zephyr.hex"
 
 & $nrfutil sdk-manager toolchain launch --ncs-version $NcsVersion --chdir $workspace -- `
-	west build -b ring_anna/nrf52833 -p always -d $build $app -- "-DBOARD_ROOT=$app"
+	west build -b ring_anna/nrf52833 -p always -d $build $app -- @extra
 
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path $hex)) {
 	Write-Output "BUILD FAILED"

@@ -46,11 +46,20 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 #define MD1_CFG_INT1_WU		BIT(5)
 
 /*
- * Wake-path diagnostic. Set to 0 once the interrupt is proven -- it
- * reads the latched source registers, so it perturbs what it measures.
+ * Wake-path diagnostic. Reads the latched source registers and pulses
+ * INT1, so it perturbs the very interrupt path the firmware depends on.
  * See POSTMORTEM.md rule 3.
+ *
+ * Controlled from Kconfig (CONFIG_RING_IMU_WAKE_DIAG, under RING_BENCH)
+ * rather than by editing this line. It used to be a hand-edited 1/0 here
+ * while BENCH_POWER_LED was hand-edited in main.c, and keeping two files
+ * in step by hand is how a bench instrument ends up in a shipped image.
  */
+#if defined(CONFIG_RING_IMU_WAKE_DIAG)
 #define IMU_WAKE_DIAG		1
+#else
+#define IMU_WAKE_DIAG		0
+#endif
 
 /* ACC_INT = U5.36 = module GPIO_36 = P0.16 */
 #define ACC_INT_PIN		16

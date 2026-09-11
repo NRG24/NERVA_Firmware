@@ -207,7 +207,7 @@ embedded-function page), `IF_CFG=0x00` (push-pull, active high),
 
 ### What actually solved it
 
-Three instruments in `imu.c`, gated behind `IMU_WAKE_DIAG`, each answering
+Three instruments in `imu.c`, gated behind `CONFIG_RING_IMU_WAKE_DIAG`, each answering
 one question the previous one raised:
 
 1. **`imu_wake_diag()`** -- samples the INT1 pin *before* reading the
@@ -219,8 +219,10 @@ one question the previous one raised:
    whether the output stage can drive high *at all*, independent of wake
    routing. `0/400` is what localised the fault to the joint.
 
-Set `IMU_WAKE_DIAG` to 0 in `imu.c` once you are done; it reads latched
-registers and pulses INT1, so it perturbs what it measures.
+These are off unless you ask for them. They now live behind
+`CONFIG_RING_IMU_WAKE_DIAG` (under `RING_BENCH`) rather than a hand-edited
+`#define` in `imu.c` -- build with `.uild.ps1 -Bench` to get them. They
+read latched registers and pulse INT1, so they perturb what they measure.
 
 ### Still to confirm
 

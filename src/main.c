@@ -30,13 +30,16 @@
 #include "imu.h"
 #include "maxm86161.h"
 #include "selftest.h"
+#include "wdt.h"
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/hwinfo.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/regulator.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/sys/util.h>
 
 #include <stdlib.h>
 
@@ -59,9 +62,18 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  * unpowered board presenting as a dead SWD link.
  *
  * It keeps the 5 V boost enabled permanently, so it costs real current and
- * defeats the whole idle power model. Set to 0 to get normal behaviour back.
+ * defeats the whole idle power model.
+ *
+ * Controlled from Kconfig (CONFIG_RING_BENCH_POWER_LED, under RING_BENCH).
+ * It used to be a hand-edited 1/0 on this line, with a whole duplicate
+ * main.c.bench kept alongside for the other setting -- which is exactly how
+ * a bench instrument survives into a shipped image.
  */
+#if defined(CONFIG_RING_BENCH_POWER_LED)
+#define BENCH_POWER_LED		1
+#else
 #define BENCH_POWER_LED		0
+#endif
 /* ~5.8 mA in the 31 mA range: clearly visible, not hot. */
 #define BENCH_LED_PA		0x30
 
@@ -108,6 +120,9 @@ static const char *const state_name[] = {
 static struct maxm86161 ppg;
 static struct hr hr_state;
 static uint32_t samples[FIFO_DEPTH];
+
+/* Cleared when the PPG stops answering, so ppg_on() knows to re-probe. */
+static bool ppg_present;
 
 static enum ring_state state = RING_IDLE;
 static uint32_t measure_window_ms = MEASURE_WINDOW_MS;
@@ -236,6 +251,31 @@ static void report(uint32_t raw)
 	}
 }
 
+/*
+ * Probe the PPG and keep the health flag honest.
+ *
+ * Boot used to sit here for up to 30 s (60 attempts, 500 ms apart) before
+ * anything else ran, including BLE. A sensor that is absent at boot is now
+ * simply recorded as absent and retried when it is actually needed.
+ */
+static int ppg_probe(int attempts, int gap_ms)
+{
+	for (int i = 1; i <= attempts; i++) {
+		if (maxm86161_probe(&ppg, I2C_BUS) == 0) {
+			ppg_present = true;
+			subsystem_flags |= RING_FLAG_PPG_OK;
+			return 0;
+		}
+		if (i < attempts) {
+			k_msleep(gap_ms);
+		}
+	}
+
+	ppg_present = false;
+	subsystem_flags &= ~RING_FLAG_PPG_OK;
+	return -ENODEV;
+}
+
 static int ppg_on(void)
 {
 	int err = regulator_enable(VLED_BOOST);
@@ -246,6 +286,16 @@ static int ppg_on(void)
 	}
 
 	k_msleep(20);
+
+	/*
+	 * Give a missing sensor another chance now that it is actually needed.
+	 * This also recovers a part that was wedged when the board booted --
+	 * previously that state persisted until the next reset.
+	 */
+	if (!ppg_present && ppg_probe(2, 50) != 0) {
+		(void)regulator_disable(VLED_BOOST);
+		return -ENODEV;
+	}
 
 	err = maxm86161_start_ppg(&ppg, PPG_LED, PPG_LED_PA);
 	if (err) {
@@ -288,6 +338,49 @@ static void slow_sense(void)
 	gsr_mv = (g >= 0) ? (int16_t)g : -1;
 }
 
+/*
+ * Why did we just boot?
+ *
+ * On a sealed board with awkward SWD access this is often the only thing
+ * separating "someone plugged the charger in" from "the firmware crashed
+ * and something reset it". The nRF latches the cause across the reset;
+ * clear it afterwards so the next boot reports its own reason rather than
+ * an accumulated history.
+ *
+ * This is also the readout for the watchdog: wdt.c installs no callback,
+ * because the nRF fires its TIMEOUT event only ~61 us before the reset
+ * lands, which is not enough to get a line out over RTT.
+ */
+static void report_reset_cause(void)
+{
+	uint32_t cause = 0;
+
+	if (hwinfo_get_reset_cause(&cause) != 0) {
+		return;
+	}
+
+	(void)hwinfo_clear_reset_cause();
+
+	if (cause & RESET_WATCHDOG) {
+		/*
+		 * Deliberately does not quote the timeout: that symbol only
+		 * exists when CONFIG_RING_WATCHDOG is set, and naming it here
+		 * made a watchdog-disabled build fail to compile.
+		 */
+		LOG_WRN("reset cause: WATCHDOG (0x%08x) -- the main loop stopped "
+			"feeding it", cause);
+	} else if (cause & RESET_SOFTWARE) {
+		LOG_WRN("reset cause: SOFTWARE (0x%08x) -- fatal error handler "
+			"or sys_reboot", cause);
+	} else {
+		LOG_INF("reset cause: 0x%08x%s%s%s%s", cause,
+			(cause & RESET_POR) ? " power-on" : "",
+			(cause & RESET_PIN) ? " pin" : "",
+			(cause & RESET_DEBUG) ? " debug" : "",
+			(cause & RESET_LOW_POWER_WAKE) ? " lp-wake" : "");
+	}
+}
+
 int main(void)
 {
 	int64_t next_pmic = 0;
@@ -296,9 +389,9 @@ int main(void)
 	int64_t window_started = 0;
 	int64_t last_motion = 0;
 	bool waiting_for_finger = false;
-	int err;
 
 	LOG_INF("ring firmware starting");
+	report_reset_cause();
 
 	if (!device_is_ready(I2C_BUS) || !device_is_ready(VLED_BOOST)) {
 		LOG_ERR("i2c0 or boost regulator not ready");
@@ -360,17 +453,38 @@ int main(void)
 			"slave; suspect a bridge from U5.10/SDA to GND");
 	}
 
-	for (int attempt = 1; attempt <= 60; attempt++) {
-		err = maxm86161_probe(&ppg, I2C_BUS);
-		if (err == 0) {
-			subsystem_flags |= RING_FLAG_PPG_OK;
-			break;
-		}
-		if (attempt % 10 == 0) {
-			LOG_WRN("MAXM86161 not responding (%d), attempt %d",
-				err, attempt);
-		}
-		k_msleep(500);
+	/*
+	 * BLE before the sensors.
+	 *
+	 * Boot used to spend up to 30 s retrying the MAXM86161 probe (60
+	 * attempts, 500 ms apart) before bt_enable() was even reached, so a
+	 * board with a sensor fault was also invisible to the phone -- two
+	 * problems presenting as one, with no way to read status until the
+	 * sensor was fixed. The radio does not touch the I2C bus, so it goes
+	 * first and the sensors settle behind it.
+	 */
+	ble_set_control_cbs(&control_cbs);
+	(void)ble_start();
+
+	/*
+	 * Three quick attempts, not sixty slow ones. ppg_on() re-probes when a
+	 * window opens, so a sensor that is late or briefly wedged is no longer
+	 * written off until the next reset.
+	 */
+	if (ppg_probe(3, 100) != 0) {
+		LOG_WRN("MAXM86161 not responding at boot -- will retry when a "
+			"measurement window opens");
+	}
+
+	/*
+	 * Load-bearing, not a diagnostic. Without this the charge current is
+	 * left at the 10 mA power-up default and TS_EN blocks charging
+	 * outright. It used to sit inside the self-test suite; selftest_run()
+	 * below is bench-only and compiles to nothing in a production build,
+	 * which would have taken charging with it.
+	 */
+	if (pmic_configure(I2C_BUS) == 0) {
+		subsystem_flags |= RING_FLAG_PMIC_OK;
 	}
 
 	selftest_run(I2C_BUS);
@@ -378,9 +492,6 @@ int main(void)
 	if (imu_init(I2C_BUS) == 0) {
 		subsystem_flags |= RING_FLAG_IMU_OK;
 	}
-
-	ble_set_control_cbs(&control_cbs);
-	(void)ble_start();
 
 	/* Nothing to measure yet: shut the optics down and wait for motion. */
 	ppg_off();
@@ -401,17 +512,63 @@ int main(void)
 	last_motion = k_uptime_get();
 	next_window = k_uptime_get() + measure_period_ms;
 
+	/*
+	 * Watchdog last, once every subsystem has had its chance.
+	 *
+	 * On the nRF52833 the watchdog cannot be stopped once started -- there
+	 * is no STOP task on this part, only a power-on reset clears it. Arming
+	 * it before this point would turn any slow or failing init into a
+	 * reboot loop, on a board that is already awkward to reflash.
+	 */
+	(void)ring_wdt_start();
+
 	LOG_INF("state -> %s", state_name[state]);
 
 	while (1) {
 		int64_t now = k_uptime_get();
 
+		/*
+		 * Fed here and nowhere else. Feeding from a timer or a separate
+		 * thread would keep the board alive while this loop was wedged,
+		 * which is precisely the failure it exists to catch.
+		 *
+		 * BLOCKING AUDIT -- keep this current, because exceeding the
+		 * timeout reboots a working board.
+		 *
+		 * The two long paths are mutually exclusive. maxm86161_indicate()
+		 * blocks 3 s, but only on the pass that enters RING_CHARGING, and
+		 * slow_sense() is gated on state != RING_CHARGING, so its 800 ms
+		 * GSR settle cannot land in that same pass.
+		 *
+		 *   charger attach : ~55 ms pmic + 3000 ms indicate + ~50 ms = 3.1 s
+		 *   ordinary pass  : ~55 ms pmic + ~900 ms slow_sense      = 1.0 s
+		 *   measuring      : FIFO read, filters, notifies          < 50 ms
+		 *
+		 * Worst case ~3.1 s against a 10 s budget, so roughly 3x margin.
+		 * Add a longer blocking call and raise
+		 * CONFIG_RING_WATCHDOG_TIMEOUT_MS with it.
+		 */
+		ring_wdt_feed();
+
 		/* --- charger, checked in every state --- */
 		if (now >= next_pmic) {
-			bool charging = pmic_service(I2C_BUS);
+			bool charging = false;
+			int pmic_rc = pmic_service(I2C_BUS, &charging);
 
 			next_pmic = now + PMIC_POLL_MS;
-			subsystem_flags |= RING_FLAG_PMIC_OK;
+
+			/*
+			 * Report what is actually true. This flag used to be
+			 * set unconditionally, right next to a call whose only
+			 * return value was "charging" -- so an unreachable PMIC
+			 * and a healthy battery-powered board both came out as
+			 * "PMIC OK, not charging" and the app believed it.
+			 */
+			if (pmic_rc == 0) {
+				subsystem_flags |= RING_FLAG_PMIC_OK;
+			} else {
+				subsystem_flags &= ~RING_FLAG_PMIC_OK;
+			}
 
 			if (charging && state != RING_CHARGING) {
 				if (state == RING_MEASURING) {
@@ -445,11 +602,13 @@ int main(void)
 		}
 
 		/*
-		 * Every state, not just idle. With a charger attached the ring
-		 * parks in RING_CHARGING within ~56 ms of boot -- and that is
-		 * precisely when the debug link is healthy enough to watch it,
-		 * so an idle-only diagnostic can never be observed on the
-		 * bench. Compiled out with IMU_WAKE_DIAG.
+		 * Bench diagnostics. Both are no-ops in a production build --
+		 * see Kconfig, CONFIG_RING_IMU_WAKE_DIAG and RING_GSR_MONITOR.
+		 *
+		 * Called in every state, not just idle: with a charger attached
+		 * the ring parks in RING_CHARGING within ~56 ms of boot, which is
+		 * precisely when the debug link is healthy enough to watch it, so
+		 * an idle-only diagnostic can never be observed on the bench.
 		 */
 		imu_wake_diag();
 		selftest_gsr_monitor();
