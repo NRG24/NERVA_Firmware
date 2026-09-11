@@ -1,0 +1,6 @@
+board:
+  name: ring_anna
+  full_name: Ring board (u-blox ANNA-B402 / nRF52833)
+  vendor: custom
+  socs:
+    - name: nrf52833

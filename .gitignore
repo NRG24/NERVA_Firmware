@@ -1,0 +1,12 @@
+# Zephyr/west build output
+build/
+build-*/
+
+# Archived binaries are tracked deliberately (release/), but not stray ones
+*.o
+*.d
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,27 @@
+/*
+ * Pin control for the ring board.
+ *
+ * Netlist -> ANNA-B402 pad -> nRF52833 port:
+ *   SDA : U5.10 = GPIO_10 = P0.20
+ *   SCL : U5.11 = GPIO_11 = P0.14
+ *
+ * SDA/SCL are pulled up externally to 1V8 by R2/R1, so no internal
+ * bias is requested here.
+ */
+
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 20)>,
+				<NRF_PSEL(TWIM_SCL, 0, 14)>;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 20)>,
+				<NRF_PSEL(TWIM_SCL, 0, 14)>;
+			low-power-enable;
+		};
+	};
+};

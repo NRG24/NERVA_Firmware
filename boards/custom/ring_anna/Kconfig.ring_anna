@@ -1,0 +1,2 @@
+config BOARD_RING_ANNA
+	select SOC_NRF52833_QIAA
