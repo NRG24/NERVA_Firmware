@@ -141,13 +141,34 @@ Duty cycle is runtime-adjustable from the app (control opcode `0x04`).
 * **IMU wake-on-motion.** This is the open item, see section 6.
 * **Heart rate accuracy.** Never checked against a reference monitor.
   Plausible numbers are not validated numbers.
-* **GSR is broken, not merely untested.** Localised 2026-08-23 to the U7
-  front end: the output should idle at V_REF (~900 mV) with the electrodes
-  open, and reads a hard 0 mV from 1 ms to 2 s. The ADC net is proven clean
-  (forcing P0.03 high succeeds through R6), so the op-amp output really is
-  at 0 V. **Do not bother bridging the electrodes** -- with V_REF at 0 the
-  output is 0 regardless of skin resistance, so that test cannot say
-  anything. See `BRINGUP_RESULTS.md` Discovery 4 for the meter sequence.
+* **GSR: the analog front end is fine. The 0 mV was firmware, twice over.**
+  The entry that used to sit here blamed U7 and told you not to bother
+  bridging the electrodes. That was wrong, and it was written at 23:30 on
+  2026-08-23 -- before either cause was found. Corrected 2026-09-10.
+
+  Cause 1, fixed: the ADC channel in `ring_anna_nrf52833.dts` had no
+  `zephyr,vref-mv`. `ADC_DT_SPEC_GET` defaults it to 0 and
+  `adc_raw_to_millivolts_dt()` computes `raw * vref_mv`, so **every
+  conversion returned 0 mV no matter how good the sample was.** Every
+  "GSR reads a hard 0" observation in this project came through that
+  multiply. The property is now set to 450 (VDD/4 with VDD = 1.8 V).
+
+  Cause 2, suspected and not yet confirmed on hardware: with vref-mv fixed,
+  a hand-rolled SAADC config on **channel 0** reads ~500 mV from AIN1
+  (P0.03) correctly, while the devicetree path -- byte-identical except
+  that it uses **channel 1** -- still returns 0. `gsr_ain_scan()` in
+  `selftest.c` A/Bs this. If it confirms, the fix is to move the DT node
+  to `channel@0` / `io-channels = <&adc 0>`, keeping
+  `zephyr,input-positive = <NRF_SAADC_AIN1>`.
+
+  The meter measurements were correct all along: V_OUT_GSR sits at V_REF
+  (~0.5 V) with the electrodes open, exactly as the topology predicts.
+
+  Still open once readings work: **R5 is probably sized wrong.** Output is
+  `V_REF x (1 + R5/R_skin)`. With R5 = 91 k and dry skin at 1-10 M through
+  2 mm electrodes, touching the electrodes moves the output by 1-10% --
+  technically present, easily lost in noise. R5 nearer 1 M would give
+  usable swing. That is a sensitivity problem, not the cause of the zeros.
 * **The custom BLE service.** Compiles and the stack starts, but no phone
   has ever subscribed to the Ring Service characteristics or written a
   control opcode. Assume nothing here works until tested.
