@@ -50,6 +50,20 @@ a PPG that wedged mid-run never recovered and kept reporting healthy; the
 probe's known bus-wedging bare read is now bench-only; and the IMU health
 flag tracks reachability like the other two.
 
+A second review pass on those fixes found three more, all folded in here:
+
+* the IMU flag could be **set** for a device that failed initialisation --
+  a successful read only proves the bus works, and an unconfigured part in
+  power-down answers reads with zeros. A failed `imu_init()` is now retried
+  once a minute and the wake interrupt re-armed, instead of leaving the IMU
+  dead for the session.
+* refusing to act on an unreachable PMIC (correctly) left no way out of
+  `RING_CHARGING`, so a PMIC that never answered again stranded the ring
+  with the optics off forever. After 30 s of failures it now falls back to
+  idle.
+* the watchdog blocking audit, rewritten to be accurate, still did not
+  account for the new recovery paths.
+
 ---
 
 ## v0.2-phase1 -- SUPERSEDED, has the charger bug above

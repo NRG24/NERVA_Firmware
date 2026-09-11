@@ -139,6 +139,40 @@ static bool ppg_present;
 static uint8_t ppg_fail_count;
 #define PPG_FAIL_LIMIT		5
 
+/*
+ * Whether imu_init() actually configured the device -- NOT whether the bus
+ * works.
+ *
+ * imu_init() can fail after WHO_AM_I has already succeeded: the CTRL1 write
+ * is the last thing it does, and if that write fails the part is left in its
+ * power-down default at ODR 0. It then answers reads perfectly well and
+ * returns zeros, so "a read succeeded" is not evidence the accelerometer is
+ * running. Without this, the idle path set RING_FLAG_IMU_OK for a device
+ * that was never started and whose wake interrupt was never armed.
+ */
+static bool imu_ready;
+
+/* How often to retry a failed imu_init(). It is idempotent and cheap. */
+#define IMU_RETRY_MS		60000
+
+/* Deviation from 1 g that arms the wake interrupt. */
+#define WAKE_THRESHOLD_MG	80
+
+/*
+ * Consecutive failed PMIC polls.
+ *
+ * A PMIC error must not move the state machine -- that was the charger bug.
+ * But the only exit from RING_CHARGING is a successful poll reporting "not
+ * charging", so a PMIC that never answers again would park the ring there
+ * forever and it would never measure again. After this many failures in a
+ * row the charger can no longer be confirmed, so idle is the better guess.
+ *
+ * 15 x PMIC_POLL_MS = 30 s: far beyond any transient, and the cost of being
+ * wrong is running the LEDs against a 20 mA charger, not a hazard.
+ */
+static uint8_t pmic_fail_count;
+#define PMIC_FAIL_LIMIT		15
+
 static enum ring_state state = RING_IDLE;
 static uint32_t measure_window_ms = MEASURE_WINDOW_MS;
 static uint32_t measure_period_ms = MEASURE_PERIOD_MS;
@@ -417,6 +451,7 @@ int main(void)
 	int64_t next_pmic = 0;
 	int64_t next_window = 0;
 	int64_t next_slow = 0;
+	int64_t next_imu_retry = 0;
 	int64_t window_started = 0;
 	int64_t last_motion = 0;
 	bool waiting_for_finger = false;
@@ -521,6 +556,7 @@ int main(void)
 	selftest_run(I2C_BUS);
 
 	if (imu_init(I2C_BUS) == 0) {
+		imu_ready = true;
 		subsystem_flags |= RING_FLAG_IMU_OK;
 	}
 
@@ -539,7 +575,7 @@ int main(void)
 	LOG_WRN("BENCH_POWER_LED on: green held solid, boost never sleeps");
 #endif
 
-	(void)imu_arm_wake(80);
+	(void)imu_arm_wake(WAKE_THRESHOLD_MG);
 	last_motion = k_uptime_get();
 	next_window = k_uptime_get() + measure_period_ms;
 
@@ -581,11 +617,17 @@ int main(void)
 		 * Longest un-fed span, stalled bus:
 		 *   charger attach  : ~0.5 s pmic + 3.0 s indicate        = 3.5 s
 		 *   window opening  : ~0.5 s imu + 4.0 s one probe attempt = 4.5 s
-		 *   measuring       : FIFO read, filters, notifies        < 0.1 s
+		 *   measuring       : ~0.5 s failed FIFO read
+		 *                     + ~0.5 s ppg_off() on the 5th failure,
+		 *                       doubled under BENCH (led_solid too) = 1.5 s
+		 *   idle, IMU retry : ~1.5 s imu_init() (fed straight after)
 		 *
-		 * ~4.5 s against the 10 s budget. Add a blocking call longer than
-		 * the remaining margin and either add a feed beside it or raise
-		 * CONFIG_RING_WATCHDOG_TIMEOUT_MS.
+		 * ~4.5 s against the 10 s budget. Both ppg_off() and imu_init()
+		 * stop at their first failed write rather than grinding through
+		 * every register, which is what keeps those two bounded.
+		 *
+		 * Add a blocking call longer than the remaining margin and either
+		 * put a feed beside it or raise CONFIG_RING_WATCHDOG_TIMEOUT_MS.
 		 */
 		ring_wdt_feed();
 
@@ -612,7 +654,36 @@ int main(void)
 				 * state machine.
 				 */
 				subsystem_flags &= ~RING_FLAG_PMIC_OK;
+
+				/*
+				 * ...but do not park here forever. The only exit
+				 * from RING_CHARGING is a successful poll saying
+				 * "not charging", so a PMIC that never answers
+				 * again would strand the ring with the optics off
+				 * and nothing to re-evaluate it -- while the PPG
+				 * and IMU might be perfectly healthy. After 30 s
+				 * the charger can no longer be confirmed, and idle
+				 * is the better guess.
+				 */
+				if (pmic_fail_count < PMIC_FAIL_LIMIT) {
+					pmic_fail_count++;
+
+					if (pmic_fail_count == PMIC_FAIL_LIMIT &&
+					    state == RING_CHARGING) {
+						LOG_WRN("PMIC unreachable for %u s -- "
+							"leaving charging state, "
+							"charger can no longer be "
+							"confirmed",
+							(PMIC_FAIL_LIMIT *
+							 PMIC_POLL_MS) / 1000U);
+						state = RING_IDLE;
+						next_window = now;
+						publish_status();
+					}
+				}
 			} else {
+				pmic_fail_count = 0;
+
 				/*
 				 * Report what is actually true. This flag used to
 				 * be set unconditionally, right next to a call
@@ -683,18 +754,56 @@ int main(void)
 			break;
 
 		case RING_IDLE: {
-			int mg = imu_magnitude_mg();
+			int mg;
 
 			/*
-			 * Keep the IMU flag current, the way the PPG and PMIC
-			 * flags now are. It used to be set once at boot and never
-			 * re-evaluated, so three health bits in the same status
-			 * byte meant three different things: a cold joint on U4
-			 * (HANDOFF.md section 6) or a stuck SDA taking all three
-			 * devices down still reported the IMU as healthy, and a
-			 * phone could not tell that from a ring held still.
+			 * Retry a failed init before reading anything.
+			 *
+			 * A transient bus error during boot used to leave the IMU
+			 * dead for the life of the session -- no wake-on-motion,
+			 * ever -- exactly the "never recovers" problem that was
+			 * fixed for the PPG. imu_init() is idempotent (WHO_AM_I,
+			 * then CTRL3 and CTRL1; no reset, no destructive state), so
+			 * calling it again is safe. Re-arm the wake interrupt too:
+			 * a re-initialised part has forgotten it.
 			 */
-			if (mg < 0) {
+			if (!imu_ready && now >= next_imu_retry) {
+				next_imu_retry = now + IMU_RETRY_MS;
+
+				if (imu_init(I2C_BUS) == 0) {
+					imu_ready = true;
+					(void)imu_arm_wake(WAKE_THRESHOLD_MG);
+					LOG_INF("IMU recovered, wake re-armed");
+				}
+
+				/* Up to three I2C timeouts on a stalled bus. */
+				ring_wdt_feed();
+			}
+
+			mg = imu_magnitude_mg();
+
+			/*
+			 * Keep the IMU flag current, the way the PPG and PMIC flags
+			 * now are -- it used to be set once at boot and never
+			 * re-evaluated, so a cold joint on U4 (HANDOFF.md section 6)
+			 * or a stuck SDA still reported the IMU as healthy.
+			 *
+			 * imu_ready matters as much as the read: a successful read
+			 * only proves the bus works. An unconfigured part sitting in
+			 * power-down answers reads and returns zeros, so testing the
+			 * read alone would report a dead IMU as healthy -- the very
+			 * thing this flag was made live to stop.
+			 *
+			 * KNOWN GAP, deliberate: imu_ready is cleared only by a failed
+			 * init, never by a working part that later stops answering, so
+			 * there is no mid-run IMU re-init the way ppg_fail_count gives
+			 * the PPG one. The flag still goes false, so nothing lies --
+			 * but a part that dies mid-session stays dead until reset.
+			 * Left out rather than added untested; it is a small change
+			 * (count consecutive mg < 0, clear imu_ready at the limit) if
+			 * it turns out to matter on hardware.
+			 */
+			if (!imu_ready || mg < 0) {
 				subsystem_flags &= ~RING_FLAG_IMU_OK;
 			} else {
 				subsystem_flags |= RING_FLAG_IMU_OK;
