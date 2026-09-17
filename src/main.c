@@ -168,6 +168,30 @@ static bool imu_ready;
 static uint8_t imu_fail_count;
 #define IMU_FAIL_LIMIT		10
 
+/*
+ * Consecutive re-inits that bought nothing.
+ *
+ * imu_fail_count used to pull next_imu_retry forward to `now`, which threw
+ * the 60 s backoff away: a part whose imu_init() succeeds but whose reads
+ * always fail cycled init -> ten failed reads -> init, about two seconds per
+ * lap, for ever. On a marginal bus that is roughly six and a half seconds of
+ * I2C traffic every ten seconds, spent re-discovering the same answer.
+ *
+ * The backoff is now honoured, and this counts the laps: every time
+ * IMU_FAIL_LIMIT trips, including the first, which follows the boot
+ * imu_init() rather than a re-init. Three init-then-fail cycles in a row
+ * with no good read in between is not a transient; it is the split failure
+ * where the part answers WHO_AM_I and configures cleanly but never produces
+ * a sample. Stop, say so once, and leave it until a reset. Any successful
+ * read clears the count, so a part that really does recover is never
+ * written off.
+ */
+static uint8_t imu_reinit_count;
+#define IMU_REINIT_LIMIT	3
+
+/* Set when IMU_REINIT_LIMIT trips; only a reset clears it. */
+static bool imu_unrecoverable;
+
 /* How often to retry a failed imu_init(). It is idempotent and cheap. */
 #define IMU_RETRY_MS		60000
 
@@ -546,7 +570,21 @@ int main(void)
 	 * first and the sensors settle behind it.
 	 */
 	ble_set_control_cbs(&control_cbs);
-	(void)ble_start();
+
+	/*
+	 * ble_start()'s return used to be discarded, which made the one
+	 * failure that matters completely silent: settings_load() failing
+	 * leaves the stack unfinalised, advertising never starts, and the
+	 * ring looks like a board with a flat battery. There is no way to
+	 * report it over BLE -- BLE is what failed -- so it goes to the log
+	 * loudly, and on a bench build to the red LED as well.
+	 */
+	int ble_rc = ble_start();
+
+	if (ble_rc) {
+		LOG_ERR("BLE did not start (%d) -- no advertising, no app, no "
+			"status; sensing continues blind", ble_rc);
+	}
 
 	/*
 	 * Three quick attempts, not sixty slow ones. ppg_on() re-probes when a
@@ -557,6 +595,26 @@ int main(void)
 		LOG_WRN("MAXM86161 not responding at boot -- will retry when a "
 			"measurement window opens");
 	}
+
+#if defined(CONFIG_RING_BENCH)
+	/*
+	 * Three red blinks when BLE failed to start, so the failure is
+	 * visible on a bench with no debugger attached.
+	 *
+	 * Deliberately here rather than beside the LOG_ERR above: the LED is
+	 * driven through the MAXM86161, and up there the part has not been
+	 * probed yet, so `ppg` still holds no I2C address and the blink would
+	 * go nowhere. The boost is already up from the boot probe. This runs
+	 * before ring_wdt_start(), so the ~1.5 s it costs is not charged to
+	 * any watchdog budget.
+	 */
+	if (ble_rc) {
+		for (int i = 0; i < 3; i++) {
+			(void)maxm86161_indicate(&ppg, LEDC_LED3, 300);
+			k_msleep(200);
+		}
+	}
+#endif
 
 	/*
 	 * Load-bearing, not a diagnostic. Without this the charge current is
@@ -783,7 +841,8 @@ int main(void)
 			 * calling it again is safe. Re-arm the wake interrupt too:
 			 * a re-initialised part has forgotten it.
 			 */
-			if (!imu_ready && now >= next_imu_retry) {
+			if (!imu_ready && !imu_unrecoverable &&
+			    now >= next_imu_retry) {
 				next_imu_retry = now + IMU_RETRY_MS;
 
 				if (imu_init(I2C_BUS) == 0) {
@@ -811,27 +870,55 @@ int main(void)
 			 * read alone would report a dead IMU as healthy -- the very
 			 * thing this flag was made live to stop.
 			 *
-			 * A part that dies mid-run is now re-initialised rather than
-			 * merely reported: IMU_FAIL_LIMIT consecutive failed reads
-			 * (~2 s at the 200 ms idle poll) clear imu_ready and pull
-			 * next_imu_retry forward to now, so the retry block at the
-			 * top of this case calls imu_init() on the very next pass and
-			 * re-arms the wake interrupt if it succeeds. This is the same
-			 * recovery ppg_fail_count gives the PPG. Only counted while
-			 * imu_ready is set -- once it is clear the retry path owns the
-			 * device and there is nothing left to count down to.
+			 * KNOWN BEHAVIOUR -- a part that dies mid-run is
+			 * re-initialised rather than merely reported:
+			 * IMU_FAIL_LIMIT consecutive failed reads (~2 s at the
+			 * 200 ms idle poll) clear imu_ready, and the retry block at
+			 * the top of this case calls imu_init() again IMU_RETRY_MS
+			 * later. This is the same recovery ppg_fail_count gives the
+			 * PPG. Only counted while imu_ready is set -- once it is
+			 * clear the retry path owns the device and there is nothing
+			 * left to count down to.
+			 *
+			 * The retry is 60 s away, not immediate. Setting
+			 * next_imu_retry to `now` here discarded the backoff
+			 * entirely, and for the part this code exists to handle --
+			 * one whose init succeeds and whose reads do not -- that is
+			 * a two-second loop of init, ten failed reads, init, with no
+			 * exit: roughly 6.5 s of I2C in every 10 s, for ever, on a
+			 * bus that is already marginal.
+			 *
+			 * IMU_REINIT_LIMIT laps of that without a single good read
+			 * in between is the split failure, and no further re-init is
+			 * going to change it, so stop and say so once.
 			 */
 			if (imu_ready && mg < 0) {
 				if (imu_fail_count < IMU_FAIL_LIMIT &&
 				    ++imu_fail_count == IMU_FAIL_LIMIT) {
-					LOG_WRN("IMU unresponsive after %d reads -- "
-						"marking uninitialised, will re-init "
-						"on the next pass", IMU_FAIL_LIMIT);
 					imu_ready = false;
-					next_imu_retry = now;
+					next_imu_retry = now + IMU_RETRY_MS;
+
+					if (imu_reinit_count < IMU_REINIT_LIMIT &&
+					    ++imu_reinit_count == IMU_REINIT_LIMIT) {
+						imu_unrecoverable = true;
+						LOG_ERR("IMU unrecoverable: %d "
+							"init-then-fail cycles of "
+							"%d failed reads with no good "
+							"read in between -- no further "
+							"retries until reset",
+							IMU_REINIT_LIMIT,
+							IMU_FAIL_LIMIT);
+					} else {
+						LOG_WRN("IMU unresponsive after %d "
+							"reads -- marking "
+							"uninitialised, re-init in "
+							"%u s", IMU_FAIL_LIMIT,
+							IMU_RETRY_MS / 1000U);
+					}
 				}
 			} else if (mg >= 0) {
 				imu_fail_count = 0;
+				imu_reinit_count = 0;
 			}
 
 			if (!imu_ready || mg < 0) {

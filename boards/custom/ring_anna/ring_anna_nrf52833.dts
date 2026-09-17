@@ -45,9 +45,22 @@
  *
  * The node is channel@0, not channel@1. The channel index is just a SAADC
  * channel slot and is independent of the analog input; the input is chosen
- * by zephyr,input-positive below. This used to be channel@1, and that path
- * returned 0 mV while a hand-rolled config on channel 0 read the same pin
- * (AIN1) correctly -- see HANDOFF.md section 5, "Cause 2". Moved 2026-09-17.
+ * by zephyr,input-positive below.
+ *
+ * This used to be channel@1. The move is a hypothesis, not a confirmed fix,
+ * and it is worth being honest about that: adc_nrfx_saadc.c rejects a
+ * channel_id only when it is >= SAADC_CH_NUM, and accepts channel 1 with any
+ * input exactly as it accepts channel 0. Nothing in the driver requires
+ * index 0.
+ *
+ * The missing zephyr,vref-mv below -- already fixed -- on its own explains
+ * every 0 mV reading this project has ever recorded, because the conversion
+ * multiplied by a vref of zero. So the most likely outcome of the A/B in
+ * gsr_ain_scan() is that ch0 and ch1 read the same, meaning the index was
+ * never the fault.
+ *
+ * The move is harmless either way and has been made; the bench log decides.
+ * See HANDOFF.md section 5, "Cause 2". Moved 2026-09-17.
  */
 &adc {
 	status = "okay";
@@ -116,9 +129,14 @@
  * to link instead of quietly eating them at run time.
  *
  * NOT YET RUN ON HARDWARE. There is no bootloader and nothing else claims
- * flash on this board, so nothing should collide, but a board that has
- * been flashed with an older image will have stale bytes at 0x7c000; NVS
- * treats an unrecognised sector as empty and re-initialises it.
+ * flash on this board, so nothing should collide, but a board that has been
+ * flashed with an older image will have stale bytes at 0x7c000.
+ *
+ * NVS does NOT recover from that by itself, whatever an earlier version of
+ * this comment claimed. nvs_init() returns -EDEADLK when every sector looks
+ * closed, and only rebuilds the region if CONFIG_NVS_INIT_BAD_MEMORY_REGION
+ * is set -- which prj.conf now does, with the reasoning. Erase the part
+ * before the first flash anyway; see release/README.md.
  */
 &flash0 {
 	partitions {

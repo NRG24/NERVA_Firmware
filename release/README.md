@@ -27,17 +27,47 @@ image. Rebuild either with `git checkout v0.1-bench`, then set
 
 ---
 
-## v0.4-ble -- NOT YET RUN ON HARDWARE
+## v0.4.1 -- NOT YET RUN ON HARDWARE
 
-BLE security. The Ring Service no longer talks to an unpaired phone, bonds
-survive a power cycle, and a null-pointer crash in the PPG stream is gone.
-**Compile-verified only**, across the same four configurations. Supersedes
-v0.3-review-fixes -- flash these, not those.
+BLE security, plus the eight fixes an adversarial review of v0.4 turned up.
+The Ring Service no longer talks to an unpaired phone, bonds survive a power
+cycle, and a null-pointer crash in the PPG stream is gone. **Compile-verified
+only**, now across five configurations. Supersedes v0.3-review-fixes and the
+earlier v0.4 hexes -- flash these, not those.
+
+**What the v0.4.1 pass fixed.** The headline is that v0.4 advertised exactly
+once per boot: `BT_LE_ADV_OPT_CONN` stops the advertiser when a connection
+forms and Zephyr 4.4 has no auto-resume, so the ring went invisible the
+moment the first phone disconnected and only a reset brought it back. It now
+restarts advertising from the `bt_conn_cb.recycled` callback. Close behind
+it, a `settings_load()` failure used to be logged as a warning and ignored,
+which with `CONFIG_BT_SETTINGS` leaves the whole stack unfinalised -- no
+identity address, no advertising -- and `main()` threw away `ble_start()`'s
+return code, so the failure was completely silent; it is now fatal to BLE,
+loudly logged, and blinks the red LED three times on a bench build.
+`CONFIG_NVS_INIT_BAD_MEMORY_REGION=y` keeps a garbage storage sector from
+turning into exactly that failure, since NVS returns `-EDEADLK` on a region
+it cannot parse rather than quietly rebuilding it as the old devicetree
+comment claimed. Control opcode `0x05` clears bonds and disconnects, so the
+first phone to pair no longer owns the ring until somebody erases its flash.
+An IMU whose init succeeds but whose reads fail no longer spins through
+init-and-fail every two seconds for ever: the 60 s backoff is honoured, and
+three cycles with no good read in between stop the retries until a reset.
+The status packet is copied under a spinlock at both ends, so a GATT read
+can no longer return a torn packet. `CONFIG_RING_HRS_OPEN` makes the open
+heart rate service an explicit, documented choice rather than an accident.
+And the GSR channel@1-to-channel@0 comments were softened to say what is
+actually known: the move is a harmless hypothesis, `zephyr,vref-mv` already
+explains every 0 mV reading, and the most likely bench result is that both
+channels read the same.
 
 | File | Build |
 |---|---|
 | `ring-fw-v0.4-production.hex` | `.\build.ps1` -- no bench instruments |
 | `ring-fw-v0.4-bench.hex` | `.\build.ps1 -Bench` -- instrumented |
+
+The filenames are unchanged; the contents are the v0.4.1 images. Check
+`SHA256SUMS.txt` if you need to be sure which build you have.
 
 What changed since v0.3:
 
@@ -58,38 +88,52 @@ What changed since v0.3:
   apps keep working.
 * v0.4-sensing: the GSR ADC node moved from `channel@1` to `channel@0`
   (`io-channels = <&adc 0>`, input still `NRF_SAADC_AIN1`) -- HANDOFF.md
-  section 5 "Cause 2". Confirm on RTT with the bench line
-  `GSR   channel A/B, input fixed at AIN1:` reading `ch0` near 500 mV and
-  `ch1` at 0 mV.
+  section 5 "Cause 2". The move is a harmless hypothesis, not a confirmed
+  fix -- the missing `zephyr,vref-mv`, also fixed, already explains every
+  0 mV reading. The bench line
+  `GSR   channel A/B, input fixed at AIN1:` decides it, and the likeliest
+  result is `ch0` and `ch1` reading the same, meaning the index was never
+  the fault.
 * v0.4-sensing: an IMU that stops answering mid-run is now re-initialised.
   Ten consecutive failed reads while idle (~2 s) clear `imu_ready` and
-  trigger `imu_init()` on the next pass, so wake-on-motion comes back
-  without a reset instead of staying dead for the session.
+  `imu_init()` is retried 60 s later, so wake-on-motion comes back without
+  a reset instead of staying dead for the session. Three such cycles with
+  no good read in between and the ring gives up until it is reset.
+* v0.4.1: advertising restarts after a disconnect, a failed
+  `settings_load()` is fatal to BLE and visible, NVS self-repairs a garbage
+  sector, control opcode `0x05` clears bonds, the IMU retry honours its
+  backoff, the status packet is locked against torn reads, and
+  `CONFIG_RING_HRS_OPEN` exposes the open-HRS trade-off.
 
-Production flash grew from 180,944 B to 198,196 B (+17.3 kB) and RAM from
+Production flash grew from 180,944 B to 199,668 B (+18.3 kB) and RAM from
 47,350 B to 48,438 B (+1.1 kB). That is the settings subsystem, NVS, SMP
 bond storage and DIS. The image region is also capped at 496 kB now by
 `zephyr,code-partition`, so an image that grew into the bonds would fail to
 link rather than quietly eat them.
 
-All four configurations build with no warnings:
+All five configurations build with no warnings:
 
 | Build | Flash | RAM |
 |---|---|---|
-| production | 198,412 B (39.1% of 496 kB) | 48,438 B (37.0%) |
-| bench | 205,528 B (40.5%) | 48,502 B (37.0%) |
-| `-DCONFIG_RING_WATCHDOG=n` | 197,248 B (38.8%) | 48,374 B (36.9%) |
-| bench, `-DCONFIG_RING_GSR_MONITOR=n` | 205,060 B (40.4%) | 48,438 B (37.0%) |
+| production | 199,668 B (39.31% of 496 kB) | 48,438 B (36.96%) |
+| bench | 206,816 B (40.72%) | 48,502 B (37.00%) |
+| `-DCONFIG_RING_WATCHDOG=n` | 198,520 B (39.09%) | 48,374 B (36.91%) |
+| bench, `-DCONFIG_RING_GSR_MONITOR=n` | 206,360 B (40.63%) | 48,438 B (36.96%) |
+| `-DCONFIG_RING_HRS_OPEN=n` | 199,668 B (39.31%) | 48,438 B (36.96%) |
 
-These are the v0.4-sensing figures, and they are what the hex files in this
-directory contain. The two sensing fixes cost 216 B of flash over v0.4-ble
-and no RAM.
+These are the v0.4.1 figures, and they are what the hex files in this
+directory contain. The eight review fixes cost 1,256 B of flash over
+v0.4-sensing and no RAM. Closing the HRS costs nothing either way -- it
+only changes a permission constant.
 
 ### First flash needs a full chip erase
 
 The partition layout changed. A board carrying a v0.3 image has whatever the
-old image left at 0x7c000, and while NVS should treat an unrecognised sector
-as empty, that path has never been exercised here. Erase, then flash:
+old image left at 0x7c000. v0.4.1 sets `CONFIG_NVS_INIT_BAD_MEMORY_REGION=y`
+so NVS rebuilds a region it cannot parse instead of returning `-EDEADLK`,
+but that path has never been exercised here and a `settings_load()` failure
+now costs the ring its radio. Erase first; the recovery is a safety net, not
+a plan. Erase, then flash:
 
 ```
 python -m pyocd erase -t nrf52833 -f 1000000 --chip

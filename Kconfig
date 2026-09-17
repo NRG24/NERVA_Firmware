@@ -97,6 +97,38 @@ config RING_WATCHDOG_TIMEOUT_MS
 	  a margin that did not exist. Read main.c rather than trusting a
 	  figure quoted here.
 
+config RING_HRS_OPEN
+	bool "Leave the standard Heart Rate Service readable without pairing"
+	default y
+	depends on BT_HRS
+	help
+	  Heart rate is a biometric, and by default this firmware broadcasts
+	  it over the standard Heart Rate Service (0x180D) with no encryption
+	  required: anyone in range who connects can read it. That is a
+	  deliberate trade, not an oversight.
+
+	  Keep it y and any off-the-shelf HR app -- a watch face, a cycling
+	  computer, a generic BLE HRM client -- pairs with nothing and just
+	  works, which is the whole point of implementing the SIG service
+	  instead of only the custom one. The cost is that resting heart rate
+	  leaks to anybody within a few metres.
+
+	  Set it to n and the HRS characteristics require an encrypted link,
+	  so only a bonded phone can read heart rate. Generic clients that do
+	  not pair will see the service, fail to subscribe, and show nothing.
+	  The Ring Service status packet has always been encrypted and carries
+	  hr_x10, so a first-party app loses nothing either way.
+
+	  This does not touch the Battery Service, which stays open.
+
+# Selecting a choice entry provokes a Kconfig warning, so steer the choice
+# instead. This file is KCONFIG_ROOT and sources Kconfig.zephyr at the end,
+# so this default is evaluated before the upstream one in
+# subsys/bluetooth/services/Kconfig.hrs.
+choice BT_HRS_DEFAULT_PERM
+	default BT_HRS_DEFAULT_PERM_RW_ENCRYPT if BT_HRS && !RING_HRS_OPEN
+endchoice
+
 endmenu
 
 source "Kconfig.zephyr"

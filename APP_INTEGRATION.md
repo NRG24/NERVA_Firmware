@@ -1,6 +1,6 @@
 # App integration guide
 
-Everything a phone app needs to talk to the ring. Firmware as of v0.4
+Everything a phone app needs to talk to the ring. Firmware as of v0.4.1
 (2026-09-17).
 
 ---
@@ -104,9 +104,13 @@ Practical notes:
 * **Raise security first, then subscribe.** Firing four subscriptions at
   an unencrypted link gets you four errors, and some stacks give up
   rather than retry after pairing.
-* **There is no way to clear a bond from the app.** No opcode does it. A
-  user who unpairs on the phone and reconnects will fail to encrypt until
-  the ring's flash is erased over SWD. Known gap, no fix yet.
+* **Clearing a bond is control opcode `0x05`.** New in v0.4.1. It erases
+  every bond on the ring and then drops the connection, so the next phone
+  to connect pairs from scratch. Send it when the user taps "forget this
+  ring", *before* you unpair on the phone side — the control
+  characteristic needs an encrypted link, so once the phone has forgotten
+  its keys the opcode is no longer reachable and only an SWD erase gets
+  the ring back. Expect the disconnect; it is not an error.
 * Bonds survive a reboot and a battery pull. They live in a 16 kB
   settings partition at the top of flash.
 * Just Works means no MITM protection. Passive eavesdropping after
@@ -149,7 +153,7 @@ subsystem is answering right now:
 | Bit | Cleared when |
 |---|---|
 | 2 PPG | five consecutive FIFO reads fail, or a re-probe finds nothing |
-| 3 IMU | an accelerometer read fails while idle; after 10 consecutive failures (~2 s) the driver is also marked uninitialised and `imu_init()` is retried on the next pass, so the bit comes back by itself if the part recovers |
+| 3 IMU | an accelerometer read fails while idle; after 10 consecutive failures (~2 s) the driver is also marked uninitialised and `imu_init()` is retried **60 s later**, so the bit comes back by itself if the part recovers. After three such re-inits with no good read in between, the ring stops retrying until it is reset and the bit stays clear — a part that initialises cleanly and never produces a sample is not going to be fixed by a fourth attempt, and the retries cost real I2C traffic |
 | 4 PMIC | a PMIC transaction fails |
 
 Each is set again as soon as the device answers, so a bit that flickers is
@@ -237,9 +241,19 @@ Write (with or without response). First byte is the opcode.
 | `0x02` | `u8 on` | IMU streaming on/off |
 | `0x03` | none | Start a measurement window immediately, skipping the duty cycle |
 | `0x04` | `u16 window_s`, `u16 period_s` | Set duty cycle, little-endian |
+| `0x05` | none | Clear every bond, then disconnect |
 
 Duty cycle values are clamped in firmware: window 5-300 s, period
 window-3600 s. Defaults are a **15 s window every 60 s**, i.e. 25% duty.
+
+`0x05` is the unpair path. `CONFIG_BT_MAX_PAIRED` is 1 and
+`CONFIG_BT_KEYS_OVERWRITE_OLDEST` is deliberately off, so without it the
+first phone to pair owns the ring until somebody erases its flash over SWD.
+The control characteristic is `BT_GATT_PERM_WRITE_ENCRYPT`, so the write
+can only arrive over an encrypted link — on a ring holding exactly one
+bond, that means the bonded owner and nobody else. The ring drops the
+connection immediately afterwards, because the keys protecting that link
+have just been deleted.
 
 Both streams are forced off on disconnect, so a phone that walks away
 cannot leave the ring burning battery.
@@ -255,6 +269,12 @@ Example — 10 s window every 5 minutes:
 ```
 write [0x04, 0x0A, 0x00, 0x2C, 0x01]
               window=10        period=300
+```
+
+Example — hand the ring to somebody else:
+
+```
+write [0x05]        then expect a disconnect
 ```
 
 ---
@@ -336,16 +356,32 @@ active attacker present during the pairing exchange can still get in the
 middle. Once bonded, the link is encrypted and passive eavesdropping is
 out.
 
-Two gaps remain. There is no way to clear a bond from the app, so a user
-who unpairs on the phone cannot re-pair without an SWD erase. And the
-standard Heart Rate and Battery services are deliberately left open so
-off-the-shelf HR apps keep working — heart rate and battery percentage
-are readable without pairing, by design. If that is not acceptable for
-your product, those two services need encrypted permissions too.
+The bond-clearing gap is closed as of v0.4.1: control opcode `0x05`
+erases every bond and disconnects, so a ring can change hands without a
+debugger. See section 6.
 
-**None of the v0.4 BLE work has run on hardware.** It compiles across all
-four build configurations and nothing more. No phone has paired with this
-ring, and the flash partition that holds the bonds has never been written.
+**Heart rate is broadcast unencrypted, and that is a decision.** The
+standard Heart Rate Service (`0x180D`) requires no pairing to read, so
+anyone in range who connects can see the wearer's heart rate. It stays
+that way by default, because the entire reason for implementing the SIG
+service alongside the custom one is that a watch face or a cycling
+computer that knows nothing about this ring still works. Requiring
+encryption there would break every generic client and buy a first-party
+app nothing, since `hr_x10` has always been available in the encrypted
+Ring Service status packet.
+
+The trade is exposed rather than hidden: `CONFIG_RING_HRS_OPEN` (Kconfig,
+default `y`). Build with `-DCONFIG_RING_HRS_OPEN=n` and the HRS
+characteristics move to `CONFIG_BT_HRS_DEFAULT_PERM_RW_ENCRYPT`, so only a
+bonded phone can read heart rate; generic clients will discover the
+service and fail to subscribe. Nothing in the advertising data changes, so
+scan filters keep working either way. The Battery Service is untouched and
+stays open in both builds.
+
+**None of the v0.4 or v0.4.1 BLE work has run on hardware.** It compiles
+across five build configurations and nothing more. No phone has paired with
+this ring, the flash partition that holds the bonds has never been written,
+and no bond has ever been cleared.
 
 ---
 

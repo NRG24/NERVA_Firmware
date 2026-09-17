@@ -56,6 +56,18 @@ static atomic_t imu_stream_on;
 static struct k_spinlock conn_lock;
 static struct bt_conn *active_conn;
 
+/*
+ * latest_status is written whole by the main loop through
+ * ble_publish_status() and read by the BT RX thread in read_status(). A
+ * 20-byte struct is not copied atomically, so an unlocked GATT read could
+ * return half of one sample and half of the next -- a packet the app has no
+ * way to recognise as torn. Its own lock rather than conn_lock, because the
+ * two protect unrelated things and sharing one would only widen both.
+ *
+ * Nothing calls into the BT stack while holding it: read_status() takes a
+ * stack copy under the lock and hands bt_gatt_attr_read() the copy.
+ */
+static struct k_spinlock status_lock;
 static struct ring_status latest_status;
 static const struct ble_control_cbs *control_cbs;
 static uint32_t ppg_seq;
@@ -74,14 +86,37 @@ static const struct bt_data sd[] = {
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
+/*
+ * Both the initial start and the restart after a disconnect go through here,
+ * so the two can never drift apart in the ad/sd they use.
+ *
+ * BT_LE_ADV_CONN_FAST_1 sets BT_LE_ADV_OPT_CONN, and the host stops the
+ * advertiser as soon as a connection forms. Zephyr 4.4 has no auto-resume --
+ * bt_le_adv_resume() no longer exists anywhere in the tree -- so without an
+ * explicit restart the ring advertises exactly once per boot and is
+ * invisible for ever after the first phone walks away.
+ */
+static int adv_start(void)
+{
+	return bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd,
+			       ARRAY_SIZE(sd));
+}
+
 /* --- GATT -------------------------------------------------------------- */
 
 static ssize_t read_status(struct bt_conn *conn,
 			   const struct bt_gatt_attr *attr, void *buf,
 			   uint16_t len, uint16_t offset)
 {
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, &latest_status,
-				 sizeof(latest_status));
+	struct ring_status snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&status_lock);
+	snapshot = latest_status;
+	k_spin_unlock(&status_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
 }
 
 static void status_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
@@ -105,6 +140,7 @@ static void imu_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
  *   0x02 <u8 on>                     IMU streaming
  *   0x03                             start a measurement window now
  *   0x04 <u16 window_s> <u16 period_s>  set duty cycle
+ *   0x05                             clear every bond
  */
 static ssize_t write_control(struct bt_conn *conn,
 			     const struct bt_gatt_attr *attr, const void *buf,
@@ -158,6 +194,38 @@ static ssize_t write_control(struct bt_conn *conn,
 			control_cbs->set_duty(window_s, period_s);
 		}
 		LOG_INF("control: duty %u s every %u s", window_s, period_s);
+		break;
+	}
+
+	case 0x05: {
+		/*
+		 * Clear bonds, so a ring is not owned for ever by whichever
+		 * phone reached it first. CONFIG_BT_MAX_PAIRED is 1 and
+		 * CONFIG_BT_KEYS_OVERWRITE_OLDEST is deliberately left off --
+		 * silently evicting the owner's keys for any stranger who
+		 * pairs is a worse failure than refusing the stranger -- so
+		 * without this opcode the only way back was an SWD erase.
+		 *
+		 * This characteristic is BT_GATT_PERM_WRITE_ENCRYPT, so the
+		 * write can only arrive over an encrypted link, which on a
+		 * ring that has exactly one bond means the bonded owner. An
+		 * unpaired phone in range gets ATT 0x0F and nothing else.
+		 *
+		 * Disconnect afterwards: the keys backing this very link are
+		 * gone, so the peer must come back and pair again rather than
+		 * keep talking on a bond that no longer exists.
+		 */
+		int unpair_rc = bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+
+		if (unpair_rc) {
+			LOG_ERR("control: clear bonds failed (%d)", unpair_rc);
+		} else {
+			LOG_WRN("control: bonds cleared -- the next connection "
+				"has to pair again");
+		}
+
+		(void)bt_conn_disconnect(conn,
+					 BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 		break;
 	}
 
@@ -304,10 +372,30 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 	}
 }
 
+/*
+ * The connection object has been freed, which is the point at which the host
+ * will accept a new advertiser. disconnected() is too early: the object is
+ * still alive there and bt_le_adv_start() can come back -ENOMEM. This is the
+ * restart path the BT_LE_ADV_OPT_CONN documentation points at.
+ */
+static void recycled(void)
+{
+	int err = adv_start();
+
+	if (err) {
+		LOG_ERR("advertising failed to restart (%d) -- the ring is "
+			"invisible to every phone until it resets", err);
+		return;
+	}
+
+	LOG_INF("advertising restarted");
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
 	.security_changed = security_changed,
+	.recycled = recycled,
 };
 
 /* --- pairing ----------------------------------------------------------- */
@@ -412,15 +500,25 @@ int ble_start(void)
 	 * Bonds live in the settings partition. This has to run after
 	 * bt_enable() and before advertising, or a phone that is already
 	 * bonded reconnects to a ring that has forgotten its keys.
+	 *
+	 * It is load-bearing for far more than the bonds. With
+	 * CONFIG_BT_SETTINGS the stack is NOT finished when bt_enable()
+	 * returns 0 -- hci_core.c logs "No ID address. App must call
+	 * settings_load()" and defers the rest to the settings commit
+	 * handler. A failure here therefore leaves no identity address, and
+	 * bt_le_adv_start() below fails too. Treating it as a warning meant
+	 * a ring that logged one line about lost bonds and then never
+	 * advertised again, with nothing saying why.
 	 */
 	err = settings_load();
 	if (err) {
-		LOG_ERR("settings_load failed (%d) -- bonds are lost", err);
+		LOG_ERR("settings_load failed (%d) -- BLE stack not finalised, "
+			"no advertising, bonds lost", err);
+		return err;
 	}
 #endif
 
-	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
-			      sd, ARRAY_SIZE(sd));
+	err = adv_start();
 	if (err) {
 		LOG_ERR("advertising failed to start (%d)", err);
 		return err;
@@ -463,14 +561,24 @@ void ble_notify_battery(uint8_t percent)
 
 void ble_publish_status(const struct ring_status *status)
 {
+	struct ring_status snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&status_lock);
 	latest_status = *status;
+	snapshot = latest_status;
+	k_spin_unlock(&status_lock, key);
 
 	if (!ble_is_connected() || !atomic_get(&status_subscribed)) {
 		return;
 	}
 
-	(void)bt_gatt_notify(NULL, ATTR_STATUS, &latest_status,
-			     sizeof(latest_status));
+	/*
+	 * Notify from the snapshot, not from latest_status: the lock is
+	 * released before this call because the BT stack must never be
+	 * entered with a spinlock held.
+	 */
+	(void)bt_gatt_notify(NULL, ATTR_STATUS, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_ppg(const uint32_t *samples, uint8_t count)

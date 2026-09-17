@@ -604,18 +604,18 @@ static int gsr_sample_mv(void)
  * Which analog input actually lands on P0.03?
  *
  * The front end is measured good -- V_OUT_GSR sits at V_REF (0.5 V) with the
- * electrodes open, exactly as designed -- yet the ADC returns 0. So the
- * SAADC is sampling something that is not this pin.
+ * electrodes open, exactly as designed -- and the ADC used to return 0.
  *
- * The suspicion is an off-by-one. The devicetree constants are zero-based
- * (NRF_SAADC_AIN0 = 0) while the hardware PSELP field is one-based, with 0
- * meaning "not connected". The driver assigns pin_p straight from the
- * devicetree value with no conversion, so `NRF_SAADC_AIN1` could be
- * selecting AIN0 -- P0.02, which is unconnected on this board and would
- * read exactly the 0 mV we see.
+ * The first suspicion was an off-by-one, the devicetree constants being
+ * zero-based (NRF_SAADC_AIN0 = 0) while the hardware PSELP field is
+ * one-based with 0 meaning "not connected". Sweeping every input settles
+ * that without more datasheet archaeology: whichever index reports ~500 mV
+ * is the one wired to P0.03.
  *
- * Sweeping every input settles it without any more datasheet archaeology:
- * whichever index reports ~500 mV is the one wired to P0.03.
+ * Read the result against the mundane explanation, which is that the node
+ * had no zephyr,vref-mv and adc_raw_to_millivolts_dt() therefore multiplied
+ * every sample by zero. That alone accounts for every 0 mV reading in this
+ * project's history, and it is already fixed.
  *
  * Raw counts scale as VDD/4 reference with gain 1/4, so full scale is
  * VDD = 1800 mV over 12 bits.
@@ -668,28 +668,37 @@ static void gsr_ain_scan(void)
 
 	/*
 	 * The scan above reads this pin fine on a hand-built config, so the
-	 * hardware and the AIN index are both right. The DT-driven path read 0
-	 * from the same pin, so print what ADC_DT_SPEC_GET_BY_IDX actually
-	 * produced rather than assuming it matches the devicetree. After the
-	 * channel move this is where ch_id=0 should now show up.
+	 * hardware and the AIN index are both right. Print what
+	 * ADC_DT_SPEC_GET_BY_IDX actually produced rather than assuming it
+	 * matches the devicetree; after the channel move ch_id=0 is what
+	 * should show up.
 	 */
 	/*
-	 * A/B the only variable left: the channel index.
+	 * A/B the remaining variable: the channel index.
 	 *
 	 * The scan above reads AIN1 correctly on channel 0. The devicetree
-	 * path used to be byte-for-byte identical except that it sat on
-	 * channel 1, and it returned 0. So hold the input at AIN1 and sweep
-	 * the channel index. If low indices work and higher ones return 0,
-	 * the fault is the channel number, not the pin.
+	 * path was byte-for-byte identical except that it sat on channel 1,
+	 * and it returned 0 -- but it also had no zephyr,vref-mv at the time,
+	 * which by itself forces every conversion to 0 mV. So the index was
+	 * never shown to be at fault; it was the last untested difference.
 	 *
-	 * THE MOVE HAS BEEN MADE: the devicetree node is now channel@0 with
-	 * reg = <0> and io-channels = <&adc 0>, input still NRF_SAADC_AIN1.
-	 * This sweep stays as the bench confirmation, and it is the line
+	 * Nothing in the driver supports the index theory either:
+	 * adc_nrfx_saadc.c rejects a channel_id only when it is >=
+	 * SAADC_CH_NUM, and treats channel 1 exactly like channel 0. The
+	 * likeliest outcome of this sweep is therefore that every index reads
+	 * about the same ~500 mV, which would mean the index was never the
+	 * fault and vref-mv was the whole of it.
+	 *
+	 * THE MOVE HAS BEEN MADE AND IS HARMLESS: the devicetree node is now
+	 * channel@0 with reg = <0> and io-channels = <&adc 0>, input still
+	 * NRF_SAADC_AIN1. It is not being reverted. This sweep stays because
+	 * it is what decides the question, and the line
 	 *
 	 *     GSR   channel A/B, input fixed at AIN1: ch0=<n>mV ch1=... ...
 	 *
-	 * that settles it: ch0 reading ~500 mV while ch1 reads 0 mV confirms
-	 * the channel index was the fault and that the move fixes it.
+	 * is the log to read: ch0 and ch1 both near 500 mV means the index was
+	 * irrelevant, ch0 near 500 mV with ch1 at 0 mV would be the surprise
+	 * and would make the move the fix after all.
 	 */
 	n = 0;
 	for (uint8_t ch = 0; ch < 4 && n < (int)sizeof(line) - 24; ch++) {

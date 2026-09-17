@@ -153,12 +153,25 @@ Duty cycle is runtime-adjustable from the app (control opcode `0x04`).
   "GSR reads a hard 0" observation in this project came through that
   multiply. The property is now set to 450 (VDD/4 with VDD = 1.8 V).
 
-  Cause 2, fix applied but still unconfirmed on hardware: with vref-mv
-  fixed, a hand-rolled SAADC config on **channel 0** reads ~500 mV from
-  AIN1 (P0.03) correctly, while the devicetree path -- byte-identical
-  except that it used **channel 1** -- still returned 0.
+  Cause 2, a hypothesis with a harmless change already applied, and
+  probably not a cause at all: a hand-rolled SAADC config on **channel 0**
+  read ~500 mV from AIN1 (P0.03) correctly, while the devicetree path --
+  byte-identical except that it used **channel 1** -- returned 0.
 
-  **The move has been made.** As of 2026-09-17 the devicetree node in
+  Two things undercut it. The devicetree path was missing `zephyr,vref-mv`
+  at the time, and that alone forces every conversion to 0 mV however good
+  the sample is, which is Cause 1 and is already fixed. And the driver does
+  not care: `adc_nrfx_saadc.c` rejects a `channel_id` only when it is
+  `>= SAADC_CH_NUM`, and accepts channel 1 with any input exactly as it
+  accepts channel 0. Nothing requires index 0.
+
+  So the honest position is that the channel index was the last untested
+  difference, not a demonstrated fault, and the **most likely outcome is
+  that ch0 and ch1 read the same** -- meaning the index was never the
+  problem and Cause 1 was the whole of it.
+
+  **The move has been made and is not being reverted** -- it costs nothing
+  and removes the variable. As of 2026-09-17 the devicetree node in
   `ring_anna_nrf52833.dts` is `channel@0` with `reg = <0>`, and
   `zephyr,user` has `io-channels = <&adc 0>`. Every other property is
   unchanged, including `zephyr,input-positive = <NRF_SAADC_AIN1>` -- the
@@ -175,13 +188,14 @@ Duty cycle is runtime-adjustable from the app (control opcode `0x04`).
   GSR   channel A/B, input fixed at AIN1: ch0=<n>mV ch1=<n>mV ch2=... ch3=...
   ```
 
-  `ch0` near 500 mV with `ch1` at 0 mV confirms the channel index was the
-  fault and that the move fixes it. Cross-check with the two lines that
-  follow it: `GSR   path A/B: dt raw=... || hand raw=...` should now show
-  both raw counts non-zero and within a few LSB of each other, and
-  `GSR   dt spec: ch_id=0 input_p=1 ...` should report ch_id=0. If instead
-  `ch0` and `ch1` both read ~500 mV, the channel index was never the
-  problem and Cause 2 needs reopening.
+  **The A/B log decides this, nothing else.** `ch0` and `ch1` both near
+  500 mV -- the expected result -- means the channel index was never the
+  problem, Cause 2 is closed as a non-cause, and `zephyr,vref-mv` was the
+  whole fix. `ch0` near 500 mV with `ch1` at 0 mV would be the surprise,
+  and would make the move the fix after all. Cross-check with the two
+  lines that follow: `GSR   path A/B: dt raw=... || hand raw=...` should
+  show both raw counts non-zero and within a few LSB of each other, and
+  `GSR   dt spec: ch_id=0 input_p=1 ...` should report ch_id=0.
 
   The meter measurements were correct all along: V_OUT_GSR sits at V_REF
   (~0.5 V) with the electrodes open, exactly as the topology predicts.
