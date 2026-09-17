@@ -11,6 +11,7 @@
 	chosen {
 		zephyr,sram = &sram0;
 		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
 	};
 
 	zephyr,user {
@@ -91,4 +92,42 @@
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
+};
+
+/*
+ * nrf52833_qiaa.dtsi gives flash0 as one undivided 512 kB region with no
+ * partitions node at all, so there was nowhere for the settings subsystem
+ * to put BLE bonds. Split it.
+ *
+ * 16 kB of storage is four erase pages; settings_nvs caps its sector count
+ * at what the partition actually holds, so this gives NVS four sectors --
+ * ample for a single bond's keys and CCC state, and it leaves 496 kB for
+ * the image.
+ *
+ * zephyr,code-partition above is what makes this binding rather than
+ * decorative: with CONFIG_USE_DT_CODE_PARTITION the linker is told the
+ * image ends at 0x7c000, so an image that grew into the bonds would fail
+ * to link instead of quietly eating them at run time.
+ *
+ * NOT YET RUN ON HARDWARE. There is no bootloader and nothing else claims
+ * flash on this board, so nothing should collide, but a board that has
+ * been flashed with an older image will have stale bytes at 0x7c000; NVS
+ * treats an unrecognised sector as empty and re-initialises it.
+ */
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		slot0_partition: partition@0 {
+			label = "image-0";
+			reg = <0x00000000 0x0007c000>;
+		};
+
+		storage_partition: partition@7c000 {
+			label = "storage";
+			reg = <0x0007c000 0x00004000>;
+		};
+	};
 };

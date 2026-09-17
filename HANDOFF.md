@@ -243,9 +243,15 @@ stuck SDA was the same bad joint.
 * Verify IMU wake (section 6)
 * Validate HR against a reference monitor
 * Test GSR with the electrodes bridged
-* Test the custom BLE service from a phone — nothing has exercised it
-* **Add BLE encryption/bonding.** Currently anyone in range can connect and
-  read biometric data. Must be fixed before shipping.
+* Test the custom BLE service from a phone — nothing has exercised it,
+  and as of v0.4 that includes pairing: the Ring Service now refuses an
+  unencrypted link, so an app that does not pair sees nothing at all
+* **BLE encryption/bonding: done in v0.4, unverified.** The Ring Service
+  characteristics and CCCs require an encrypted link, pairing is Just
+  Works (no display, no keypad), and bonds persist in a 16 kB settings
+  partition at 0x7c000. Compile-verified only. Still missing: a way to
+  clear a bond without an SWD erase, and MITM protection, which this
+  hardware cannot provide. HRS and BAS are deliberately still open.
 * Respin the PCB with the nine changes in `HARDWARE_NOTES.md`, especially
   the debug connector and the TS divider
 

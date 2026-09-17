@@ -4,3 +4,5 @@
 65a14c86c6738a7cb8940763a740ce1b15fc5dfdb3c5566bca33382bc473dde4 *release/ring-fw-v0.2-phase1-production.hex
 72c13b736fec29c920bfc274b8af31041f9e46b9ed265ed605242a5e127381f1 *release/ring-fw-v0.3-bench.hex
 4304a848eae9331637964fe18549c99191cb266743fb6395875061ff56fe1c7a *release/ring-fw-v0.3-production.hex
+f2b399f95d5b9cc67c359dd47ae69eabc65711776afdbe3b390f10d98bfa479a *release/ring-fw-v0.4-bench.hex
+d255f764b48cd556b32b15f112b35d088c183985a26062f13970fba0c4ec9b86 *release/ring-fw-v0.4-production.hex

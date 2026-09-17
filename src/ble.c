@@ -9,6 +9,9 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#if defined(CONFIG_BT_SETTINGS)
+#include <zephyr/settings/settings.h>
+#endif
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 
@@ -42,6 +45,16 @@ static atomic_t ppg_subscribed;
 static atomic_t imu_subscribed;
 static atomic_t ppg_stream_on;
 static atomic_t imu_stream_on;
+
+/*
+ * The one connection we allow (CONFIG_BT_MAX_CONN=1), held with a
+ * reference so it cannot be freed while another thread is using it.
+ * Written from the BT RX thread in connected()/disconnected(), read from
+ * the main loop in ble_publish_ppg(), so every access goes through the
+ * spinlock and hands back its own reference.
+ */
+static struct k_spinlock conn_lock;
+static struct bt_conn *active_conn;
 
 static struct ring_status latest_status;
 static const struct ble_control_cbs *control_cbs;
@@ -156,27 +169,38 @@ static ssize_t write_control(struct bt_conn *conn,
 	return len;
 }
 
+/*
+ * Every Ring Service attribute demands an encrypted link. The control
+ * characteristic is the one that mattered most: with a plain
+ * BT_GATT_PERM_WRITE anyone in range could write opcodes and force
+ * measurement windows on someone else's ring. The standard HRS and BAS
+ * are left open so off-the-shelf HR apps keep working.
+ */
 BT_GATT_SERVICE_DEFINE(ring_svc,
 	BT_GATT_PRIMARY_SERVICE(&uuid_svc),
 
 	BT_GATT_CHARACTERISTIC(&uuid_status.uuid,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-			       BT_GATT_PERM_READ, read_status, NULL, NULL),
+			       BT_GATT_PERM_READ_ENCRYPT, read_status, NULL,
+			       NULL),
 	BT_GATT_CCC(status_ccc_changed,
-		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 
 	BT_GATT_CHARACTERISTIC(&uuid_ppg.uuid, BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
-	BT_GATT_CCC(ppg_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CCC(ppg_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 
 	BT_GATT_CHARACTERISTIC(&uuid_imu.uuid, BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
-	BT_GATT_CCC(imu_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CCC(imu_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 
 	BT_GATT_CHARACTERISTIC(&uuid_control.uuid,
 			       BT_GATT_CHRC_WRITE |
 			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
-			       BT_GATT_PERM_WRITE, NULL, write_control, NULL),
+			       BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_control,
+			       NULL),
 );
 
 /* Attribute indices: 1 = status value, 4 = ppg value, 7 = imu value. */
@@ -184,11 +208,49 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 #define ATTR_PPG	(&ring_svc.attrs[4])
 #define ATTR_IMU	(&ring_svc.attrs[7])
 
+/* --- connection tracking ----------------------------------------------- */
+
+/*
+ * Install @new as the active connection and hand back whatever was there,
+ * with its reference, for the caller to release outside the lock.
+ */
+static struct bt_conn *conn_swap(struct bt_conn *new)
+{
+	k_spinlock_key_t key;
+	struct bt_conn *old;
+
+	key = k_spin_lock(&conn_lock);
+	old = active_conn;
+	active_conn = new;
+	k_spin_unlock(&conn_lock, key);
+
+	return old;
+}
+
+/*
+ * A referenced handle on the active connection, or NULL when nobody is
+ * connected. The caller must bt_conn_unref() it. Taking the reference
+ * under the lock is what stops disconnected() freeing the object while a
+ * caller is still holding the pointer.
+ */
+static struct bt_conn *conn_get(void)
+{
+	k_spinlock_key_t key;
+	struct bt_conn *conn;
+
+	key = k_spin_lock(&conn_lock);
+	conn = active_conn ? bt_conn_ref(active_conn) : NULL;
+	k_spin_unlock(&conn_lock, key);
+
+	return conn;
+}
+
 /* --- connection callbacks ---------------------------------------------- */
 
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
+	struct bt_conn *old;
 
 	if (err) {
 		LOG_ERR("connection failed (0x%02x)", err);
@@ -197,12 +259,28 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	atomic_inc(&connected_count);
+
+	old = conn_swap(bt_conn_ref(conn));
+
+	if (old) {
+		/* Should not happen with CONFIG_BT_MAX_CONN=1. */
+		LOG_WRN("replacing a connection that never disconnected");
+		bt_conn_unref(old);
+	}
+
 	LOG_INF("connected to %s", addr);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
+	struct bt_conn *old;
+
+	old = conn_swap(NULL);
 	atomic_dec(&connected_count);
+
+	if (old) {
+		bt_conn_unref(old);
+	}
 
 	/* Streaming is expensive; never leave it running for a gone phone. */
 	atomic_set(&ppg_stream_on, 0);
@@ -211,9 +289,78 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	LOG_INF("disconnected (reason 0x%02x)", reason);
 }
 
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+			     enum bt_security_err err)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+
+	if (err) {
+		LOG_WRN("security with %s failed at level %u (err %d)", addr,
+			level, err);
+	} else {
+		LOG_INF("security with %s is level %u", addr, level);
+	}
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.security_changed = security_changed,
+};
+
+/* --- pairing ----------------------------------------------------------- */
+
+/*
+ * The ring has no display and no keypad, so the only association model
+ * available is Just Works: no MITM protection, but the link is encrypted
+ * and the bond survives a reboot. Registering neither passkey_display nor
+ * passkey_entry is what tells the SMP layer our IO capability is
+ * NoInputNoOutput -- see get_io_capa() in subsys/bluetooth/host/smp.c.
+ */
+static void auth_pairing_confirm(struct bt_conn *conn)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_INF("pairing requested by %s, accepting (Just Works)", addr);
+
+	(void)bt_conn_auth_pairing_confirm(conn);
+}
+
+static void auth_cancel(struct bt_conn *conn)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_WRN("pairing with %s cancelled", addr);
+}
+
+static const struct bt_conn_auth_cb auth_cb = {
+	.pairing_confirm = auth_pairing_confirm,
+	.cancel = auth_cancel,
+};
+
+static void pairing_complete(struct bt_conn *conn, bool bonded)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_INF("paired with %s, bonded %s", addr, bonded ? "yes" : "no");
+}
+
+static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	LOG_WRN("pairing with %s failed (reason %d)", addr, reason);
+}
+
+static struct bt_conn_auth_info_cb auth_info_cb = {
+	.pairing_complete = pairing_complete,
+	.pairing_failed = pairing_failed,
 };
 
 /* --- API --------------------------------------------------------------- */
@@ -242,11 +389,35 @@ int ble_start(void)
 {
 	int err;
 
+	err = bt_conn_auth_cb_register(&auth_cb);
+	if (err) {
+		LOG_ERR("auth callbacks rejected (%d)", err);
+		return err;
+	}
+
+	err = bt_conn_auth_info_cb_register(&auth_info_cb);
+	if (err) {
+		LOG_ERR("auth info callbacks rejected (%d)", err);
+		return err;
+	}
+
 	err = bt_enable(NULL);
 	if (err) {
 		LOG_ERR("bt_enable failed (%d)", err);
 		return err;
 	}
+
+#if defined(CONFIG_BT_SETTINGS)
+	/*
+	 * Bonds live in the settings partition. This has to run after
+	 * bt_enable() and before advertising, or a phone that is already
+	 * bonded reconnects to a ring that has forgotten its keys.
+	 */
+	err = settings_load();
+	if (err) {
+		LOG_ERR("settings_load failed (%d) -- bonds are lost", err);
+	}
+#endif
 
 	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
 			      sd, ARRAY_SIZE(sd));
@@ -264,8 +435,10 @@ int ble_start(void)
 		bt_addr_le_to_str(&addrs[0], addr_str, sizeof(addr_str));
 	}
 
+	LOG_INF("firmware revision %s", CONFIG_BT_DIS_FW_REV_STR);
 	LOG_INF("advertising as %s, addr %s", CONFIG_BT_DEVICE_NAME, addr_str);
-	LOG_INF("services: Heart Rate, Battery, Ring");
+	LOG_INF("services: Heart Rate, Battery, Device Information, Ring");
+	LOG_INF("Ring Service requires an encrypted link (Just Works pairing)");
 
 	return 0;
 }
@@ -308,6 +481,8 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 	 * notification by the 23-byte default.
 	 */
 	uint8_t buf[5 + 40 * sizeof(uint32_t)];
+	struct bt_conn *conn;
+	uint16_t mtu;
 	uint16_t mtu_payload;
 	uint8_t max_samples;
 	uint8_t n;
@@ -316,7 +491,24 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 		return;
 	}
 
-	mtu_payload = bt_gatt_get_mtu(NULL) - 3;
+	/*
+	 * bt_gatt_get_mtu(NULL) is not a "use the default" shorthand: it
+	 * reaches att_get(), which dereferences conn->state and faults. There
+	 * is no MTU to ask about when nobody is connected, so leave.
+	 */
+	conn = conn_get();
+	if (!conn) {
+		return;
+	}
+
+	mtu = bt_gatt_get_mtu(conn);
+	bt_conn_unref(conn);
+
+	if (mtu < 3) {
+		return;
+	}
+
+	mtu_payload = mtu - 3;
 	max_samples = (mtu_payload > 5) ? (mtu_payload - 5) / sizeof(uint32_t)
 				        : 0;
 	if (max_samples > 40) {

@@ -27,6 +27,74 @@ image. Rebuild either with `git checkout v0.1-bench`, then set
 
 ---
 
+## v0.4-ble -- NOT YET RUN ON HARDWARE
+
+BLE security. The Ring Service no longer talks to an unpaired phone, bonds
+survive a power cycle, and a null-pointer crash in the PPG stream is gone.
+**Compile-verified only**, across the same four configurations. Supersedes
+v0.3-review-fixes -- flash these, not those.
+
+| File | Build |
+|---|---|
+| `ring-fw-v0.4-production.hex` | `.\build.ps1` -- no bench instruments |
+| `ring-fw-v0.4-bench.hex` | `.\build.ps1 -Bench` -- instrumented |
+
+What changed since v0.3:
+
+* `ble_publish_ppg()` called `bt_gatt_get_mtu(NULL)`. NULL reaches
+  `att_get()`, which dereferences `conn->state` -- a hard fault the moment
+  anything asked for the MTU. The connection is now kept, referenced, from
+  the connect callback, and the function returns early when nobody is there.
+* every Ring Service characteristic and CCC requires an encrypted link. The
+  control characteristic mattered most: anyone in range could previously
+  write opcodes and force measurement windows on someone else's ring.
+* Just Works pairing, because the ring has no display and no keypad.
+  Encrypted and bonded, but no MITM protection.
+* bonds persist. Settings over NVS in a new 16 kB `storage` partition at
+  0x7c000, loaded with `settings_load()` after `bt_enable()`.
+* Device Information Service, firmware revision `0.4.0`, also logged over
+  RTT at boot so a log line and a GATT read always agree.
+* Heart Rate and Battery are deliberately still open, so off-the-shelf HR
+  apps keep working.
+
+Production flash grew from 180,944 B to 198,196 B (+17.3 kB) and RAM from
+47,350 B to 48,438 B (+1.1 kB). That is the settings subsystem, NVS, SMP
+bond storage and DIS. The image region is also capped at 496 kB now by
+`zephyr,code-partition`, so an image that grew into the bonds would fail to
+link rather than quietly eat them.
+
+All four configurations build with no warnings:
+
+| Build | Flash | RAM |
+|---|---|---|
+| production | 198,196 B (39.0% of 496 kB) | 48,438 B (37.0%) |
+| bench | 205,296 B (40.4%) | 48,502 B (37.0%) |
+| `-DCONFIG_RING_WATCHDOG=n` | 197,048 B (38.8%) | 48,374 B (36.9%) |
+| bench, `-DCONFIG_RING_GSR_MONITOR=n` | 204,844 B (40.3%) | 48,438 B (37.0%) |
+
+### First flash needs a full chip erase
+
+The partition layout changed. A board carrying a v0.3 image has whatever the
+old image left at 0x7c000, and while NVS should treat an unrecognised sector
+as empty, that path has never been exercised here. Erase, then flash:
+
+```
+python -m pyocd erase -t nrf52833 -f 1000000 --chip
+python -m pyocd flash -t nrf52833 -f 1000000 release/ring-fw-v0.4-production.hex
+```
+
+### What to watch on RTT
+
+`ble_start()` now prints the firmware revision, the service list and a line
+saying the Ring Service needs encryption. A pairing attempt should produce
+`pairing requested by ...`, then `security with ... is level 2`, then
+`paired with ..., bonded yes`. Anything else is the thing to report.
+
+A phone app written against v0.3 **will stop working** -- it must pair
+before it can touch the Ring Service. See `../APP_INTEGRATION.md` section 2.
+
+---
+
 ## v0.3-review-fixes -- NOT YET RUN ON HARDWARE
 
 Seven code-review fixes on top of Phase 1, two of them for bugs Phase 1

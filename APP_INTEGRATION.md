@@ -1,7 +1,7 @@
 # App integration guide
 
-Everything a phone app needs to talk to the ring. Firmware as of v0.3
-(2026-09-11).
+Everything a phone app needs to talk to the ring. Firmware as of v0.4
+(2026-09-17).
 
 ---
 
@@ -26,7 +26,7 @@ Advertising runs continuously, including while charging.
 
 ## 2. Services
 
-Two standard services plus one custom.
+Three standard services plus one custom.
 
 ### Heart Rate Service — `0x180D`
 
@@ -49,16 +49,69 @@ Standard, 0-100 percent, updated every 30 s.
 > status packet and apply your own curve if you need accuracy. See
 > section 6.
 
+### Device Information Service — `0x180A`
+
+Standard, read-only, and readable without pairing. Read it to find out
+which firmware you are talking to before you decide what to trust.
+
+| Characteristic | UUID | Value |
+|---|---|---|
+| Firmware Revision | `0x2A26` | `0.4.0` |
+| Manufacturer Name | `0x2A29` | `Ring project` |
+| Model Number | `0x2A24` | `Ring ANNA-B402` |
+
+The same revision string is logged over RTT at boot, so a log line and a
+GATT read always agree about which image is running.
+
 ### Ring Service — `f0a10000-1e5c-4a2b-8d3f-9c7b6e5a4d21`
 
-Everything the standard services cannot express.
+Everything the standard services cannot express. **Every attribute in
+this service now requires an encrypted link** — see Pairing, below.
 
-| Characteristic | UUID | Properties |
-|---|---|---|
-| Status | `f0a10001-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify |
-| PPG stream | `f0a10002-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify |
-| IMU stream | `f0a10003-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify |
-| Control | `f0a10004-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Write, Write w/o response |
+| Characteristic | UUID | Properties | Permission |
+|---|---|---|---|
+| Status | `f0a10001-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
+| PPG stream | `f0a10002-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
+| IMU stream | `f0a10003-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
+| Control | `f0a10004-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Write, Write w/o response | Encrypted write |
+
+### Pairing
+
+**New in v0.4, and it will break an app written against v0.3.** Reading
+Status, subscribing to any Ring Service notification, or writing a control
+opcode over an unencrypted link is now rejected with ATT error `0x0F`,
+Insufficient Encryption.
+
+The ring has no display and no keypad, so the association model is **Just
+Works**: no passkey, nothing for the user to confirm on the ring, and the
+firmware accepts every pairing request that arrives. What that buys is an
+encrypted link and a stored bond. It is not authentication.
+
+The flow from the app side:
+
+1. Connect as usual. Heart Rate, Battery and Device Information all work
+   immediately, unencrypted.
+2. Raise security. Either ask your stack to do it explicitly
+   (`createBond()` on Android) or simply touch an encrypted
+   characteristic, which is enough to start pairing on iOS.
+3. Pairing completes with no prompt on the ring. The phone may show its
+   own system dialog; that is the phone, not us.
+4. The bond is written to flash. On every later connection the phone
+   re-encrypts from the stored keys and step 2 costs nothing.
+
+Practical notes:
+
+* **Raise security first, then subscribe.** Firing four subscriptions at
+  an unencrypted link gets you four errors, and some stacks give up
+  rather than retry after pairing.
+* **There is no way to clear a bond from the app.** No opcode does it. A
+  user who unpairs on the phone and reconnects will fail to encrypt until
+  the ring's flash is erased over SWD. Known gap, no fix yet.
+* Bonds survive a reboot and a battery pull. They live in a 16 kB
+  settings partition at the top of flash.
+* Just Works means no MITM protection. Passive eavesdropping after
+  pairing is prevented; an active attacker present at the moment of
+  pairing is not.
 
 ---
 
@@ -274,11 +327,25 @@ unconnected on this board revision, so the firmware disables the thermal
 monitor to allow charging at all. This is a bench workaround, not a
 shippable configuration. See `HARDWARE_NOTES.md` item 9.
 
-**No bonding or encryption.** `CONFIG_BT_SMP` is enabled but nothing
-requires authentication, and no characteristic demands an encrypted link.
-Anyone in range can connect and read biometric data. **This must be fixed
-before shipping** — at minimum require encryption on the Ring Service
-characteristics and implement pairing.
+**Pairing is Just Works, so there is no authentication.** As of v0.4 the
+Ring Service does demand an encrypted link and bonds are stored across
+reboots, which closes the hole where anyone in range could read biometrics
+and write control opcodes. What it does not do is prove who the peer is:
+with no display and no keypad the ring cannot offer a passkey, so an
+active attacker present during the pairing exchange can still get in the
+middle. Once bonded, the link is encrypted and passive eavesdropping is
+out.
+
+Two gaps remain. There is no way to clear a bond from the app, so a user
+who unpairs on the phone cannot re-pair without an SWD erase. And the
+standard Heart Rate and Battery services are deliberately left open so
+off-the-shelf HR apps keep working — heart rate and battery percentage
+are readable without pairing, by design. If that is not acceptable for
+your product, those two services need encrypted permissions too.
+
+**None of the v0.4 BLE work has run on hardware.** It compiles across all
+four build configurations and nothing more. No phone has paired with this
+ring, and the flash partition that holds the bonds has never been written.
 
 ---
 
@@ -286,10 +353,12 @@ characteristics and implement pairing.
 
 1. Scan for service `0x180D`, connect
 2. Request MTU 247
-3. Subscribe to Status (`f0a10001-...`)
-4. Subscribe to Heart Rate Measurement (`0x2A37`)
-5. Write `[0x03]` to Control to request an immediate reading
-6. Watch `flags` bit 0 for finger presence and `perfusion_x10` for grip
+3. Raise security and pair — Just Works, no passkey. Everything in the
+   Ring Service is refused until this succeeds
+4. Subscribe to Status (`f0a10001-...`)
+5. Subscribe to Heart Rate Measurement (`0x2A37`)
+6. Write `[0x03]` to Control to request an immediate reading
+7. Watch `flags` bit 0 for finger presence and `perfusion_x10` for grip
    quality; show the user a "hold still, don't squeeze" prompt while
    `hr_x10` is still 0
-7. Read `battery_mv` from Status, not the Battery Service percentage
+8. Read `battery_mv` from Status, not the Battery Service percentage
