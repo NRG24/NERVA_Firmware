@@ -153,13 +153,35 @@ Duty cycle is runtime-adjustable from the app (control opcode `0x04`).
   "GSR reads a hard 0" observation in this project came through that
   multiply. The property is now set to 450 (VDD/4 with VDD = 1.8 V).
 
-  Cause 2, suspected and not yet confirmed on hardware: with vref-mv fixed,
-  a hand-rolled SAADC config on **channel 0** reads ~500 mV from AIN1
-  (P0.03) correctly, while the devicetree path -- byte-identical except
-  that it uses **channel 1** -- still returns 0. `gsr_ain_scan()` in
-  `selftest.c` A/Bs this. If it confirms, the fix is to move the DT node
-  to `channel@0` / `io-channels = <&adc 0>`, keeping
-  `zephyr,input-positive = <NRF_SAADC_AIN1>`.
+  Cause 2, fix applied but still unconfirmed on hardware: with vref-mv
+  fixed, a hand-rolled SAADC config on **channel 0** reads ~500 mV from
+  AIN1 (P0.03) correctly, while the devicetree path -- byte-identical
+  except that it used **channel 1** -- still returned 0.
+
+  **The move has been made.** As of 2026-09-17 the devicetree node in
+  `ring_anna_nrf52833.dts` is `channel@0` with `reg = <0>`, and
+  `zephyr,user` has `io-channels = <&adc 0>`. Every other property is
+  unchanged, including `zephyr,input-positive = <NRF_SAADC_AIN1>` -- the
+  channel index is a SAADC channel slot and says nothing about which pin is
+  sampled. Nothing in the firmware hard-codes the index: `gsr_adc` is
+  `ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0)` and every read goes
+  through `adc_*_dt()`, so the whole GSR path followed the node.
+
+  The A/B diagnostic in `gsr_ain_scan()` (`selftest.c`, bench builds only)
+  is deliberately kept -- it is the confirmation, not scaffolding. The line
+  to look for on RTT is:
+
+  ```
+  GSR   channel A/B, input fixed at AIN1: ch0=<n>mV ch1=<n>mV ch2=... ch3=...
+  ```
+
+  `ch0` near 500 mV with `ch1` at 0 mV confirms the channel index was the
+  fault and that the move fixes it. Cross-check with the two lines that
+  follow it: `GSR   path A/B: dt raw=... || hand raw=...` should now show
+  both raw counts non-zero and within a few LSB of each other, and
+  `GSR   dt spec: ch_id=0 input_p=1 ...` should report ch_id=0. If instead
+  `ch0` and `ch1` both read ~500 mV, the channel index was never the
+  problem and Cause 2 needs reopening.
 
   The meter measurements were correct all along: V_OUT_GSR sits at V_REF
   (~0.5 V) with the electrodes open, exactly as the topology predicts.

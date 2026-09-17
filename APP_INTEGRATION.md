@@ -149,7 +149,7 @@ subsystem is answering right now:
 | Bit | Cleared when |
 |---|---|
 | 2 PPG | five consecutive FIFO reads fail, or a re-probe finds nothing |
-| 3 IMU | an accelerometer read fails while idle |
+| 3 IMU | an accelerometer read fails while idle; after 10 consecutive failures (~2 s) the driver is also marked uninitialised and `imu_init()` is retried on the next pass, so the bit comes back by itself if the part recovers |
 | 4 PMIC | a PMIC transaction fails |
 
 Each is set again as soon as the device answers, so a bit that flickers is

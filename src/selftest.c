@@ -668,18 +668,28 @@ static void gsr_ain_scan(void)
 
 	/*
 	 * The scan above reads this pin fine on a hand-built config, so the
-	 * hardware and the AIN index are both right. The DT-driven path reads
-	 * 0 from the same pin, so print what ADC_DT_SPEC_GET_BY_IDX actually
-	 * produced rather than assuming it matches the devicetree.
+	 * hardware and the AIN index are both right. The DT-driven path read 0
+	 * from the same pin, so print what ADC_DT_SPEC_GET_BY_IDX actually
+	 * produced rather than assuming it matches the devicetree. After the
+	 * channel move this is where ch_id=0 should now show up.
 	 */
 	/*
 	 * A/B the only variable left: the channel index.
 	 *
 	 * The scan above reads AIN1 correctly on channel 0. The devicetree
-	 * path is byte-for-byte identical except that it uses channel 1, and
-	 * it returns 0. So hold the input at AIN1 and sweep the channel index.
-	 * If low indices work and higher ones return 0, the fault is the
-	 * channel number, not the pin -- and the devicetree just has to move.
+	 * path used to be byte-for-byte identical except that it sat on
+	 * channel 1, and it returned 0. So hold the input at AIN1 and sweep
+	 * the channel index. If low indices work and higher ones return 0,
+	 * the fault is the channel number, not the pin.
+	 *
+	 * THE MOVE HAS BEEN MADE: the devicetree node is now channel@0 with
+	 * reg = <0> and io-channels = <&adc 0>, input still NRF_SAADC_AIN1.
+	 * This sweep stays as the bench confirmation, and it is the line
+	 *
+	 *     GSR   channel A/B, input fixed at AIN1: ch0=<n>mV ch1=... ...
+	 *
+	 * that settles it: ch0 reading ~500 mV while ch1 reads 0 mV confirms
+	 * the channel index was the fault and that the move fixes it.
 	 */
 	n = 0;
 	for (uint8_t ch = 0; ch < 4 && n < (int)sizeof(line) - 24; ch++) {
@@ -713,10 +723,18 @@ static void gsr_ain_scan(void)
 	LOG_INF("GSR   channel A/B, input fixed at AIN1:%s", line);
 
 	/*
-	 * Same pin, same channel, same settings -- one path reads it, the
-	 * other returns 0. Run them back to back and print the sequence the
-	 * DT helper builds, including the fields the spec dump does not show
-	 * (oversampling, calibrate) and the raw counts before conversion.
+	 * Same pin, same channel, same settings -- one path used to read it
+	 * while the other returned 0. Run them back to back and print the
+	 * sequence the DT helper builds, including the fields the spec dump
+	 * does not show (oversampling, calibrate) and the raw counts before
+	 * conversion.
+	 *
+	 * The hand-rolled config below tracks the devicetree, so it moved from
+	 * channel 1 to channel 0 with it -- the point of this block is to hold
+	 * everything equal and vary only the API, and the channel index itself
+	 * is A/B'd by the sweep above. After the move both raw counts should
+	 * be non-zero and within a few LSB of each other; a dt raw of 0 beside
+	 * a non-zero hand raw would mean the move did not take.
 	 */
 	{
 		int16_t s_dt = 0, s_hand = 0;
@@ -729,11 +747,11 @@ static void gsr_ain_scan(void)
 			.reference = ADC_REF_VDD_1_4,
 			.acquisition_time =
 				ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40),
-			.channel_id = 1,
+			.channel_id = 0,
 			.input_positive = 1,
 		};
 		struct adc_sequence q_hand = {
-			.channels = BIT(1),
+			.channels = BIT(0),
 			.buffer = &s_hand,
 			.buffer_size = sizeof(s_hand),
 			.resolution = 12,

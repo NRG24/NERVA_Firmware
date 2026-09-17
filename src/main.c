@@ -152,6 +152,22 @@ static uint8_t ppg_fail_count;
  */
 static bool imu_ready;
 
+/*
+ * Consecutive failed imu_magnitude_mg() reads while idle.
+ *
+ * imu_ready used to be cleared only by a failed init, never by a part that
+ * had been working and then stopped answering, so an IMU that died mid-
+ * session stayed dead until reset -- no wake-on-motion for the rest of the
+ * run. This is the PPG's ppg_fail_count pattern applied to the IMU: at the
+ * limit, drop imu_ready and let the existing retry path re-init the part.
+ *
+ * RING_IDLE sleeps 200 ms per pass, so ten in a row is about two seconds:
+ * long enough that a single bus transient does not tear down a healthy
+ * device, short enough that a real death is picked up almost immediately.
+ */
+static uint8_t imu_fail_count;
+#define IMU_FAIL_LIMIT		10
+
 /* How often to retry a failed imu_init(). It is idempotent and cheap. */
 #define IMU_RETRY_MS		60000
 
@@ -772,6 +788,7 @@ int main(void)
 
 				if (imu_init(I2C_BUS) == 0) {
 					imu_ready = true;
+					imu_fail_count = 0;
 					(void)imu_arm_wake(WAKE_THRESHOLD_MG);
 					LOG_INF("IMU recovered, wake re-armed");
 				}
@@ -794,15 +811,29 @@ int main(void)
 			 * read alone would report a dead IMU as healthy -- the very
 			 * thing this flag was made live to stop.
 			 *
-			 * KNOWN GAP, deliberate: imu_ready is cleared only by a failed
-			 * init, never by a working part that later stops answering, so
-			 * there is no mid-run IMU re-init the way ppg_fail_count gives
-			 * the PPG one. The flag still goes false, so nothing lies --
-			 * but a part that dies mid-session stays dead until reset.
-			 * Left out rather than added untested; it is a small change
-			 * (count consecutive mg < 0, clear imu_ready at the limit) if
-			 * it turns out to matter on hardware.
+			 * A part that dies mid-run is now re-initialised rather than
+			 * merely reported: IMU_FAIL_LIMIT consecutive failed reads
+			 * (~2 s at the 200 ms idle poll) clear imu_ready and pull
+			 * next_imu_retry forward to now, so the retry block at the
+			 * top of this case calls imu_init() on the very next pass and
+			 * re-arms the wake interrupt if it succeeds. This is the same
+			 * recovery ppg_fail_count gives the PPG. Only counted while
+			 * imu_ready is set -- once it is clear the retry path owns the
+			 * device and there is nothing left to count down to.
 			 */
+			if (imu_ready && mg < 0) {
+				if (imu_fail_count < IMU_FAIL_LIMIT &&
+				    ++imu_fail_count == IMU_FAIL_LIMIT) {
+					LOG_WRN("IMU unresponsive after %d reads -- "
+						"marking uninitialised, will re-init "
+						"on the next pass", IMU_FAIL_LIMIT);
+					imu_ready = false;
+					next_imu_retry = now;
+				}
+			} else if (mg >= 0) {
+				imu_fail_count = 0;
+			}
+
 			if (!imu_ready || mg < 0) {
 				subsystem_flags &= ~RING_FLAG_IMU_OK;
 			} else {

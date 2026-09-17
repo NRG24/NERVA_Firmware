@@ -15,7 +15,7 @@
 	};
 
 	zephyr,user {
-		io-channels = <&adc 1>;
+		io-channels = <&adc 0>;
 	};
 
 	/*
@@ -42,14 +42,20 @@
 /*
  * GSR front end. U7 (OPA2333) drives GSR_ADC into P0.03 = AIN1.
  * GSR_PWR (P0.11) powers the divider; leave it off when not measuring.
+ *
+ * The node is channel@0, not channel@1. The channel index is just a SAADC
+ * channel slot and is independent of the analog input; the input is chosen
+ * by zephyr,input-positive below. This used to be channel@1, and that path
+ * returned 0 mV while a hand-rolled config on channel 0 read the same pin
+ * (AIN1) correctly -- see HANDOFF.md section 5, "Cause 2". Moved 2026-09-17.
  */
 &adc {
 	status = "okay";
 	#address-cells = <1>;
 	#size-cells = <0>;
 
-	channel@1 {
-		reg = <1>;
+	channel@0 {
+		reg = <0>;
 		zephyr,gain = "ADC_GAIN_1_4";
 		zephyr,reference = "ADC_REF_VDD_1_4";
 		/*

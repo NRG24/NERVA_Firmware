@@ -56,6 +56,15 @@ What changed since v0.3:
   RTT at boot so a log line and a GATT read always agree.
 * Heart Rate and Battery are deliberately still open, so off-the-shelf HR
   apps keep working.
+* v0.4-sensing: the GSR ADC node moved from `channel@1` to `channel@0`
+  (`io-channels = <&adc 0>`, input still `NRF_SAADC_AIN1`) -- HANDOFF.md
+  section 5 "Cause 2". Confirm on RTT with the bench line
+  `GSR   channel A/B, input fixed at AIN1:` reading `ch0` near 500 mV and
+  `ch1` at 0 mV.
+* v0.4-sensing: an IMU that stops answering mid-run is now re-initialised.
+  Ten consecutive failed reads while idle (~2 s) clear `imu_ready` and
+  trigger `imu_init()` on the next pass, so wake-on-motion comes back
+  without a reset instead of staying dead for the session.
 
 Production flash grew from 180,944 B to 198,196 B (+17.3 kB) and RAM from
 47,350 B to 48,438 B (+1.1 kB). That is the settings subsystem, NVS, SMP
@@ -67,10 +76,14 @@ All four configurations build with no warnings:
 
 | Build | Flash | RAM |
 |---|---|---|
-| production | 198,196 B (39.0% of 496 kB) | 48,438 B (37.0%) |
-| bench | 205,296 B (40.4%) | 48,502 B (37.0%) |
-| `-DCONFIG_RING_WATCHDOG=n` | 197,048 B (38.8%) | 48,374 B (36.9%) |
-| bench, `-DCONFIG_RING_GSR_MONITOR=n` | 204,844 B (40.3%) | 48,438 B (37.0%) |
+| production | 198,412 B (39.1% of 496 kB) | 48,438 B (37.0%) |
+| bench | 205,528 B (40.5%) | 48,502 B (37.0%) |
+| `-DCONFIG_RING_WATCHDOG=n` | 197,248 B (38.8%) | 48,374 B (36.9%) |
+| bench, `-DCONFIG_RING_GSR_MONITOR=n` | 205,060 B (40.4%) | 48,438 B (37.0%) |
+
+These are the v0.4-sensing figures, and they are what the hex files in this
+directory contain. The two sensing fixes cost 216 B of flash over v0.4-ble
+and no RAM.
 
 ### First flash needs a full chip erase
 
