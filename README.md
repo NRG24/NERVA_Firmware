@@ -1,7 +1,7 @@
 # Ring board bring-up firmware — MAXM86161 PPG
 
-> **New session? Read [HANDOFF.md](HANDOFF.md) first.** It covers current
-> state, the traps that cost days, and the one open issue.
+> **Start with [STATUS.md](STATUS.md)** -- what is proven, what is not, and the
+> risk register. Then [HANDOFF.md](HANDOFF.md) for the traps that cost days.
 
 Barebones nRF Connect SDK (Zephyr) app for the board in
 `Netlist_New_Switch_2_2026-08-21.asc`. It does one thing: bring the
