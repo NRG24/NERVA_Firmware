@@ -77,12 +77,17 @@ tick fired — times body weight (default 70 kg, settable over BLE). All
 three stop dead in `CHARGING`, which reads no accelerometer: a ring on a
 charger is not a ring being worn, and none of them pretend otherwise.
 
-**All three are new and, like heart rate, unvalidated** (§2, §5). The one
-to keep in front of you: **sleep has no wear detection.** A ring on a
-nightstand is perfectly still and logs a full night. That is confirmed
-behaviour, and it is not fixable in firmware while the power model stops
-opening PPG windows — the only wear signal — after three minutes of
-stillness.
+**All three are new and, like heart rate, unvalidated** (§2, §5). Two
+things to keep in front of you. **Sleep has no wear detection** — a ring
+on a nightstand is perfectly still and logs a full night, which is
+confirmed behaviour and not fixable in firmware while the power model
+stops opening PPG windows, the only wear signal, after three minutes of
+stillness. And **the sleep classifier is closer to binary than its name
+suggests**: simulated over 8 hours, a wearer moving at least every 8
+minutes logs no sleep at all, one moving only every 16 minutes logs the
+entire stretch. The cliff is the ten consecutive still minutes that onset
+requires; `tests/test_activity.c` pins both ends of it so tuning cannot
+move it unnoticed.
 
 **BLE.** Standard HRS (0x180D) and BAS (0x180F), open by default so generic
 apps work. Custom Ring Service (`f0a1…`) with a 20-byte status packet, a
@@ -174,10 +179,16 @@ Ordered by how much it would hurt, not how likely it is.
   So `RING_IDLE` now polls the accelerometer every 40 ms whenever recent
   motion suggests the wearer may be walking, and drops back to 200 ms once
   they are still (`STEP_POLL_MS` / `STEP_MOTION_MG` in `main.c`). A still
-  ring — the whole of the night — is unchanged at 5 Hz, and the extra
-  ~20 I2C reads a second while moving are small beside the optical front
-  end's 15 mA duty cycle. Both numbers are simulation, not bench
-  measurement: **nobody has measured what this costs on a real battery.**
+  ring — the whole of the night — is unchanged at 5 Hz.
+  Do not read "only while moving" as "almost never", though: the 10 s
+  hold after the last qualifying motion means an ordinary active day
+  spends a lot of the waking hours on the fast poll. Simulated across
+  three days of a plausible routine, 41 % of samples were at 40 ms and
+  the average rate was 7.1 Hz against the old flat 5 Hz. That is still
+  small beside the optical front end's 15 mA duty cycle, but it is a
+  ~40 % increase in accelerometer traffic, not a rounding error. Every
+  figure here is simulation: **nobody has measured what this costs on a
+  real battery.**
 * **The 100 mg detection floor is a guess.** It rejects typing and
   gesturing in simulation and it rejects gentle walking too. Where that
   line actually belongs can only be settled on a wrist — sorry, a finger —

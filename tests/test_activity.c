@@ -401,6 +401,43 @@ static void test_a_gap_does_not_bank_provisional_minutes(void)
 }
 
 /*
+ * Characterisation, not a bug guard: this pins WHERE the classifier's
+ * cliff sits, because the honest description of this algorithm is not
+ * "it detects sleep" but "it detects the absence of a movement above
+ * SLEEP_STILL_MG within any SLEEP_ONSET_MINUTES window".
+ *
+ * The behaviour is close to binary, which is worth knowing before tuning
+ * anything: a wearer who twitches at least every few minutes logs no
+ * sleep at all, and one who goes quarter-hours without moving logs the
+ * whole stretch. Measured, and the reason the caveats in STATUS.md and
+ * APP_INTEGRATION.md can put a number on it.
+ */
+static void test_where_the_sleep_cliff_sits(void)
+{
+	sim_section("how often a wearer must move to not look asleep");
+
+	/* Moving every 8 minutes: never 10 consecutive still minutes. */
+	reset_all();
+	for (int i = 0; i < 8 * 60 / 8; i++) {
+		feed_still(8 * 60 - 6, 200, 15);
+		feed_walk(6, 40, 100, 250);
+	}
+	CHECK(sleep_total_minutes() == 0,
+	      "a wearer moving every 8 minutes logged %u minutes of sleep",
+	      sleep_total_minutes());
+
+	/* Moving every 16 minutes: the stillness between is enough. */
+	reset_all();
+	for (int i = 0; i < 8 * 60 / 16; i++) {
+		feed_still(16 * 60 - 6, 200, 15);
+		feed_walk(6, 40, 100, 250);
+	}
+	CHECK(sleep_total_minutes() > 6 * 60,
+	      "a wearer moving only every 16 minutes logged just %u minutes "
+	      "of sleep over 8 hours", sleep_total_minutes());
+}
+
+/*
  * BUG: sleep_reset() kept a step snapshot taken before steps_reset() zeroed
  * the counter, so the next minute's unsigned delta wrapped to ~4 billion
  * and read as the most active minute ever recorded -- costing a minute of
@@ -546,6 +583,7 @@ int main(void)
 	test_waking_up_is_not_restlessness();
 	test_a_genuine_stir_is_still_counted();
 	test_a_gap_does_not_bank_provisional_minutes();
+	test_where_the_sleep_cliff_sits();
 	test_reset_does_not_poison_the_next_minute();
 
 	test_calorie_arithmetic();

@@ -332,9 +332,25 @@ uncalibrated trend line, not a number to show without a caveat.
 Three specific behaviours are worth designing around, because they are
 confirmed in simulation rather than hypothetical:
 
-* **A ring that is not being worn still logs sleep.** A ring on a
-  nightstand is perfectly still, and stillness is the only signal the
-  sleep tracker has. The one wear signal on this board is the PPG DC
+* **"Asleep" really means "has not moved much for a while".** The
+  classifier has one input — whether any minute saw a peak deviation of
+  100 mg — and its behaviour is close to binary. Measured in simulation
+  over an 8-hour stretch:
+
+  | Wearer moves… | Logged as sleep |
+  |---|---|
+  | at least every 8 minutes | 0 of 8 hours |
+  | only every 16 minutes | 8 of 8 hours |
+
+  The transition sits at the 10 consecutive still minutes sleep onset
+  requires. So anyone genuinely motionless for quarter-hours at a time —
+  a long film, a flight, a nap on a sofa — is reported as asleep, and a
+  restless sleeper who shifts every few minutes may never register a
+  session at all.
+
+* **A ring that is not being worn logs sleep too.** A ring on a
+  nightstand is perfectly still, so it scores as the deepest sleep the
+  algorithm can report. The only wear signal on this board is the PPG DC
   level, and the power model deliberately stops opening PPG windows after
   three minutes without motion — precisely the case that would need
   checking. An eight-hour "session" with `restless_min == 0` and no steps
