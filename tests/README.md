@@ -5,7 +5,9 @@ them against a simulated wearer. No Zephyr, no board, no debugger.
 
 ```sh
 cd tests
-make            # check constants, build, run both suites
+make            # constants, syntax pass, then both suites
+make syntax     # just the syntax pass
+make run        # just the behavioural suites
 ```
 
 Exit code is non-zero if anything fails. Runs on Linux, macOS, WSL, or
@@ -30,12 +32,43 @@ That is the same caveat `STATUS.md` puts on heart rate, and it is not
 weaker for having a test suite behind it. What the suite buys is that a
 *change* cannot silently make things worse than they are today.
 
-**It does not compile the firmware.** `main.c` and `ble.c` need the Zephyr
-headers and are not built here — `test_mainloop.c` re-implements main.c's
-polling policy rather than including it. `make check-constants` greps
-`../src/main.c` and fails if the two copies of the polling constants drift
-apart, which covers the likeliest way that emulation goes stale, but it
-cannot catch a change to the surrounding logic.
+**It does not build the firmware.** `test_mainloop.c` re-implements
+main.c's polling policy rather than including it. `make check-constants`
+greps `../src/main.c` and fails if the two copies of the polling constants
+drift apart, which covers the likeliest way that emulation goes stale, but
+it cannot catch a change to the surrounding logic.
+
+---
+
+## The syntax pass
+
+`make syntax` runs every file in `src/` through the compiler with
+`-fsyntax-only -Wall -Wextra -Werror`, against hand-written stub headers
+in `stubs/zephyr/`. Both configurations, production and `RING_BENCH`,
+because the bench instruments are `#ifdef`'d in and would otherwise never
+be parsed.
+
+It exists because the real build needs NCS on a Windows machine, so
+`main.c` and `ble.c` could otherwise go through a dozen edits without a
+compiler ever looking at them. It catches typos, undeclared identifiers,
+unbalanced braces, and mismatched log format specifiers — `LOG_*` route to
+a `__attribute__((format(printf)))` function here for exactly that reason.
+
+**It is not a build, and the stubs are not Zephyr.** They are ours, so a
+stub with a wrong signature would hide the very mismatch you wanted
+caught. A clean syntax pass means the code parses and type-checks against
+*our idea* of the API; only `build.ps1` against real NCS proves it
+compiles. Treat this as a fast first filter, never as permission to skip
+the real build.
+
+`test_gatt_layout.c` is the one part of the syntax pass that checks
+behaviour rather than grammar. `ble.c` indexes the GATT table by raw
+number (`ATTR_ACTIVITY` is `&ring_svc.attrs[12]`), which is only right for
+one ordering of the `BT_GATT_*` macros — and a wrong index does not fail
+to build, it notifies the wrong attribute on a service no phone has ever
+exercised. The stub macros expand to the same number of array entries as
+the real ones, so the file can assert the total and stop the build if
+somebody inserts a characteristic in the middle.
 
 ---
 
@@ -77,6 +110,7 @@ the fix was reverted and the suite confirmed to fail:
 | `test_charging_does_not_accrue_calories` | The calorie tick ran above the state switch and billed ~147 kcal for a two-hour charge. |
 | `test_slow_polling_is_known_bad` | Documents the 200 ms cliff itself, so nobody quietly raises the poll interval back. |
 | `check-constants` | main.c and the test's copy of the polling constants drifting apart. |
+| `test_gatt_layout` | A characteristic inserted into the Ring Service shifting the raw `ATTR_*` indices in ble.c onto the wrong attribute. |
 
 `test_no_false_steps_across_a_gap` is deliberately *not* in that list: it
 is a property check, and deleting the gap handling in `steps.c` does not

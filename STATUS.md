@@ -154,15 +154,19 @@ Ordered by how much it would hurt, not how likely it is.
   registers match; embedded functions do not.
 * **Logging is INF over an 8 kB RTT buffer in production.** Fine for
   bring-up, wasteful for a shipped image.
-* **No CI, and no tests for anything but the activity modules.**
+* **No CI, and the only behavioural tests are for the activity modules.**
   Verification is still the five-configuration build sweep run by hand on
-  one Windows machine with NCS installed at `C:\ncs`. `tests/` now builds
-  `steps.c`/`sleep.c`/`calories.c` against a host compiler and runs them
-  against a simulated wearer (`cd tests && make`), which is what caught the
-  defects listed above — but it covers three files out of thirteen, it
-  cannot compile `main.c` or `ble.c`, and the signal it feeds them is an
-  assumption about what a footfall looks like on a finger, not a recording
-  off this board. Nothing here has ever run on hardware.
+  one Windows machine with NCS installed at `C:\ncs`. `cd tests && make`
+  now adds two things to that: it runs `steps.c`/`sleep.c`/`calories.c`
+  against a simulated wearer, which is what caught the defects listed
+  above, and it puts every file in `src/` through
+  `-fsyntax-only -Wall -Wextra -Werror` against stub Zephyr headers, in
+  both the production and bench configurations.
+  The syntax pass is a filter, not a build — the stubs are ours, so it
+  proves the code type-checks against our idea of the API and nothing
+  more. The behavioural tests cover three files out of thirteen and feed
+  them an assumed footfall rather than a recording off this board.
+  Nothing here has ever run on hardware.
 * **The pedometer needs a fast poll, and that changes the idle power
   model.** 5 Hz — the old idle poll rate — does not undercount gait, it
   misses it almost entirely: simulated against a 5 min walk it counted

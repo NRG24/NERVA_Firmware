@@ -11,6 +11,18 @@
 #ifndef TEST_STUB_ZEPHYR_SYS_UTIL_H_
 #define TEST_STUB_ZEPHYR_SYS_UTIL_H_
 
+/*
+ * ARG_UNUSED and __packed really come from Zephyr's toolchain headers,
+ * which util.h pulls in. They are here so one -Istubs covers both the
+ * behavioural tests and the syntax check.
+ */
+#ifndef ARG_UNUSED
+#define ARG_UNUSED(x)	(void)(x)
+#endif
+#ifndef __packed
+#define __packed	__attribute__((packed))
+#endif
+
 #define MAX(a, b)	(((a) > (b)) ? (a) : (b))
 #define MIN(a, b)	(((a) < (b)) ? (a) : (b))
 #define ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))
