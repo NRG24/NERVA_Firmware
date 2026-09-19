@@ -289,8 +289,8 @@ write [0x05]        then expect a disconnect
 Example — set body weight to 68.5 kg:
 
 ```
-write [0x06, 0xAB, 0x02]
-              weight_kg_x10=685 (68.5 kg)
+write [0x06, 0xAD, 0x02]
+              weight_kg_x10=685 (68.5 kg, 0x02AD little-endian)
 ```
 
 Example — start a new day (zero steps/sleep/calories):
@@ -346,9 +346,12 @@ confirmed in simulation rather than hypothetical:
   pram handle — registers as nothing. Under-counting is the deliberate
   choice here: the threshold that would catch those also counts typing and
   gesturing as walking.
-* **A charging gap ends a sleep session.** The ring reads no
-  accelerometer at all while charging, so sessions do not span a charge,
-  and `sleep_total_min` keeps whatever was credited before it.
+* **Everything stops while charging.** The ring reads no accelerometer at
+  all in that state, so steps stop, a sleep session in progress ends
+  rather than spanning the charge (`sleep_total_min` keeps whatever was
+  credited before it), and `kcal_x1000` stops advancing — the ring has no
+  reason to believe it is on a finger. Expect a flat spot, not a gap in
+  the counters, and do not interpolate across it.
 
 There is also no RTC on this board (see README), so `sleep_session_min`
 and `sleep_total_min` are durations, not clock times. If you want to show

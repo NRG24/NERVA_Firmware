@@ -981,12 +981,26 @@ int main(void)
 		if (now >= next_activity_min) {
 			uint32_t steps_now = steps_count();
 
-			/* Clamped: the control characteristic can zero the step
-			 * counter between two ticks, and unsigned, that wraps.
+			/*
+			 * Not while charging. The ring reads no accelerometer
+			 * in that state, so steps and sleep already stop dead;
+			 * accruing resting calories through a two-hour charge
+			 * would credit ~147 kcal at 70 kg to a wearer the ring
+			 * has no reason to believe is wearing it, and would
+			 * contradict the rule sleep.c applies to the very same
+			 * gap. The deadline still moves, so coming off the
+			 * charger does not fire a catch-up burst.
 			 */
-			calories_update_minute(steps_now >= steps_at_last_min
-					       ? steps_now - steps_at_last_min
-					       : 0);
+			if (state != RING_CHARGING) {
+				/* Clamped: the control characteristic can zero
+				 * the step counter between two ticks, and
+				 * unsigned, that wraps.
+				 */
+				calories_update_minute(
+					steps_now >= steps_at_last_min
+					? steps_now - steps_at_last_min : 0);
+			}
+
 			steps_at_last_min = steps_now;
 			next_activity_min = now + 60000;
 		}
@@ -1113,11 +1127,24 @@ int main(void)
 				last_motion = now;
 			}
 
-			/* Feed the pedometer and sleep tracker off the same
+			/*
+			 * Feed the pedometer and sleep tracker off the same
 			 * magnitude read used for the motion timeout above --
 			 * no extra I2C traffic for either.
+			 *
+			 * imu_ready, not just mg >= 0. A part that was never
+			 * configured answers reads perfectly well and returns
+			 * zeros (the failure the comment above describes), and
+			 * zeros are not a failed read: they are a magnitude of
+			 * 0 mg, a full 1 g away from rest. That would refresh
+			 * last_step_motion on every pass -- pinning the ring to
+			 * the fast poll for as long as it ran -- and make every
+			 * sleep bucket look active, so a session could never
+			 * start. Feeding nothing is the honest answer when
+			 * there is no working accelerometer; sleep.c's gap
+			 * handling closes any session that was open.
 			 */
-			if (mg >= 0) {
+			if (imu_ready && mg >= 0) {
 				if (abs(mg - 1000) > STEP_MOTION_MG) {
 					last_step_motion = now;
 				}

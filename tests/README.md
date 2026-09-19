@@ -68,15 +68,33 @@ the fix was reverted and the suite confirmed to fail:
 | Guard | The defect |
 |---|---|
 | `test_walking_is_counted_end_to_end` | 200 ms idle polling sat barely above Nyquist for gait; **0 of 1100 steps counted**. Steps were only ever counted during PPG windows. |
+| `test_a_dead_imu_does_not_pin_the_fast_poll` | An unconfigured accelerometer answers reads with zeros, and zeros read as 1 g of motion — pinning the ring to the 40 ms poll forever and stopping sleep from ever being detected. |
 | `test_charging_gap_ends_the_session` | An hour on the charger arrived as one stale bucket and the sleep session ran straight through it. |
+| `test_short_gaps_are_caught_too` | The gap was measured from the start of the bucket, so the shortest outage it could see was a whole bucket long and a one-minute charge slipped through as ordinary stillness. |
+| `test_a_slow_pass_is_not_a_gap` | The other side of that: a few seconds of I2C stall must stay an ordinary minute, or a marginal bus shreds every session. |
 | `test_reset_does_not_poison_the_next_minute` | `sleep_reset()` kept a step snapshot from before the counter was zeroed; the unsigned delta wrapped to ~4 billion. |
 | `test_calories_do_not_depend_on_tick_phase` | A sampled instantaneous cadence made the same activity worth 42.0 or 12.3 kcal depending only on when the tick fired. |
+| `test_charging_does_not_accrue_calories` | The calorie tick ran above the state switch and billed ~147 kcal for a two-hour charge. |
 | `test_slow_polling_is_known_bad` | Documents the 200 ms cliff itself, so nobody quietly raises the poll interval back. |
 | `check-constants` | main.c and the test's copy of the polling constants drifting apart. |
 
 `test_no_false_steps_across_a_gap` is deliberately *not* in that list: it
 is a property check, and deleting the gap handling in `steps.c` does not
 make it fail. The comment above it says so.
+
+### Mutation-test your own tests
+
+`test_charging_does_not_accrue_calories` passed the first time it was
+written — and it was worthless. The charging loop in the harness had its
+own copy of the per-minute tick, so it skipped the calories no matter what
+the firmware did; reverting the fix did not make it fail. The harness now
+runs one `ring_tick_common()` from both the idle and charging paths, which
+is why the mutation is visible.
+
+The lesson generalises: in a harness that re-implements part of the
+firmware, a test can pass because the *harness* has the behaviour, not the
+code under test. Reverting the fix and watching the test fail is the only
+thing that tells those apart. Do it for every guard you add.
 
 ---
 

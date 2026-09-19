@@ -36,6 +36,7 @@ struct ring {
 	int64_t last_step_motion;
 	int64_t next_activity_min;
 	uint32_t steps_at_last_min;
+	bool charging;
 
 	/* observability, for the tests */
 	long polls;
@@ -48,6 +49,7 @@ static void ring_boot(struct ring *r)
 	r->last_step_motion = 0;
 	r->next_activity_min = 60000;
 	r->steps_at_last_min = 0;
+	r->charging = false;
 	r->polls = 0;
 	r->fast_polls = 0;
 
@@ -56,23 +58,48 @@ static void ring_boot(struct ring *r)
 	calories_init();
 }
 
-/* One pass of main.c's RING_IDLE case. Returns the chosen sleep interval. */
-static int ring_idle_pass(struct ring *r, int32_t mg)
+/*
+ * The work main.c does above the state switch, so it runs in every state.
+ * It lives in one function here for the same reason it is one block there:
+ * if the charging path had its own copy, a test could not tell whether the
+ * firmware skips the tick while charging or whether the emulation does.
+ */
+static void ring_tick_common(struct ring *r)
 {
-	if (abs(mg - 1000) > STEP_MOTION_MG) {
-		r->last_step_motion = r->now;
+	if (r->now < r->next_activity_min) {
+		return;
 	}
 
-	steps_update(mg, r->now);
-	sleep_feed(mg, r->now);
+	uint32_t steps_now = steps_count();
 
-	if (r->now >= r->next_activity_min) {
-		uint32_t steps_now = steps_count();
-
+	if (!r->charging) {
 		calories_update_minute(steps_now >= r->steps_at_last_min
 				       ? steps_now - r->steps_at_last_min : 0);
-		r->steps_at_last_min = steps_now;
-		r->next_activity_min = r->now + 60000;
+	}
+
+	r->steps_at_last_min = steps_now;
+	r->next_activity_min = r->now + 60000;
+}
+
+/*
+ * One pass of main.c's RING_IDLE case. Returns the chosen sleep interval.
+ *
+ * imu_ready mirrors main.c's flag: false means the part is not known to be
+ * configured, and a read from an unconfigured LSM6DSV succeeds and returns
+ * zeros rather than failing, so "the read worked" is not evidence of
+ * anything. mg is passed in as the firmware would have read it.
+ */
+static int ring_idle_pass(struct ring *r, int32_t mg, bool imu_ready)
+{
+	ring_tick_common(r);
+
+	if (imu_ready && mg >= 0) {
+		if (abs(mg - 1000) > STEP_MOTION_MG) {
+			r->last_step_motion = r->now;
+		}
+
+		steps_update(mg, r->now);
+		sleep_feed(mg, r->now);
 	}
 
 	bool maybe_walking =
@@ -90,13 +117,50 @@ static void ring_run(struct ring *r, struct sim_wearer *w, int secs)
 	while (r->now < end) {
 		int32_t mg = sim_sample(w, dt);
 
-		dt = ring_idle_pass(r, mg);
+		dt = ring_idle_pass(r, mg, true);
 		r->now += dt;
 		r->polls++;
 		if (dt == STEP_POLL_MS) {
 			r->fast_polls++;
 		}
 	}
+}
+
+/*
+ * The same loop with a dead accelerometer: reads succeed and return zeros,
+ * which is what an LSM6DSV left in its power-down default does.
+ */
+static void ring_run_dead_imu(struct ring *r, int secs)
+{
+	int64_t end = r->now + (int64_t)secs * 1000;
+	int dt = IDLE_POLL_MS;
+
+	while (r->now < end) {
+		dt = ring_idle_pass(r, 0, false);
+		r->now += dt;
+		r->polls++;
+		if (dt == STEP_POLL_MS) {
+			r->fast_polls++;
+		}
+	}
+}
+
+/* Time on the charger: main.c reads no IMU at all in RING_CHARGING. */
+static void ring_run_charging(struct ring *r, int secs)
+{
+	int64_t end = r->now + (int64_t)secs * 1000;
+
+	r->charging = true;
+	while (r->now < end) {
+		/*
+		 * RING_CHARGING runs the common block and then sleeps 200 ms,
+		 * touching neither the accelerometer nor the detectors.
+		 */
+		ring_tick_common(r);
+		r->now += 200;
+		r->polls++;
+	}
+	r->charging = false;
 }
 
 /*
@@ -237,6 +301,73 @@ static void test_a_plausible_day(void)
 	      "nine hours came to %u kcal, expected roughly 700", kcal);
 }
 
+/*
+ * BUG: the feed was gated on `mg >= 0` alone. An accelerometer that was
+ * never configured answers reads and returns zeros, and zeros are not a
+ * failed read -- they are a magnitude of 0 mg, a full 1 g from rest. That
+ * refreshed last_step_motion every single pass, pinning the ring to the
+ * 40 ms poll for the entire run, and made every sleep bucket look active
+ * so a session could never start.
+ */
+static void test_a_dead_imu_does_not_pin_the_fast_poll(void)
+{
+	struct ring r;
+	double hz;
+
+	sim_section("an unconfigured IMU returning zeros is not 'motion'");
+
+	ring_boot(&r);
+	ring_run_dead_imu(&r, 3600);
+
+	hz = r.polls / 3600.0;
+	CHECK_NEAR(hz, 1000.0 / IDLE_POLL_MS, 2,
+		   "poll rate over an hour with a dead IMU (Hz)");
+	CHECK(steps_count() == 0, "a dead IMU produced %u steps",
+	      steps_count());
+	CHECK(!sleep_is_asleep(),
+	      "a dead IMU produced a sleep session out of nothing");
+}
+
+/*
+ * BUG: the calorie tick sat above the state switch and kept accruing
+ * resting MET through a charge -- about 147 kcal over two hours at 70 kg,
+ * credited to a wearer the ring has no reason to think is wearing it, and
+ * flatly contradicting the rule sleep.c applies to the very same gap.
+ */
+static void test_charging_does_not_accrue_calories(void)
+{
+	struct sim_wearer resting;
+	struct ring r;
+	uint32_t before, after;
+
+	sim_section("a charging ring burns no calories");
+
+	ring_boot(&r);
+	sim_wearer_init(&resting, 0, 0, 4);
+
+	ring_run(&r, &resting, 600);
+	before = calories_total_x1000();
+	CHECK(before > 0, "no calories accrued while worn and idle");
+
+	ring_run_charging(&r, 2 * 3600);
+	after = calories_total_x1000();
+
+	CHECK(after == before,
+	      "two hours of charging added %u.%03u kcal",
+	      (after - before) / 1000, (after - before) % 1000);
+
+	/* And it must start again on coming off the charger, without a
+	 * catch-up burst for the two hours it sat there.
+	 */
+	ring_run(&r, &resting, 600);
+
+	uint32_t resumed = calories_total_x1000() - after;
+
+	CHECK(resumed > 0, "calories did not resume after charging");
+	CHECK_NEAR(resumed, before, 25,
+		   "ten minutes after a charge vs ten minutes before it");
+}
+
 int main(void)
 {
 	printf("main loop policy tests\n");
@@ -244,6 +375,8 @@ int main(void)
 	test_walking_is_counted_end_to_end();
 	test_still_ring_keeps_the_idle_rate();
 	test_walking_raises_the_rate();
+	test_a_dead_imu_does_not_pin_the_fast_poll();
+	test_charging_does_not_accrue_calories();
 	test_a_plausible_day();
 
 	return sim_report("test_mainloop");

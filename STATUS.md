@@ -73,7 +73,9 @@ cannot span a gap in accelerometer data such as a charge. Calories
 (`calories.c`): a MET table keyed on steps *per minute* — a count over the
 interval, not a sampled instantaneous cadence, which is what keeps a
 minute from inheriting whatever the wearer was doing at the instant the
-tick fired — times body weight (default 70 kg, settable over BLE).
+tick fired — times body weight (default 70 kg, settable over BLE). All
+three stop dead in `CHARGING`, which reads no accelerometer: a ring on a
+charger is not a ring being worn, and none of them pretend otherwise.
 
 **All three are new and, like heart rate, unvalidated** (§2, §5). The one
 to keep in front of you: **sleep has no wear detection.** A ring on a

@@ -262,6 +262,52 @@ static void test_charging_gap_ends_the_session(void)
 }
 
 /*
+ * BUG: the gap was measured from the start of the bucket rather than from
+ * the last sample, so the shortest outage it could see was a whole bucket
+ * long. A short charge -- one or two minutes -- slipped through and was
+ * credited as ordinary stillness, extending the session straight over it.
+ */
+static void test_short_gaps_are_caught_too(void)
+{
+	const int gaps_s[] = { 20, 45, 75, 110, 200 };
+
+	sim_section("a short feed gap ends the session as well as a long one");
+
+	for (size_t i = 0; i < ARRAY_SIZE(gaps_s); i++) {
+		reset_all();
+		feed_still(30 * 60, 200, 3);
+		CHECK(sleep_is_asleep(), "did not fall asleep before the gap");
+
+		feed_gap(gaps_s[i]);
+		feed_still(90, 200, 3);
+
+		CHECK(!sleep_is_asleep(),
+		      "a %d s outage did not end the session", gaps_s[i]);
+	}
+}
+
+/*
+ * A legitimate slow pass must NOT look like an outage. The main loop can
+ * stall for a few seconds on a bad I2C bus (see the blocking audit in
+ * main.c) and that has to stay an ordinary still minute, or a marginal bus
+ * would shred every sleep session into fragments.
+ */
+static void test_a_slow_pass_is_not_a_gap(void)
+{
+	sim_section("a few seconds of stall does not end a session");
+
+	reset_all();
+	feed_still(30 * 60, 200, 3);
+	CHECK(sleep_is_asleep(), "did not fall asleep");
+
+	feed_gap(5);			/* the documented worst-case stall */
+	feed_still(120, 200, 3);
+
+	CHECK(sleep_is_asleep(),
+	      "a 5 s stall on a slow bus ended the sleep session");
+}
+
+/*
  * BUG: sleep_reset() kept a step snapshot taken before steps_reset() zeroed
  * the counter, so the next minute's unsigned delta wrapped to ~4 billion
  * and read as the most active minute ever recorded -- costing a minute of
@@ -402,6 +448,8 @@ int main(void)
 
 	test_sleep_onset_and_wake();
 	test_charging_gap_ends_the_session();
+	test_short_gaps_are_caught_too();
+	test_a_slow_pass_is_not_a_gap();
 	test_reset_does_not_poison_the_next_minute();
 
 	test_calorie_arithmetic();

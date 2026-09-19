@@ -33,22 +33,31 @@
 #define WAKE_CONFIRM_MINUTES	3
 
 /*
- * Longer than this since the last sample and the bucket is not a minute
- * of anything -- RING_CHARGING reads no IMU at all, so a ring that spent
- * an hour on a charger would otherwise come back, close its stale bucket,
- * and have that hour judged as one still minute. A ring on a charger is
- * also not a ring being slept in, so a session in progress ends here.
+ * A gap this long between two SAMPLES means the feed stopped: RING_CHARGING
+ * reads no IMU at all, so a ring that spent time on a charger would
+ * otherwise come back, close its stale bucket, and have the whole outage
+ * judged as one still minute. A ring on a charger is also not a ring being
+ * slept in, so a session in progress ends here.
  *
- * Has to be comfortably above MINUTE_MS: a bucket legitimately stays open
- * for a whole minute plus one poll interval.
+ * Measured from the last sample, NOT from the start of the bucket. Against
+ * the bucket the shortest detectable outage is a whole bucket long, so a
+ * gap of one to two minutes -- a short charge, or the IMU dropping out and
+ * recovering -- slipped through and was credited as ordinary stillness.
+ *
+ * 15 s is chosen to sit above every legitimate pause and far below a
+ * bucket. The main loop feeds every 20-200 ms; the worst documented
+ * un-fed span on a stalled I2C bus is around 4.5 s (see the blocking audit
+ * in main.c), and anything approaching 10 s trips the watchdog and reboots
+ * the board anyway.
  */
-#define FEED_GAP_LIMIT_MS	(2 * MINUTE_MS)
+#define FEED_GAP_LIMIT_MS	15000
 
 struct sleep_state {
 	bool primed;
 
 	/* current one-minute bucket */
 	int64_t bucket_start_ms;
+	int64_t last_sample_ms;
 	int32_t bucket_peak_dev_mg;
 	uint32_t bucket_step_snapshot;
 
@@ -56,7 +65,6 @@ struct sleep_state {
 	uint16_t still_run;
 	uint16_t active_run;
 
-	int64_t session_start_ms;
 	uint16_t session_minutes;
 	uint16_t restless_minutes;
 
@@ -73,6 +81,7 @@ void sleep_init(void)
 void sleep_reset(void)
 {
 	int64_t bucket_start = sl.bucket_start_ms;
+	int64_t last_sample = sl.last_sample_ms;
 	bool was_primed = sl.primed;
 
 	memset(&sl, 0, sizeof(sl));
@@ -85,6 +94,7 @@ void sleep_reset(void)
 	 */
 	sl.bucket_step_snapshot = steps_count();
 	sl.bucket_start_ms = bucket_start;
+	sl.last_sample_ms = last_sample;
 	sl.primed = was_primed;
 }
 
@@ -109,8 +119,7 @@ uint16_t sleep_restless_minutes(void)
 	return sl.restless_minutes;
 }
 
-static void evaluate_minute(int64_t bucket_end_ms, int32_t peak_dev_mg,
-			    uint32_t steps_in_minute)
+static void evaluate_minute(int32_t peak_dev_mg, uint32_t steps_in_minute)
 {
 	bool minute_still = (peak_dev_mg < SLEEP_STILL_MG) &&
 			    (steps_in_minute == 0);
@@ -126,11 +135,12 @@ static void evaluate_minute(int64_t bucket_end_ms, int32_t peak_dev_mg,
 	if (!sl.asleep) {
 		if (sl.still_run >= SLEEP_ONSET_MINUTES) {
 			sl.asleep = true;
-			/* Back-date onset to when the stillness actually
-			 * started, not to the minute the threshold tripped.
+			/*
+			 * The session starts when the stillness did, not when
+			 * the threshold tripped, so it opens already holding
+			 * the minutes that earned it rather than counting up
+			 * from zero ten minutes late.
 			 */
-			sl.session_start_ms = bucket_end_ms -
-				(int64_t)SLEEP_ONSET_MINUTES * MINUTE_MS;
 			sl.session_minutes = SLEEP_ONSET_MINUTES;
 			sl.restless_minutes = 0;
 			sl.total_minutes += SLEEP_ONSET_MINUTES;
@@ -186,6 +196,9 @@ static void open_bucket(int64_t now_ms)
 void sleep_feed(int32_t mg, int64_t now_ms)
 {
 	int32_t dev = abs(mg - 1000);
+	int64_t since_sample = now_ms - sl.last_sample_ms;
+
+	sl.last_sample_ms = now_ms;
 
 	if (!sl.primed) {
 		open_bucket(now_ms);
@@ -193,14 +206,13 @@ void sleep_feed(int32_t mg, int64_t now_ms)
 		return;
 	}
 
-	if (now_ms - sl.bucket_start_ms > FEED_GAP_LIMIT_MS) {
+	if (since_sample > FEED_GAP_LIMIT_MS) {
 		/*
-		 * The feed stopped for longer than a bucket, so there is no
-		 * honest verdict to reach about the time that passed. End any
-		 * session rather than extend one across a gap: whatever the
-		 * ring was doing, it was not being worn on a sleeping hand.
-		 * Minutes already credited to total_minutes stay credited --
-		 * that sleep did happen.
+		 * The feed stopped, so there is no honest verdict to reach
+		 * about the time that passed. End any session rather than
+		 * extend one across a gap: whatever the ring was doing, it was
+		 * not being worn on a sleeping hand. Minutes already credited
+		 * to total_minutes stay credited -- that sleep did happen.
 		 */
 		sl.asleep = false;
 		sl.session_minutes = 0;
@@ -228,7 +240,7 @@ void sleep_feed(int32_t mg, int64_t now_ms)
 	uint32_t steps_in_minute = (steps_now >= sl.bucket_step_snapshot)
 				 ? (steps_now - sl.bucket_step_snapshot) : 0;
 
-	evaluate_minute(now_ms, sl.bucket_peak_dev_mg, steps_in_minute);
+	evaluate_minute(sl.bucket_peak_dev_mg, steps_in_minute);
 
 	open_bucket(now_ms);
 }
