@@ -382,6 +382,47 @@ static void publish_status(void)
 	ble_publish_status(&s);
 }
 
+/*
+ * Say what the activity counters are doing, over RTT.
+ *
+ * Not a diagnostic that can be compiled out: until a phone has
+ * successfully subscribed to the Ring Service -- which per STATUS.md R10
+ * has never happened -- this log line is the ONLY way to find out whether
+ * the pedometer counts anything on a real wrist, finger or bench shake.
+ * Bringing these features up without it means walking a hundred steps and
+ * then guessing.
+ *
+ * Only speaks when something changed. A still ring overnight has nothing
+ * to report and would otherwise push the boot messages out of an 8 kB RTT
+ * buffer with identical lines; a sleep transition is exactly the event
+ * worth seeing, so it is never suppressed.
+ */
+static void log_activity(void)
+{
+	static uint32_t last_steps;
+	static bool last_asleep;
+	static bool primed;
+
+	uint32_t steps = steps_count();
+	bool asleep = sleep_is_asleep();
+
+	if (primed && steps == last_steps && asleep == last_asleep) {
+		return;
+	}
+
+	primed = true;
+	last_steps = steps;
+	last_asleep = asleep;
+
+	uint32_t kcal_x1000 = calories_total_x1000();
+
+	LOG_INF("activity: %u steps, %u spm, %u.%03u kcal, %s (%u min, "
+		"%u restless, %u total)", steps, steps_cadence_spm(),
+		kcal_x1000 / 1000U, kcal_x1000 % 1000U,
+		asleep ? "asleep" : "awake", sleep_session_minutes(),
+		sleep_restless_minutes(), sleep_total_minutes());
+}
+
 static void publish_activity(void)
 {
 	struct ring_activity a = {
@@ -1014,6 +1055,8 @@ int main(void)
 
 			steps_at_last_min = steps_now;
 			next_activity_min = now + 60000;
+
+			log_activity();
 		}
 
 		/*

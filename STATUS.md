@@ -238,6 +238,46 @@ If it reboot-loops: erase, flash `ring-fw-v0.1-bench-greenled.hex`, and
 disconnect the **battery**, not just the charger — the watchdog survives a
 soft reset.
 
+### Validating the activity features
+
+These have never touched hardware, and the numbers they produce are
+plausible-looking whether or not they are right — which is the dangerous
+kind of wrong. The `activity:` line over RTT is the only way to see them
+without a working phone app; it prints whenever the step count or the
+sleep state changes. Do these in order, because each one tells you
+something the next assumes:
+
+1. **Does it count at all?** Hold the board and walk 100 steps, counting
+   out loud. Expect an `activity:` line with a step count in the
+   neighbourhood and a plausible `spm`. Anything near zero means the
+   detector is not seeing the motion at all: check `AMPLITUDE_FLOOR_MG`
+   in `steps.c` against what a finger-worn ring actually swings, which is
+   the single biggest unknown in this feature.
+2. **Does it over-count?** Put the board on a desk for ten minutes, then
+   type at a keyboard with it strapped on for another ten. Both should
+   add zero steps. Tremor and typing counting as walking is the classic
+   pedometer failure and is what the floor is defending against.
+3. **Is the poll rate doing its job?** Walk 100 steps again, this time
+   watching whether the count keeps up in real time rather than arriving
+   late. `STEP_POLL_MS` exists because 200 ms polling counted essentially
+   nothing in simulation (§5); if counting is erratic while walking,
+   suspect the fast poll is not engaging — `STEP_MOTION_MG` decides that.
+4. **Sleep.** Leave the board perfectly still for 15 minutes: expect an
+   `asleep` line after about 10. Then pick it up and move it for 3
+   minutes: expect `awake`. Note that a board on a bench passes this test
+   perfectly while telling you nothing about a sleeping human — see the
+   wear-detection caveat in §5.
+5. **Calories.** Send control opcode `0x06` with a real body weight
+   before believing any number; the default is 70 kg. At rest the total
+   should climb about 1.2 kcal per minute for a 70 kg wearer, which is a
+   figure you can check against the clock.
+
+Numbers worth recording in `BRINGUP_RESULTS.md` when you do: the step
+count against a hand count, the magnitude swing a real walking finger
+produces, and whether typing generates false steps. All three are
+assumptions in `tests/sim.c` right now, and every accuracy claim in this
+repo rests on them.
+
 ---
 
 ## 8. Version history
