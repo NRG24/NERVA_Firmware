@@ -40,11 +40,18 @@
 #define INTERVAL_HISTORY	4
 
 /*
- * Longer than this between two samples and the filters are stale: the
- * ring was charging (RING_CHARGING reads no IMU at all) or the part
- * stopped answering. Ramping a 32-sample baseline EMA from a stale value
- * towards a new orientation manufactures a slow swing that looks like
- * motion, so re-prime instead and start clean.
+ * Longer than this between two samples and the detector's time-based state
+ * no longer describes anything: the ring was charging (RING_CHARGING reads
+ * no IMU at all) or the part stopped answering. The amplitude window would
+ * close on its first sample back with a peak-to-peak straddling the gap,
+ * the refractory timer would compare against a step from an hour ago, and
+ * `above` could still be latched. Re-prime instead.
+ *
+ * Note what this is NOT protecting against: the baseline going stale. The
+ * input is a magnitude, so it sits near 1000 mg at rest whatever
+ * orientation the ring came back in, and removing this re-prime does not
+ * make the test suite produce a single false step. This is hygiene for the
+ * windows, not a fix for a demonstrated fault.
  */
 #define FEED_GAP_LIMIT_MS	2000
 

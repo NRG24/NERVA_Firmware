@@ -152,8 +152,15 @@ Ordered by how much it would hurt, not how likely it is.
   registers match; embedded functions do not.
 * **Logging is INF over an 8 kB RTT buffer in production.** Fine for
   bring-up, wasteful for a shipped image.
-* **No unit tests, no CI.** Verification is the five-configuration build
-  sweep run by hand on one Windows machine with NCS installed at `C:\ncs`.
+* **No CI, and no tests for anything but the activity modules.**
+  Verification is still the five-configuration build sweep run by hand on
+  one Windows machine with NCS installed at `C:\ncs`. `tests/` now builds
+  `steps.c`/`sleep.c`/`calories.c` against a host compiler and runs them
+  against a simulated wearer (`cd tests && make`), which is what caught the
+  defects listed above — but it covers three files out of thirteen, it
+  cannot compile `main.c` or `ble.c`, and the signal it feeds them is an
+  assumption about what a footfall looks like on a finger, not a recording
+  off this board. Nothing here has ever run on hardware.
 * **The pedometer needs a fast poll, and that changes the idle power
   model.** 5 Hz — the old idle poll rate — does not undercount gait, it
   misses it almost entirely: simulated against a 5 min walk it counted

@@ -1,0 +1,411 @@
+/*
+ * Host-side tests for steps.c, sleep.c and calories.c.
+ *
+ * Most of these are regression guards: every one marked BUG below is a
+ * defect that shipped in the first version of these modules and was found
+ * by running exactly this scenario. They are here so it cannot come back.
+ *
+ * What this suite proves: the algorithms do what their headers claim when
+ * fed a plausible signal. What it does NOT prove: that the signal is
+ * plausible. Nobody has recorded a real accelerometer trace off this ring,
+ * so the wearer model in sim.c is an assumption, and every "accuracy"
+ * number here is accuracy against that assumption. See tests/README.md.
+ */
+
+#include "sim.h"
+
+#include "calories.h"
+#include "sleep.h"
+#include "steps.h"
+
+/* ble.h is firmware-side and expects the Zephyr toolchain's macros. */
+#define __packed	__attribute__((packed))
+#include <zephyr/sys/util.h>	/* the stub under tests/stubs */
+#include "ble.h"
+
+#include <stddef.h>
+#include <stdio.h>
+
+/* --- feeding helpers --------------------------------------------------- */
+
+static int64_t now_ms;
+
+static void reset_all(void)
+{
+	now_ms = 0;
+	steps_init();
+	sleep_init();
+	calories_init();
+}
+
+/* Feed both detectors for `secs` at a fixed interval. */
+static void feed(struct sim_wearer *w, int secs, int dt_ms)
+{
+	int64_t end = now_ms + (int64_t)secs * 1000;
+
+	while (now_ms < end) {
+		int32_t mg = sim_sample(w, dt_ms);
+
+		steps_update(mg, now_ms);
+		sleep_feed(mg, now_ms);
+		now_ms += dt_ms;
+	}
+}
+
+static void feed_still(int secs, int dt_ms, int noise_mg)
+{
+	struct sim_wearer w;
+
+	sim_wearer_init(&w, 0, 0, noise_mg);
+	feed(&w, secs, dt_ms);
+}
+
+static void feed_walk(int secs, int dt_ms, double spm, double swing_mg)
+{
+	struct sim_wearer w;
+
+	sim_wearer_init(&w, spm, swing_mg, 8);
+	feed(&w, secs, dt_ms);
+}
+
+/* Time passes with no samples at all -- what RING_CHARGING looks like. */
+static void feed_gap(int secs)
+{
+	now_ms += (int64_t)secs * 1000;
+}
+
+/* --- the wire contract ------------------------------------------------- */
+
+/*
+ * APP_INTEGRATION.md section 7 publishes these offsets to app authors. If
+ * a field is added or reordered without updating that table, this fails
+ * rather than silently shifting everybody's parser by two bytes.
+ */
+static void test_wire_format(void)
+{
+	sim_section("wire format (must match APP_INTEGRATION.md section 7)");
+
+	CHECK(sizeof(struct ring_activity) == 17,
+	      "ring_activity is %zu bytes, documented as 17",
+	      sizeof(struct ring_activity));
+
+	/* Must stay inside a default 23-byte ATT MTU (3 bytes of header). */
+	CHECK(sizeof(struct ring_activity) <= 20,
+	      "ring_activity does not fit an unnegotiated MTU");
+
+	CHECK(offsetof(struct ring_activity, steps) == 0, "steps offset");
+	CHECK(offsetof(struct ring_activity, kcal_x1000) == 4, "kcal offset");
+	CHECK(offsetof(struct ring_activity, cadence_spm) == 8, "cadence offset");
+	CHECK(offsetof(struct ring_activity, sleep_session_min) == 10,
+	      "sleep_session_min offset");
+	CHECK(offsetof(struct ring_activity, sleep_total_min) == 12,
+	      "sleep_total_min offset");
+	CHECK(offsetof(struct ring_activity, restless_min) == 14,
+	      "restless_min offset");
+	CHECK(offsetof(struct ring_activity, sleep_state) == 16,
+	      "sleep_state offset");
+}
+
+/* --- steps ------------------------------------------------------------- */
+
+static void test_step_accuracy(void)
+{
+	const int dts[] = { 20, 40, 60 };
+	const double cadences[] = { 90, 110, 130 };
+
+	sim_section("step count at the rates main.c actually polls");
+
+	for (size_t d = 0; d < ARRAY_SIZE(dts); d++) {
+		for (size_t c = 0; c < ARRAY_SIZE(cadences); c++) {
+			char label[64];
+
+			reset_all();
+			feed_walk(300, dts[d], cadences[c], 150);
+
+			snprintf(label, sizeof(label),
+				 "%.0f spm at %d ms", cadences[c], dts[d]);
+			CHECK_NEAR(steps_count(), cadences[c] * 5, 3, label);
+		}
+	}
+}
+
+/*
+ * BUG: the detector was fed at 200 ms, which is where the firmware's idle
+ * poll used to sit. Walking is 1.5-2.5 Hz, so that is barely above Nyquist
+ * and steps are lost outright rather than merely mis-timed. This documents
+ * the cliff so nobody quietly raises the poll interval again; the policy
+ * that keeps the firmware off it is tested in test_mainloop.c.
+ */
+static void test_slow_polling_is_known_bad(void)
+{
+	sim_section("the 200 ms cliff (documents why STEP_POLL_MS exists)");
+
+	reset_all();
+	feed_walk(300, 200, 110, 150);
+
+	CHECK(steps_count() < 550 / 2,
+	      "200 ms polling counted %u of 550 steps -- if this now passes, "
+	      "the detector improved and steps.h's table needs redoing",
+	      steps_count());
+}
+
+static void test_no_false_steps_when_still(void)
+{
+	const int noises[] = { 2, 8, 20, 40 };
+
+	sim_section("a still ring counts no steps");
+
+	for (size_t i = 0; i < ARRAY_SIZE(noises); i++) {
+		reset_all();
+		feed_still(1800, 40, noises[i]);
+
+		CHECK(steps_count() == 0,
+		      "30 min still with +/-%d mg noise counted %u steps",
+		      noises[i], steps_count());
+	}
+}
+
+static void test_cadence(void)
+{
+	sim_section("cadence tracks, and decays when walking stops");
+
+	reset_all();
+	feed_walk(120, 40, 110, 150);
+	CHECK_NEAR(steps_cadence_spm(), 110, 10, "cadence while walking");
+
+	feed_still(10, 40, 4);
+	CHECK(steps_cadence_spm() == 0,
+	      "cadence %u ten seconds after stopping, expected 0",
+	      steps_cadence_spm());
+}
+
+/*
+ * A property check, not a regression guard -- and the distinction is worth
+ * recording. steps.c re-primes after a feed gap, but deleting that
+ * re-prime does not make this test fail: the input is a magnitude, so the
+ * baseline sits near 1000 mg at rest no matter which way the ring came
+ * back. The gap handling that IS load-bearing is in sleep.c, below.
+ */
+static void test_no_false_steps_across_a_gap(void)
+{
+	sim_section("a feed gap does not manufacture steps");
+
+	reset_all();
+	feed_still(600, 40, 4);
+
+	uint32_t before = steps_count();
+
+	feed_gap(3600);
+	feed_still(60, 40, 4);
+
+	CHECK(steps_count() == before,
+	      "an hour of charging produced %u steps",
+	      steps_count() - before);
+}
+
+/* --- sleep ------------------------------------------------------------- */
+
+static void test_sleep_onset_and_wake(void)
+{
+	sim_section("sleep onset needs dwell, and so does waking");
+
+	reset_all();
+	feed_still(8 * 60, 200, 3);
+	CHECK(!sleep_is_asleep(), "asleep after only 8 still minutes");
+
+	feed_still(4 * 60, 200, 3);
+	CHECK(sleep_is_asleep(), "not asleep after 12 still minutes");
+	CHECK(sleep_session_minutes() >= 10,
+	      "session reports %u minutes, expected at least 10",
+	      sleep_session_minutes());
+
+	/* One restless minute must not end the session. */
+	feed_walk(70, 40, 110, 200);
+	CHECK(sleep_is_asleep(),
+	      "a single minute of movement ended the session");
+	CHECK(sleep_restless_minutes() >= 1, "restless minute not counted");
+
+	/* Sustained activity must. */
+	feed_walk(3 * 60, 40, 110, 200);
+	CHECK(!sleep_is_asleep(),
+	      "three active minutes did not end the session");
+	CHECK(sleep_session_minutes() == 0,
+	      "session minutes still %u while awake",
+	      sleep_session_minutes());
+}
+
+/*
+ * BUG: RING_CHARGING reads no accelerometer, so an hour on a charger
+ * arrived as a single stale bucket, was judged one still minute, and the
+ * session ran straight through it. A ring on a charger is not a ring being
+ * slept in.
+ */
+static void test_charging_gap_ends_the_session(void)
+{
+	sim_section("a charging gap ends the session");
+
+	reset_all();
+	feed_still(30 * 60, 200, 3);
+	CHECK(sleep_is_asleep(), "did not fall asleep in 30 still minutes");
+
+	uint16_t credited = sleep_total_minutes();
+
+	feed_gap(3600);
+	feed_still(90, 200, 3);
+
+	CHECK(!sleep_is_asleep(),
+	      "still 'asleep' after an hour with no accelerometer data");
+	CHECK(sleep_session_minutes() == 0, "session did not close");
+	CHECK(sleep_total_minutes() >= credited,
+	      "minutes credited before the gap were lost (%u -> %u)",
+	      credited, sleep_total_minutes());
+}
+
+/*
+ * BUG: sleep_reset() kept a step snapshot taken before steps_reset() zeroed
+ * the counter, so the next minute's unsigned delta wrapped to ~4 billion
+ * and read as the most active minute ever recorded -- costing a minute of
+ * stillness and, if a session had been running, a restless minute.
+ */
+static void test_reset_does_not_poison_the_next_minute(void)
+{
+	sim_section("resetting the counters does not corrupt the next minute");
+
+	reset_all();
+	feed_walk(300, 40, 110, 200);
+	CHECK(steps_count() > 0, "no steps to reset");
+
+	/* Exactly what main.c's reset block does, in that order. */
+	steps_reset();
+	sleep_reset();
+	calories_reset();
+
+	CHECK(steps_count() == 0, "steps not cleared");
+
+	feed_still(20 * 60, 200, 3);
+
+	CHECK(sleep_is_asleep(), "20 still minutes after a reset did not sleep");
+	CHECK(sleep_session_minutes() >= 20,
+	      "session is %u minutes, expected 20 -- a minute was eaten by a "
+	      "bogus step delta", sleep_session_minutes());
+}
+
+/* --- calories ---------------------------------------------------------- */
+
+static void test_calorie_arithmetic(void)
+{
+	sim_section("calorie arithmetic");
+
+	/* kcal/min = MET * kg * 0.0175; at rest, 70 kg: 1.225 kcal/min. */
+	calories_init();
+	calories_set_weight(700);
+	for (int i = 0; i < 60; i++) {
+		calories_update_minute(0);
+	}
+	CHECK(calories_total_x1000() == 73500,
+	      "an hour of rest at 70 kg gave %u, expected 73500",
+	      calories_total_x1000());
+
+	/* Weight is clamped to 20.0-250.0 kg. */
+	calories_init();
+	calories_set_weight(0);
+	calories_update_minute(0);
+	CHECK(calories_total_x1000() == 350,
+	      "weight 0 should clamp to 20 kg (350), got %u",
+	      calories_total_x1000());
+
+	calories_init();
+	calories_set_weight(65535);
+	calories_update_minute(0);
+	CHECK(calories_total_x1000() == 4375,
+	      "weight 65535 should clamp to 250 kg (4375), got %u",
+	      calories_total_x1000());
+
+	/* Walking has to cost more than resting. */
+	calories_init();
+	calories_set_weight(700);
+	calories_update_minute(110);
+
+	uint32_t walking = calories_total_x1000();
+
+	calories_init();
+	calories_set_weight(700);
+	calories_update_minute(0);
+	CHECK(walking > calories_total_x1000() * 2,
+	      "a minute of walking (%u) is not meaningfully above rest (%u)",
+	      walking, calories_total_x1000());
+}
+
+/*
+ * BUG: calories_update_minute() used to take an instantaneous cadence, so
+ * a whole minute inherited whatever the wearer happened to be doing at the
+ * instant the tick fired. The same ten minutes of intermittent walking
+ * came out as 42.0 kcal or 12.3 kcal depending only on tick phase.
+ */
+static void test_calories_do_not_depend_on_tick_phase(void)
+{
+	uint32_t mid_walk, after_rest;
+	uint32_t last;
+
+	sim_section("calorie totals do not depend on when the tick lands");
+
+	/* Ten minutes of 20 s walking, 40 s still. Tick lands mid-stride. */
+	reset_all();
+	calories_set_weight(700);
+	last = 0;
+	for (int m = 0; m < 10; m++) {
+		feed_walk(20, 40, 110, 200);
+		calories_update_minute(steps_count() - last);
+		last = steps_count();
+		feed_still(40, 40, 4);
+	}
+	mid_walk = calories_total_x1000();
+
+	/* Identical activity, tick lands after the rest instead. */
+	reset_all();
+	calories_set_weight(700);
+	last = 0;
+	for (int m = 0; m < 10; m++) {
+		feed_walk(20, 40, 110, 200);
+		feed_still(40, 40, 4);
+		calories_update_minute(steps_count() - last);
+		last = steps_count();
+	}
+	after_rest = calories_total_x1000();
+
+	CHECK_NEAR(mid_walk, after_rest, 10,
+		   "same activity, different tick phase");
+
+	/*
+	 * And the answer should be in the right neighbourhood: a third of
+	 * each minute at ~3.5 MET and the rest at 1 MET is about 2.2
+	 * kcal/min for 70 kg, so roughly 22 kcal over ten minutes. Wide
+	 * tolerance -- this is checking for a plausible magnitude, not
+	 * calibration, which no simulation can give.
+	 */
+	CHECK(mid_walk > 14000 && mid_walk < 30000,
+	      "ten minutes of intermittent walking gave %u.%03u kcal, "
+	      "expected roughly 22", mid_walk / 1000, mid_walk % 1000);
+}
+
+int main(void)
+{
+	printf("activity module tests\n");
+
+	test_wire_format();
+
+	test_step_accuracy();
+	test_slow_polling_is_known_bad();
+	test_no_false_steps_when_still();
+	test_cadence();
+	test_no_false_steps_across_a_gap();
+
+	test_sleep_onset_and_wake();
+	test_charging_gap_ends_the_session();
+	test_reset_does_not_poison_the_next_minute();
+
+	test_calorie_arithmetic();
+	test_calories_do_not_depend_on_tick_phase();
+
+	return sim_report("test_activity");
+}
