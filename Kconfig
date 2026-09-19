@@ -97,6 +97,74 @@ config RING_WATCHDOG_TIMEOUT_MS
 	  a margin that did not exist. Read main.c rather than trusting a
 	  figure quoted here.
 
+config RING_SLEEP_WEAR_CHECK
+	bool "Corroborate sleep sessions with a PPG wear check"
+	default y
+	help
+	  Opens a short PPG window every so often while a sleep session is
+	  open, purely to read the DC level and answer "is this ring on a
+	  hand?". Without it, stillness is the only input the sleep tracker
+	  has and a ring left on a nightstand logs a full night -- confirmed
+	  behaviour, not a hypothesis.
+
+	  It costs LED current at night, but only where the answer is "no".
+	  A worn ring never goes stale -- finding a finger during an ordinary
+	  window refreshes the motion timeout -- so it is already measuring
+	  every minute and its scheduled windows answer this for free: at
+	  most one extra 6 s window per session, and usually none. A ring off
+	  a finger DOES go stale three minutes in, and there the check adds
+	  roughly 16 windows of 6 s, about 96 s of LED1 per night at ~15.4 mA
+	  off the 5 V rail, against the ~12 s that night cost before.
+
+	  That is ~0.41 mAh at 5 V, or ~0.65 mAh referred to a 3.7 V cell at
+	  an assumed 85 % boost efficiency, before the AFE's own draw. NOBODY
+	  HAS MEASURED THE BATTERY, so what fraction of a night that is
+	  remains unknown. The arithmetic and the simulated window counts are
+	  in STATUS.md section 5; the far larger pre-existing cost of the
+	  duty cycle itself is R13 in the same file.
+
+	  The verdict is reported, never enforced: a session that fails the
+	  check is still reported as sleep, and the app decides what to do
+	  with it.
+
+	  Set this to n and no window is ever opened to ask the question, so
+	  the power model is exactly what it was before this option existed.
+	  Sessions then report RING_WEAR_UNKNOWN, except where a window
+	  opened for some other reason -- an app-forced measurement, opcode
+	  0x03 -- happens to land inside one. That reading is free and is
+	  still recorded either way.
+
+config RING_SLEEP_WEAR_CHECK_INTERVAL_MIN
+	int "Minutes between sleep wear checks"
+	default 30
+	range 5 1440
+	depends on RING_SLEEP_WEAR_CHECK
+	help
+	  How long to wait between wear checks within one sleep session. The
+	  first check of a session is taken as soon as the session opens, so
+	  a verdict of "not worn" -- which needs two negatives -- lands about
+	  one interval after onset.
+
+	  Cost scales linearly: halving this doubles the LED time per night.
+	  Set it beyond a night's length (say 600) to get exactly one check
+	  per session, which is the cheapest useful setting and cannot notice
+	  a ring taken off at 2 am.
+
+config RING_SLEEP_WEAR_CHECK_WINDOW_MS
+	int "Length of a sleep wear-check window (ms)"
+	default 6000
+	range 4000 30000
+	depends on RING_SLEEP_WEAR_CHECK
+	help
+	  How long the PPG runs for one wear check. This only has to settle
+	  the DC tracker, not acquire a heart rate, so it is far shorter than
+	  MEASURE_WINDOW_MS.
+
+	  The floor is the ~4 s settling figure the measurement window is
+	  sized around; the 6 s default is that plus margin. Nothing shorter
+	  has been tried on hardware, because there is no hardware -- do not
+	  lower the floor on the strength of the filter time constant alone.
+
 config RING_HRS_OPEN
 	bool "Leave the standard Heart Rate Service readable without pairing"
 	default y
