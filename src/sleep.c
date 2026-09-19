@@ -119,6 +119,29 @@ uint16_t sleep_restless_minutes(void)
 	return sl.restless_minutes;
 }
 
+/*
+ * Close the current session, un-crediting minutes that were counted on the
+ * assumption the wearer might settle again.
+ *
+ * Both counters need it. total_minutes is the obvious one. restless_minutes
+ * is the one that was wrong for longer: it is published as "minutes of
+ * motion during the session that did not end it", so the minutes that DID
+ * end it must not be in there -- otherwise a still night that finishes with
+ * the wearer getting out of bed reports three restless minutes, and carries
+ * them all of the next day, since the field is only cleared when the next
+ * session starts.
+ */
+static void end_session(uint16_t provisional_sleep, uint16_t provisional_restless)
+{
+	sl.total_minutes -= MIN((uint32_t)provisional_sleep, sl.total_minutes);
+	sl.restless_minutes -= MIN(provisional_restless, sl.restless_minutes);
+
+	sl.asleep = false;
+	sl.session_minutes = 0;
+	sl.still_run = 0;
+	sl.active_run = 0;
+}
+
 static void evaluate_minute(int32_t peak_dev_mg, uint32_t steps_in_minute)
 {
 	bool minute_still = (peak_dev_mg < SLEEP_STILL_MG) &&
@@ -159,22 +182,17 @@ static void evaluate_minute(int32_t peak_dev_mg, uint32_t steps_in_minute)
 
 	if (sl.active_run >= WAKE_CONFIRM_MINUTES) {
 		/*
-		 * Session over. Back out the minutes counted provisionally
-		 * while waiting to see whether stillness would resume --
-		 * they were awake, not asleep.
+		 * Session over.
+		 *
+		 * Every active minute since stillness broke was counted
+		 * twice over on the assumption the wearer might settle
+		 * again: once into total_minutes as provisional sleep, and
+		 * once into restless_minutes. They were the wearer getting
+		 * up, so back both out. The two counts differ by one --
+		 * this final minute incremented restless_minutes above but
+		 * never reached the provisional credit below.
 		 */
-		uint16_t overcounted = WAKE_CONFIRM_MINUTES - 1;
-
-		/* session_minutes needs no correction of its own: the
-		 * session is ending this minute regardless, so it is
-		 * zeroed below either way.
-		 */
-		sl.total_minutes -= MIN((uint32_t)overcounted, sl.total_minutes);
-
-		sl.asleep = false;
-		sl.session_minutes = 0;
-		sl.still_run = 0;
-		sl.active_run = 0;
+		end_session(sl.active_run - 1, sl.active_run);
 	} else {
 		/* Provisionally still counts as sleep until the wake is
 		 * confirmed, so a single stirring minute does not cost the
@@ -211,13 +229,14 @@ void sleep_feed(int32_t mg, int64_t now_ms)
 		 * The feed stopped, so there is no honest verdict to reach
 		 * about the time that passed. End any session rather than
 		 * extend one across a gap: whatever the ring was doing, it was
-		 * not being worn on a sleeping hand. Minutes already credited
-		 * to total_minutes stay credited -- that sleep did happen.
+		 * not being worn on a sleeping hand. Minutes genuinely slept
+		 * stay credited -- that sleep did happen -- but any active
+		 * minutes still awaiting a wake confirmation are backed out
+		 * the same way the confirmed path backs them out. Here every
+		 * one of them was provisionally credited, since none reached
+		 * the minute that ends a session.
 		 */
-		sl.asleep = false;
-		sl.session_minutes = 0;
-		sl.still_run = 0;
-		sl.active_run = 0;
+		end_session(sl.active_run, sl.active_run);
 		open_bucket(now_ms);
 		return;
 	}

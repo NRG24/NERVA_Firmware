@@ -232,6 +232,17 @@ static uint8_t imu_reinit_count;
 /* Set when IMU_REINIT_LIMIT trips; only a reset clears it. */
 static bool imu_unrecoverable;
 
+/*
+ * Consecutive failures of the pedometer's own accelerometer read inside a
+ * measurement window. Separate from imu_fail_count, which belongs to the
+ * IMU health machinery in RING_IDLE and decides whether the part is dead;
+ * this one only decides whether to keep asking during this window. Three
+ * is enough to distinguish a wedged part from one bad transaction, and
+ * cheap to be wrong about -- the cost is some steps missed in one window.
+ */
+static uint8_t act_fail_count;
+#define ACT_FAIL_LIMIT		3
+
 /* How often to retry a failed imu_init(). It is idempotent and cheap. */
 #define IMU_RETRY_MS		60000
 
@@ -1175,6 +1186,10 @@ int main(void)
 					state = RING_MEASURING;
 					window_started = now;
 					waiting_for_finger = !forced;
+					/* Each window gets its own budget of
+					 * accelerometer retries.
+					 */
+					act_fail_count = 0;
 					LOG_INF("state -> %s%s", state_name[state],
 						forced ? " (app requested)" : "");
 					publish_all();
@@ -1250,13 +1265,40 @@ int main(void)
 			 * worn and moving. Gated on imu_ready so a part
 			 * already known dead is not charged a full I2C
 			 * timeout here as well as in RING_IDLE.
+			 *
+			 * The IMU health machinery deliberately lives in
+			 * RING_IDLE and is not duplicated here, so this read
+			 * has no fail counter behind it to stop it retrying.
+			 * Without a limit, an IMU that wedges while the PPG
+			 * stays healthy would cost a full I2C timeout on
+			 * every 20 ms pass for the whole window -- roughly
+			 * 500 ms of stalled bus per pass, for 15 s of
+			 * window, achieving nothing. Give up on the feed for
+			 * the rest of this window instead; the next window
+			 * starts fresh, and RING_IDLE still owns deciding
+			 * whether the part is actually dead.
 			 */
-			if (imu_ready) {
+			if (imu_ready && act_fail_count < ACT_FAIL_LIMIT) {
 				int act_mg = imu_magnitude_mg();
 
 				if (act_mg >= 0) {
+					act_fail_count = 0;
+					if (abs(act_mg - 1000) > STEP_MOTION_MG) {
+						/*
+						 * Keeps the fast idle poll from
+						 * being re-earned from scratch
+						 * when the window closes: the
+						 * hold would otherwise have
+						 * expired mid-window and the
+						 * first idle pass would use the
+						 * slow rate that counts nothing.
+						 */
+						last_step_motion = now;
+					}
 					steps_update(act_mg, now);
 					sleep_feed(act_mg, now);
+				} else if (act_fail_count < ACT_FAIL_LIMIT) {
+					act_fail_count++;
 				}
 			}
 

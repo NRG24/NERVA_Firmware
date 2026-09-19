@@ -105,6 +105,8 @@ the fix was reverted and the suite confirmed to fail:
 | `test_charging_gap_ends_the_session` | An hour on the charger arrived as one stale bucket and the sleep session ran straight through it. |
 | `test_short_gaps_are_caught_too` | The gap was measured from the start of the bucket, so the shortest outage it could see was a whole bucket long and a one-minute charge slipped through as ordinary stillness. |
 | `test_a_slow_pass_is_not_a_gap` | The other side of that: a few seconds of I2C stall must stay an ordinary minute, or a marginal bus shreds every session. |
+| `test_waking_up_is_not_restlessness` | `restless_min` counted the very minutes that ended the session, so a still night finishing with the wearer getting up reported three restless minutes — and carried them all the next day. |
+| `test_a_gap_does_not_bank_provisional_minutes` | The gap path kept minutes credited provisionally while waiting on a wake confirmation, which the wake-confirm path in the same function backed out. |
 | `test_reset_does_not_poison_the_next_minute` | `sleep_reset()` kept a step snapshot from before the counter was zeroed; the unsigned delta wrapped to ~4 billion. |
 | `test_calories_do_not_depend_on_tick_phase` | A sampled instantaneous cadence made the same activity worth 42.0 or 12.3 kcal depending only on when the tick fired. |
 | `test_charging_does_not_accrue_calories` | The calorie tick ran above the state switch and billed ~147 kcal for a two-hour charge. |
@@ -129,6 +131,20 @@ The lesson generalises: in a harness that re-implements part of the
 firmware, a test can pass because the *harness* has the behaviour, not the
 code under test. Reverting the fix and watching the test fail is the only
 thing that tells those apart. Do it for every guard you add.
+
+### Buckets are wall-clock minutes, so stir durations matter
+
+A test that stirs the sleeper for 70 seconds is not testing "one restless
+minute". Sleep buckets close on wall-clock minute boundaries, so a 70 s
+stir straddles three of them — two during the walk and one covering its
+tail — which is three active minutes and *correctly* ends the session.
+An early version of `test_a_genuine_stir_is_still_counted` asserted the
+opposite and failed against correct code.
+
+Measured: a stir of 10–55 s produces one active minute, and 70 s produces
+three. If a sleep test's premise depends on the count, keep the stir well
+under a minute, or instrument the transitions and check rather than
+assuming.
 
 ---
 

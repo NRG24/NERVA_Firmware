@@ -308,6 +308,99 @@ static void test_a_slow_pass_is_not_a_gap(void)
 }
 
 /*
+ * BUG: restless_minutes counted the very minutes that ended the session.
+ * It is published as "motion during the session that did not end it", so a
+ * still night finishing with the wearer getting out of bed reported three
+ * restless minutes -- and carried them all of the next day, since the
+ * field is only cleared when the next session starts.
+ */
+static void test_waking_up_is_not_restlessness(void)
+{
+	sim_section("the minutes that end a session are not 'restless'");
+
+	reset_all();
+	feed_still(40 * 60, 200, 3);
+	CHECK(sleep_is_asleep(), "did not fall asleep");
+	CHECK(sleep_restless_minutes() == 0,
+	      "a perfectly still night logged %u restless minutes",
+	      sleep_restless_minutes());
+
+	/* Get up: sustained activity, enough to end the session. */
+	feed_walk(4 * 60, 40, 110, 200);
+
+	CHECK(!sleep_is_asleep(), "walking for 4 minutes did not end it");
+	CHECK(sleep_restless_minutes() == 0,
+	      "getting up logged %u restless minutes for a still night",
+	      sleep_restless_minutes());
+}
+
+/*
+ * A genuine mid-session stir -- one active minute, then settling again --
+ * IS restlessness and must survive. This is the other side of the fix
+ * above, so that "back out the wake minutes" cannot be implemented by
+ * simply zeroing the counter.
+ */
+static void test_a_genuine_stir_is_still_counted(void)
+{
+	sim_section("a stir that does not end the session stays counted");
+
+	reset_all();
+	feed_still(40 * 60, 200, 3);
+	CHECK(sleep_is_asleep(), "did not fall asleep");
+
+	/*
+	 * 25 s, not a minute-and-more. Buckets are wall-clock minutes, so a
+	 * stir long enough to straddle three boundaries genuinely IS three
+	 * active minutes and genuinely should end the session -- measured,
+	 * and the reason an earlier version of this test was wrong.
+	 */
+	feed_walk(25, 40, 110, 200);
+	feed_still(10 * 60, 200, 3);		/* settle again */
+
+	CHECK(sleep_is_asleep(), "one stirring minute ended the session");
+	CHECK(sleep_restless_minutes() >= 1,
+	      "a real mid-session stir was not counted as restless");
+}
+
+/*
+ * BUG: the feed-gap session end kept the minutes that had been credited
+ * provisionally while waiting to see whether the wearer settled, while the
+ * wake-confirm path in the same function backed them out. Asleep, two
+ * stirring minutes, then onto the charger left sleep_total_min two
+ * minutes high.
+ */
+static void test_a_gap_does_not_bank_provisional_minutes(void)
+{
+	uint16_t settled, after_gap;
+
+	sim_section("a gap does not bank provisionally-credited awake minutes");
+
+	reset_all();
+	feed_still(40 * 60, 200, 3);
+	CHECK(sleep_is_asleep(), "did not fall asleep");
+	settled = sleep_total_minutes();
+
+	/* A stirring minute: provisionally credited, wake not yet confirmed. */
+	feed_walk(25, 40, 110, 200);
+	CHECK(sleep_is_asleep(), "one stirring minute ended the session early");
+
+	/* Now the ring goes on the charger before the wake is confirmed. */
+	feed_gap(600);
+	feed_still(90, 200, 3);
+
+	CHECK(!sleep_is_asleep(), "the gap did not end the session");
+
+	after_gap = sleep_total_minutes();
+	CHECK(after_gap <= settled,
+	      "total sleep went %u -> %u across a stir-then-charge; the "
+	      "provisionally credited awake minute was banked", settled,
+	      after_gap);
+	CHECK(sleep_restless_minutes() == 0,
+	      "the stirring minute stayed on the restless count (%u) after "
+	      "the session was ended by a gap", sleep_restless_minutes());
+}
+
+/*
  * BUG: sleep_reset() kept a step snapshot taken before steps_reset() zeroed
  * the counter, so the next minute's unsigned delta wrapped to ~4 billion
  * and read as the most active minute ever recorded -- costing a minute of
@@ -450,6 +543,9 @@ int main(void)
 	test_charging_gap_ends_the_session();
 	test_short_gaps_are_caught_too();
 	test_a_slow_pass_is_not_a_gap();
+	test_waking_up_is_not_restlessness();
+	test_a_genuine_stir_is_still_counted();
+	test_a_gap_does_not_bank_provisional_minutes();
 	test_reset_does_not_poison_the_next_minute();
 
 	test_calorie_arithmetic();
