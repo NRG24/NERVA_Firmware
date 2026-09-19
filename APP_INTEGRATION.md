@@ -353,6 +353,37 @@ confirmed in simulation rather than hypothetical:
   reason to believe it is on a finger. Expect a flat spot, not a gap in
   the counters, and do not interpolate across it.
 
+### Counters are since-boot, and a reboot zeroes them
+
+**None of this is stored in flash.** Every field in this characteristic
+lives in RAM and starts again from zero on any reset — a watchdog reboot,
+a fatal error, a flat battery, or the battery contact bouncing under flex
+(`HARDWARE_NOTES.md` §13, and it is a known issue on this revision). The
+ring is not the system of record for anything here. **Your app is.**
+
+Persistence was deliberately not added in firmware: the settings
+partition has never been successfully written on this board, and putting
+a step counter on a flash-write path before that is proven would risk the
+bonds alongside it.
+
+So accumulate on the phone side, and detect the resets:
+
+1. Subscribe to **Status** as well as Activity, and watch `uptime_s`.
+2. **If `uptime_s` goes backwards, the ring rebooted.** Everything in the
+   Activity packet restarted from zero at that moment.
+3. Keep your own running totals. On each read, add the *delta* since your
+   last sample, and after a reboot treat the new value as the delta
+   directly rather than subtracting your previous total from it — which
+   would otherwise go negative and, unsigned, wrap.
+
+Polling only the Activity characteristic cannot detect this: it carries
+no uptime of its own, and a reboot mid-walk looks exactly like a step
+count that quietly stopped climbing.
+
+The same applies to body weight (opcode `0x06`), which also lives in RAM
+— resend it after any reboot you detect, or the calorie estimate silently
+reverts to assuming 70 kg.
+
 There is also no RTC on this board (see README), so `sleep_session_min`
 and `sleep_total_min` are durations, not clock times. If you want to show
 "fell asleep at 11:42 PM," subtract `sleep_session_min` minutes from the

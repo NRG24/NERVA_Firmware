@@ -182,10 +182,17 @@ Ordered by how much it would hurt, not how likely it is.
   gesturing in simulation and it rejects gentle walking too. Where that
   line actually belongs can only be settled on a wrist — sorry, a finger —
   with a reference count.
-* **Body weight for the calorie estimate is not persisted.** It lives in
-  RAM only (`calories.c`), defaults to 70 kg, and resets to that default on
-  every reboot. The app has to resend control opcode `0x06` after every
-  power cycle if the wearer is not 70 kg.
+* **Nothing in the activity feature is persisted.** Steps, sleep minutes,
+  calories and the body weight the estimate depends on all live in RAM and
+  start from zero on any reset — watchdog (R2), fatal error, flat battery,
+  or the battery contact bouncing under flex (`HARDWARE_NOTES.md` §13).
+  This is deliberate rather than an oversight: the settings partition has
+  never been successfully written on this board (R3), and putting a step
+  counter on a flash-write path before that is proven would put the bonds
+  at risk alongside it. The app is the system of record and has to
+  accumulate its own totals, watching `uptime_s` in the status packet to
+  spot a reboot — `APP_INTEGRATION.md` §7 spells out how. Revisit once
+  NVS has demonstrably worked on real hardware.
 * **No RTC**, so sleep sessions are durations from `k_uptime_get()`, not
   clock times — see `APP_INTEGRATION.md` §7. A session spanning a reboot
   (watchdog reset, battery pull) is lost: `sleep.c` has no persistence and
