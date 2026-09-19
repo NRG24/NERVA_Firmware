@@ -221,6 +221,24 @@ static uint32_t measure_window_ms = MEASURE_WINDOW_MS;
 static uint32_t measure_period_ms = MEASURE_PERIOD_MS;
 static atomic_t force_measure;
 
+/*
+ * steps.c/sleep.c/calories.c have no locking of their own -- unlike
+ * latest_status/latest_activity in ble.c, their state is more than one
+ * scalar and is read-modify-written every pass through RING_IDLE and
+ * RING_MEASURING. Calling their reset/setter functions straight from a
+ * BLE control callback, which runs on the BT RX thread, would race the
+ * main loop's steps_update()/sleep_feed()/calories_update_minute() --
+ * concretely, sleep_feed() reads steps_count() and diffs it against a
+ * snapshot, so a steps_reset() landing in between the two makes that
+ * diff go deeply negative and wrap to a huge uint32_t, which
+ * evaluate_minute() would read as an enormous step count and
+ * misclassify the minute. Same atomic-handoff pattern as force_measure
+ * above: the callback only sets a flag/value, and only the main loop
+ * ever calls into steps.c/sleep.c/calories.c.
+ */
+static atomic_t activity_reset_pending;
+static atomic_t pending_weight_kg_x10;
+
 static uint16_t last_hr_x10;
 static uint16_t battery_mv;
 static int16_t gsr_mv = -1;
@@ -265,15 +283,18 @@ static void cb_stream_ppg(bool on)
 
 static void cb_set_weight(uint16_t weight_kg_x10)
 {
-	calories_set_weight(weight_kg_x10);
+	/*
+	 * 0 is the "nothing pending" sentinel the main loop looks for, so a
+	 * literal 0 from the app is nudged to 1 -- calories_set_weight()
+	 * clamps anything below 20.0 kg up to the same 20.0 kg floor anyway,
+	 * so this changes nothing about the value that is actually applied.
+	 */
+	atomic_set(&pending_weight_kg_x10, weight_kg_x10 ? weight_kg_x10 : 1);
 }
 
 static void cb_reset_activity(void)
 {
-	steps_reset();
-	sleep_reset();
-	calories_reset();
-	LOG_INF("activity counters reset (app request)");
+	atomic_set(&activity_reset_pending, 1);
 }
 
 static const struct ble_control_cbs control_cbs = {
@@ -760,6 +781,31 @@ int main(void)
 		 * put a feed beside it or raise CONFIG_RING_WATCHDOG_TIMEOUT_MS.
 		 */
 		ring_wdt_feed();
+
+		/*
+		 * --- activity control, checked in every state ---
+		 *
+		 * The only place steps_reset()/sleep_reset()/calories_reset()/
+		 * calories_set_weight() are called -- see the comment above
+		 * activity_reset_pending's declaration for why the BLE
+		 * callbacks only set these instead of calling straight in.
+		 */
+		if (atomic_cas(&activity_reset_pending, 1, 0)) {
+			steps_reset();
+			sleep_reset();
+			calories_reset();
+			LOG_INF("activity counters reset (app request)");
+		}
+
+		{
+			uint16_t w = (uint16_t)atomic_set(&pending_weight_kg_x10, 0);
+
+			if (w != 0) {
+				calories_set_weight(w);
+				LOG_INF("body weight set: %u.%u kg (app request)",
+					w / 10U, w % 10U);
+			}
+		}
 
 		/* --- charger, checked in every state --- */
 		if (now >= next_pmic) {

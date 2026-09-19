@@ -147,7 +147,10 @@ static void evaluate_minute(int64_t bucket_end_ms, int32_t peak_dev_mg,
 		 */
 		uint16_t overcounted = WAKE_CONFIRM_MINUTES - 1;
 
-		sl.session_minutes -= MIN(overcounted, sl.session_minutes);
+		/* session_minutes needs no correction of its own: the
+		 * session is ending this minute regardless, so it is
+		 * zeroed below either way.
+		 */
 		sl.total_minutes -= MIN((uint32_t)overcounted, sl.total_minutes);
 
 		sl.asleep = false;
