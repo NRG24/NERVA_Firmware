@@ -50,10 +50,13 @@ anything newer as a bring-up, not an update.
 ## 3. Features
 
 **Power model.** Three states. `IDLE`: optics off, 5 V boost off, IMU wake
-armed at 80 mg, CPU asleep. `MEASURING`: 15 s window every 60 s, abandoned
-after 6 s if no finger. `CHARGING`: all optics off. After 3 min without
-motion the ring stops probing on a timer and waits for the interrupt. The
-app can change the duty cycle or force a window.
+armed at 80 mg, CPU asleep, accelerometer polled every 200 ms — or every
+40 ms while recent motion says the wearer may be walking, which is what the
+pedometer needs to see footfalls at all (§5). `MEASURING`: 15 s window every
+60 s, abandoned after 6 s if no finger. `CHARGING`: all optics off, and no
+accelerometer reads at all, so steps and sleep stop with it. After 3 min
+without motion the ring stops probing on a timer and waits for the
+interrupt. The app can change the duty cycle or force a window.
 
 **Sensing.** Green-LED PPG at ~15 mA, 100 sps, FIFO polled every 20 ms.
 Integer-only HR: DC tracker → 4 Hz low-pass → adaptive threshold → median of
@@ -63,11 +66,21 @@ PMIC monitor. GSR through a transimpedance stage into the SAADC.
 **Activity.** Steps, sleep and calories, all derived from the IMU's
 accelerometer magnitude and none of them from any new sensor. Steps:
 peak-detection pedometer (`steps.c`), same technique as the HR detector
-applied to motion. Sleep (`sleep.c`): one-minute stillness buckets, 10
-consecutive still minutes to start a session, 3 consecutive active minutes
-to end one. Calories (`calories.c`): a standard MET table keyed on step
-cadence, times body weight (default 70 kg, settable over BLE). **All three
-are new and, like heart rate, unvalidated** — see §2 and §5.
+applied to motion, needing roughly a 100 mg swing to fire. Sleep
+(`sleep.c`): one-minute stillness buckets, 10 consecutive still minutes to
+start a session, 3 consecutive active minutes to end one, and a session
+cannot span a gap in accelerometer data such as a charge. Calories
+(`calories.c`): a MET table keyed on steps *per minute* — a count over the
+interval, not a sampled instantaneous cadence, which is what keeps a
+minute from inheriting whatever the wearer was doing at the instant the
+tick fired — times body weight (default 70 kg, settable over BLE).
+
+**All three are new and, like heart rate, unvalidated** (§2, §5). The one
+to keep in front of you: **sleep has no wear detection.** A ring on a
+nightstand is perfectly still and logs a full night. That is confirmed
+behaviour, and it is not fixable in firmware while the power model stops
+opening PPG windows — the only wear signal — after three minutes of
+stillness.
 
 **BLE.** Standard HRS (0x180D) and BAS (0x180F), open by default so generic
 apps work. Custom Ring Service (`f0a1…`) with a 20-byte status packet, a
@@ -141,13 +154,21 @@ Ordered by how much it would hurt, not how likely it is.
   bring-up, wasteful for a shipped image.
 * **No unit tests, no CI.** Verification is the five-configuration build
   sweep run by hand on one Windows machine with NCS installed at `C:\ncs`.
-* **Step/sleep sampling rate is whatever the main loop happens to be
-  polling the IMU at** — 5 Hz while idle and unworn, up to 50 Hz during a
-  measurement window or while IMU streaming is on. A pedometer built for a
-  fixed sample rate would reject this; this one uses timestamps rather
-  than sample counts specifically so it tolerates the variation (see
-  `steps.c`), but 5 Hz is a thin margin above the ~2 Hz cadence of a fast
-  walk and has not been checked against a real gait.
+* **The pedometer needs a fast poll, and that changes the idle power
+  model.** 5 Hz — the old idle poll rate — does not undercount gait, it
+  misses it almost entirely: simulated against a 5 min walk it counted
+  nothing below a 250 mg magnitude swing, against 0–1 % error at 25 Hz.
+  So `RING_IDLE` now polls the accelerometer every 40 ms whenever recent
+  motion suggests the wearer may be walking, and drops back to 200 ms once
+  they are still (`STEP_POLL_MS` / `STEP_MOTION_MG` in `main.c`). A still
+  ring — the whole of the night — is unchanged at 5 Hz, and the extra
+  ~20 I2C reads a second while moving are small beside the optical front
+  end's 15 mA duty cycle. Both numbers are simulation, not bench
+  measurement: **nobody has measured what this costs on a real battery.**
+* **The 100 mg detection floor is a guess.** It rejects typing and
+  gesturing in simulation and it rejects gentle walking too. Where that
+  line actually belongs can only be settled on a wrist — sorry, a finger —
+  with a reference count.
 * **Body weight for the calorie estimate is not persisted.** It lives in
   RAM only (`calories.c`), defaults to 70 kg, and resets to that default on
   every reboot. The app has to resend control opcode `0x06` after every

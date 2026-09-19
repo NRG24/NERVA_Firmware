@@ -108,6 +108,43 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  */
 #define STILL_TIMEOUT_MS	180000
 
+/* --- pedometer sampling ------------------------------------------------ */
+
+/*
+ * How fast the IMU is polled while the ring might be walking.
+ *
+ * Not a tuning preference. Walking is 1.5-2.5 Hz and a footfall is a
+ * narrow peak, so the idle 200 ms poll sits barely above Nyquist and the
+ * detector loses steps outright rather than merely adding noise -- in
+ * simulation it counted essentially nothing at 200 ms below a 250 mg
+ * magnitude swing, against 0-1 % error at 40 ms. See the table in steps.h.
+ *
+ * The cost is bounded: an extra ~20 accelerometer reads a second, each one
+ * a 6-byte I2C burst, and only while the wearer is actually moving. Set
+ * against the optical front end's ~15 mA for 15 s in every 60 while worn,
+ * it is noise. While the ring is still -- which is the whole of the night,
+ * and the case the idle power model was built for -- polling stays at
+ * IDLE_POLL_MS, and there are no steps to miss.
+ */
+#define STEP_POLL_MS		40
+#define IDLE_POLL_MS		200
+
+/*
+ * Deviation from 1 g that switches to the fast poll. Deliberately well
+ * below STILL_MG: that threshold decides wear and measurement windows,
+ * where a false positive lights the LEDs, but this one only costs a
+ * faster poll, and it has to trip on gentle walking that never deviates
+ * 120 mg in the first place -- exactly the motion the 200 ms poll cannot
+ * see.
+ */
+#define STEP_MOTION_MG		50
+
+/*
+ * How long the fast poll is held after the last qualifying motion. Covers
+ * the pause at a kerb or between strides without flapping between rates.
+ */
+#define STEP_POLL_HOLD_MS	10000
+
 enum ring_state {
 	RING_IDLE,
 	RING_MEASURING,
@@ -561,6 +598,8 @@ int main(void)
 	int64_t next_activity_min = 0;
 	int64_t window_started = 0;
 	int64_t last_motion = 0;
+	int64_t last_step_motion = 0;
+	uint32_t steps_at_last_min = 0;
 	bool waiting_for_finger = false;
 
 	LOG_INF("ring firmware starting");
@@ -722,7 +761,19 @@ int main(void)
 
 	(void)imu_arm_wake(WAKE_THRESHOLD_MG);
 	last_motion = k_uptime_get();
+	/* Same assumption last_motion makes: the ring was just handled. Left
+	 * at 0 this would instead depend on how long boot happened to take.
+	 */
+	last_step_motion = k_uptime_get();
 	next_window = k_uptime_get() + measure_period_ms;
+
+	/*
+	 * A minute from now, not immediately. The other periodic timers start
+	 * at 0 so their first poll happens on the first pass, which is right
+	 * for a poll and wrong for an accumulator: firing at boot would credit
+	 * a minute of resting calories to a minute that has not happened.
+	 */
+	next_activity_min = k_uptime_get() + 60000;
 
 	/*
 	 * Watchdog last, once every subsystem has had its chance.
@@ -791,9 +842,14 @@ int main(void)
 		 * callbacks only set these instead of calling straight in.
 		 */
 		if (atomic_cas(&activity_reset_pending, 1, 0)) {
+			/* steps_reset() first: sleep_reset() re-snapshots the
+			 * step count and would otherwise keep a snapshot from
+			 * before the counter was zeroed.
+			 */
 			steps_reset();
 			sleep_reset();
 			calories_reset();
+			steps_at_last_min = 0;
 			LOG_INF("activity counters reset (app request)");
 		}
 
@@ -916,14 +972,22 @@ int main(void)
 		 * --- calories, once a minute ---
 		 *
 		 * steps_update()/sleep_feed() run inline wherever the IMU is
-		 * already being read (below); calories only needs the cadence
-		 * that leaves behind, and a per-minute MET lookup is all the
-		 * precision the formula in calories.c has to offer, so there is
-		 * no reason to recompute it on every pass. No I2C traffic here,
-		 * so no watchdog feed is needed beside it.
+		 * already being read (below); calories only needs how many
+		 * steps that left behind since the last tick, which is an
+		 * average over the minute rather than a sample of whatever was
+		 * happening at the instant it fired. No I2C traffic here, so no
+		 * watchdog feed is needed beside it.
 		 */
 		if (now >= next_activity_min) {
-			calories_update_minute(steps_cadence_spm());
+			uint32_t steps_now = steps_count();
+
+			/* Clamped: the control characteristic can zero the step
+			 * counter between two ticks, and unsigned, that wraps.
+			 */
+			calories_update_minute(steps_now >= steps_at_last_min
+					       ? steps_now - steps_at_last_min
+					       : 0);
+			steps_at_last_min = steps_now;
 			next_activity_min = now + 60000;
 		}
 
@@ -1054,6 +1118,9 @@ int main(void)
 			 * no extra I2C traffic for either.
 			 */
 			if (mg >= 0) {
+				if (abs(mg - 1000) > STEP_MOTION_MG) {
+					last_step_motion = now;
+				}
 				steps_update(mg, now);
 				sleep_feed(mg, now);
 			}
@@ -1088,7 +1155,18 @@ int main(void)
 					next_window = now + measure_period_ms;
 				}
 			} else {
-				k_msleep(ble_imu_streaming() ? 20 : 200);
+				/*
+				 * Poll fast enough to actually see footfalls
+				 * while the ring is moving, and fall back to
+				 * the idle rate once it is still. See
+				 * STEP_POLL_MS.
+				 */
+				bool maybe_walking =
+					(now - last_step_motion) < STEP_POLL_HOLD_MS;
+
+				k_msleep(ble_imu_streaming() ? 20
+					 : maybe_walking ? STEP_POLL_MS
+					 : IDLE_POLL_MS);
 			}
 			break;
 		}

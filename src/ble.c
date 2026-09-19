@@ -336,9 +336,25 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 );
 
 /*
- * Attribute indices: 1 = status value, 4 = ppg value, 7 = imu value,
- * 12 = activity value. Control (10-11) has no CCC and nothing else in this
- * file indexes it directly, so it is not named here.
+ * Attribute indices into the table above. BT_GATT_CHARACTERISTIC expands to
+ * TWO attributes -- the Characteristic Declaration and then the Value -- and
+ * BT_GATT_CCC to one more, so each notifiable characteristic occupies three
+ * slots and these constants point at the first of each:
+ *
+ *   0  primary service
+ *   1  status   decl   2 value   3 CCC
+ *   4  ppg      decl   5 value   6 CCC
+ *   7  imu      decl   8 value   9 CCC
+ *  10  control  decl  11 value        (write-only, no CCC)
+ *  12  activity decl  13 value  14 CCC
+ *
+ * Pointing at the declaration rather than the value is deliberate and is
+ * what bt_gatt_notify() documents: "The attribute object on the parameters
+ * can be the so called Characteristic Declaration [...] or the
+ * Characteristic Value Declaration". It detects BT_UUID_GATT_CHRC, checks
+ * the declaration carries BT_GATT_CHRC_NOTIFY, and resolves the value
+ * handle itself. Any characteristic added here without BT_GATT_CHRC_NOTIFY
+ * would therefore fail with -EINVAL rather than notify the wrong handle.
  */
 #define ATTR_STATUS	(&ring_svc.attrs[1])
 #define ATTR_PPG	(&ring_svc.attrs[4])

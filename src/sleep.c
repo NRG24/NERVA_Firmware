@@ -32,6 +32,18 @@
  */
 #define WAKE_CONFIRM_MINUTES	3
 
+/*
+ * Longer than this since the last sample and the bucket is not a minute
+ * of anything -- RING_CHARGING reads no IMU at all, so a ring that spent
+ * an hour on a charger would otherwise come back, close its stale bucket,
+ * and have that hour judged as one still minute. A ring on a charger is
+ * also not a ring being slept in, so a session in progress ends here.
+ *
+ * Has to be comfortably above MINUTE_MS: a bucket legitimately stays open
+ * for a whole minute plus one poll interval.
+ */
+#define FEED_GAP_LIMIT_MS	(2 * MINUTE_MS)
+
 struct sleep_state {
 	bool primed;
 
@@ -60,17 +72,18 @@ void sleep_init(void)
 
 void sleep_reset(void)
 {
-	uint32_t step_snapshot = sl.bucket_step_snapshot;
 	int64_t bucket_start = sl.bucket_start_ms;
 	bool was_primed = sl.primed;
 
 	memset(&sl, 0, sizeof(sl));
 
-	/* Keep the bucket boundary and step snapshot: restarting them would
-	 * just make the very next bucket look artificially active from a
-	 * negative step delta.
+	/* Keep the bucket boundary -- restarting it would stretch the
+	 * current bucket to nearly two minutes. The step snapshot is
+	 * re-taken rather than kept, because the caller resets the step
+	 * counter alongside this and a snapshot from before that reset is
+	 * larger than the count it will be subtracted from.
 	 */
-	sl.bucket_step_snapshot = step_snapshot;
+	sl.bucket_step_snapshot = steps_count();
 	sl.bucket_start_ms = bucket_start;
 	sl.primed = was_primed;
 }
@@ -78,11 +91,6 @@ void sleep_reset(void)
 bool sleep_is_asleep(void)
 {
 	return sl.asleep;
-}
-
-uint32_t sleep_session_start_s(void)
-{
-	return sl.asleep ? (uint32_t)(sl.session_start_ms / 1000) : 0;
 }
 
 uint16_t sleep_session_minutes(void)
@@ -167,14 +175,38 @@ static void evaluate_minute(int64_t bucket_end_ms, int32_t peak_dev_mg,
 	}
 }
 
+/* Start a fresh bucket at now_ms with nothing carried over from the last. */
+static void open_bucket(int64_t now_ms)
+{
+	sl.bucket_start_ms = now_ms;
+	sl.bucket_peak_dev_mg = 0;
+	sl.bucket_step_snapshot = steps_count();
+}
+
 void sleep_feed(int32_t mg, int64_t now_ms)
 {
 	int32_t dev = abs(mg - 1000);
 
 	if (!sl.primed) {
-		sl.bucket_start_ms = now_ms;
-		sl.bucket_step_snapshot = steps_count();
+		open_bucket(now_ms);
 		sl.primed = true;
+		return;
+	}
+
+	if (now_ms - sl.bucket_start_ms > FEED_GAP_LIMIT_MS) {
+		/*
+		 * The feed stopped for longer than a bucket, so there is no
+		 * honest verdict to reach about the time that passed. End any
+		 * session rather than extend one across a gap: whatever the
+		 * ring was doing, it was not being worn on a sleeping hand.
+		 * Minutes already credited to total_minutes stay credited --
+		 * that sleep did happen.
+		 */
+		sl.asleep = false;
+		sl.session_minutes = 0;
+		sl.still_run = 0;
+		sl.active_run = 0;
+		open_bucket(now_ms);
 		return;
 	}
 
@@ -187,11 +219,16 @@ void sleep_feed(int32_t mg, int64_t now_ms)
 	}
 
 	uint32_t steps_now = steps_count();
-	uint32_t steps_in_minute = steps_now - sl.bucket_step_snapshot;
+	/*
+	 * Clamped rather than subtracted blind: steps_count() is reset from
+	 * the control characteristic, and a snapshot taken before that reset
+	 * exceeds the count it is subtracted from. Unsigned, that wraps to
+	 * billions and reads as the most active minute ever recorded.
+	 */
+	uint32_t steps_in_minute = (steps_now >= sl.bucket_step_snapshot)
+				 ? (steps_now - sl.bucket_step_snapshot) : 0;
 
 	evaluate_minute(now_ms, sl.bucket_peak_dev_mg, steps_in_minute);
 
-	sl.bucket_peak_dev_mg = 0;
-	sl.bucket_step_snapshot = steps_now;
-	sl.bucket_start_ms = now_ms;
+	open_bucket(now_ms);
 }

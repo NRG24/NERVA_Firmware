@@ -22,10 +22,26 @@ void steps_init(void);
 
 /*
  * Feed one accelerometer magnitude sample (milli-g, as returned by
- * imu_magnitude_mg()). now_ms should be k_uptime_get(); the detector uses
- * it for the refractory period and cadence, not a fixed sample rate, so it
- * tolerates being called at whatever cadence the caller happens to poll
- * the IMU.
+ * imu_magnitude_mg()). now_ms should be k_uptime_get(): the refractory
+ * period and cadence are measured in real time rather than in samples, so
+ * the caller's polling rate may vary.
+ *
+ * THE RATE STILL HAS TO BE FAST ENOUGH. Walking is 1.5-2.5 Hz and a
+ * footfall is a narrow peak, so sampling near Nyquist does not merely
+ * add noise, it loses steps outright. Simulated against a 5 min walk
+ * (90-130 spm, second harmonic and noise, magnitude swing in brackets):
+ *
+ *     sample interval   result
+ *     20-60 ms          within 1 % of the true count [>=100 mg swing]
+ *     80-100 ms         within 2 %, first misses appear [100 mg swing]
+ *     150 ms            unreliable above ~110 spm
+ *     200 ms            counts essentially nothing below a 250 mg swing
+ *
+ * So the caller must poll at 60 ms or faster while the ring is moving.
+ * main.c does that by dropping its idle poll interval to STEP_POLL_MS
+ * whenever recent motion says the wearer may be walking, and going back
+ * to the slow idle rate once they are still -- which costs nothing at
+ * night, when there are no steps to miss.
  */
 void steps_update(int32_t mg, int64_t now_ms);
 

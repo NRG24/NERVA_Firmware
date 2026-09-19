@@ -53,15 +53,20 @@ struct ring_status {
  * Activity payload: steps, calories, sleep. Everything here is derived
  * from the accelerometer only (steps.c/sleep.c/calories.c) -- see those
  * files for the "unvalidated" caveats that apply to every field.
+ *
+ * Field order puts every member on its natural alignment inside the packed
+ * struct -- u32s, then u16s, then the single u8. Packed access to a
+ * misaligned word costs a byte-wise fixup on every read and write, and
+ * there is no reason to pay it.
  */
 struct ring_activity {
 	uint32_t steps;
-	uint16_t cadence_spm;
 	uint32_t kcal_x1000;
-	uint8_t sleep_state;		/* see SLEEP_STATE_* above */
+	uint16_t cadence_spm;
 	uint16_t sleep_session_min;	/* minutes into the current session */
 	uint16_t sleep_total_min;	/* minutes asleep since boot/reset */
 	uint16_t restless_min;
+	uint8_t sleep_state;		/* see SLEEP_STATE_* above */
 } __packed;
 
 /* Callbacks the phone can trigger by writing to the control characteristic. */

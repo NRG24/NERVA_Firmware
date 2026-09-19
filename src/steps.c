@@ -39,6 +39,15 @@
 
 #define INTERVAL_HISTORY	4
 
+/*
+ * Longer than this between two samples and the filters are stale: the
+ * ring was charging (RING_CHARGING reads no IMU at all) or the part
+ * stopped answering. Ramping a 32-sample baseline EMA from a stale value
+ * towards a new orientation manufactures a slow swing that looks like
+ * motion, so re-prime instead and start clean.
+ */
+#define FEED_GAP_LIMIT_MS	2000
+
 struct step_state {
 	bool primed;
 
@@ -49,6 +58,7 @@ struct step_state {
 	int64_t win_start_ms;
 	bool above;
 
+	int64_t last_sample_ms;
 	int64_t last_step_ms;
 	uint32_t total;
 
@@ -98,12 +108,22 @@ uint16_t steps_cadence_spm(void)
 
 void steps_update(int32_t mg, int64_t now_ms)
 {
-	if (!st.primed) {
+	if (!st.primed || (now_ms - st.last_sample_ms) > FEED_GAP_LIMIT_MS) {
 		st.baseline = mg;
+		st.smooth = 0;
+		st.amplitude = 0;
+		st.win_max = 0;
+		st.win_min = 0;
 		st.win_start_ms = now_ms;
+		st.above = false;
+		st.interval_count = 0;
+		st.interval_next = 0;
+		st.last_sample_ms = now_ms;
 		st.primed = true;
 		return;
 	}
+
+	st.last_sample_ms = now_ms;
 
 	st.baseline += (mg - st.baseline) >> BASELINE_SHIFT;
 

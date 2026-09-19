@@ -311,25 +311,44 @@ about which measurement period they describe.
 | Offset | Type | Field | Notes |
 |---|---|---|---|
 | 0 | u32 | `steps` | Total since boot or the last reset (opcode `0x07`) |
-| 4 | u16 | `cadence_spm` | Current steps per minute, 0 within a few seconds of stopping |
-| 6 | u32 | `kcal_x1000` | Kilocalories x1000 since boot or the last reset |
-| 10 | u8 | `sleep_state` | 0 awake, 1 asleep |
-| 11 | u16 | `sleep_session_min` | Minutes into the current sleep session, 0 while awake |
-| 13 | u16 | `sleep_total_min` | Minutes asleep since boot or the last reset |
-| 15 | u16 | `restless_min` | Minutes of motion during the current/last session that did not end it |
+| 4 | u32 | `kcal_x1000` | Kilocalories x1000 since boot or the last reset |
+| 8 | u16 | `cadence_spm` | Current steps per minute, 0 within a few seconds of stopping |
+| 10 | u16 | `sleep_session_min` | Minutes into the current sleep session, 0 while awake |
+| 12 | u16 | `sleep_total_min` | Minutes asleep since boot or the last reset |
+| 14 | u16 | `restless_min` | Minutes of motion during the current/last session that did not end it |
+| 16 | u8 | `sleep_state` | 0 awake, 1 asleep |
 
-**None of this has been validated.** Steps come from peak-detecting the
-IMU's acceleration magnitude — the same "plausible, never checked against
-a reference" caveat that applies to heart rate in section 10 applies here,
-and more so: a finger-worn ring does not move the way a wrist or waist
-does, so even the detector's assumptions about what a footstep looks like
-are unproven on this hardware. Calories are steps run through a standard
-MET table, which only has a step count from the same unvalidated detector
-to work from, plus whatever weight the app sent (opcode `0x06`) or the
-70 kg default. Sleep is stillness-with-hysteresis, not a sleep-stage
-algorithm — it cannot tell "asleep" from "sitting motionless at a desk,"
-only "still for a while" from "not." Treat every field here as a rough,
+**None of this has been validated on hardware.** Steps come from
+peak-detecting the IMU's acceleration magnitude — the same "plausible,
+never checked against a reference" caveat that applies to heart rate in
+section 10 applies here, and more so: a finger-worn ring does not move the
+way a wrist or waist does, so even the detector's assumptions about what a
+footstep looks like are unproven on this board. Calories are steps run
+through a standard MET table, which only has a step count from the same
+unvalidated detector to work from, plus whatever weight the app sent
+(opcode `0x06`) or the 70 kg default. Treat every field here as a rough,
 uncalibrated trend line, not a number to show without a caveat.
+
+Three specific behaviours are worth designing around, because they are
+confirmed in simulation rather than hypothetical:
+
+* **A ring that is not being worn still logs sleep.** A ring on a
+  nightstand is perfectly still, and stillness is the only signal the
+  sleep tracker has. The one wear signal on this board is the PPG DC
+  level, and the power model deliberately stops opening PPG windows after
+  three minutes without motion — precisely the case that would need
+  checking. An eight-hour "session" with `restless_min == 0` and no steps
+  on either side of it is far more likely to be a bedside table than a
+  night's sleep; corroborate before showing it.
+* **Gentle motion is not counted.** The detector needs roughly a ±100 mg
+  swing in acceleration magnitude. Slow, smooth walking that never reaches
+  that — and any stepping done with the hand in a pocket or resting on a
+  pram handle — registers as nothing. Under-counting is the deliberate
+  choice here: the threshold that would catch those also counts typing and
+  gesturing as walking.
+* **A charging gap ends a sleep session.** The ring reads no
+  accelerometer at all while charging, so sessions do not span a charge,
+  and `sleep_total_min` keeps whatever was credited before it.
 
 There is also no RTC on this board (see README), so `sleep_session_min`
 and `sleep_total_min` are durations, not clock times. If you want to show
