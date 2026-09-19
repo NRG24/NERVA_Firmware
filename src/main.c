@@ -26,10 +26,13 @@
  */
 
 #include "ble.h"
+#include "calories.h"
 #include "hr.h"
 #include "imu.h"
 #include "maxm86161.h"
 #include "selftest.h"
+#include "sleep.h"
+#include "steps.h"
 #include "wdt.h"
 
 #include <zephyr/device.h>
@@ -260,11 +263,26 @@ static void cb_stream_ppg(bool on)
 	}
 }
 
+static void cb_set_weight(uint16_t weight_kg_x10)
+{
+	calories_set_weight(weight_kg_x10);
+}
+
+static void cb_reset_activity(void)
+{
+	steps_reset();
+	sleep_reset();
+	calories_reset();
+	LOG_INF("activity counters reset (app request)");
+}
+
 static const struct ble_control_cbs control_cbs = {
 	.stream_ppg = cb_stream_ppg,
 	.stream_imu = NULL,
 	.measure_now = cb_measure_now,
 	.set_duty = cb_set_duty,
+	.set_weight = cb_set_weight,
+	.reset_activity = cb_reset_activity,
 };
 
 /* --- status ------------------------------------------------------------ */
@@ -293,6 +311,33 @@ static void publish_status(void)
 	}
 
 	ble_publish_status(&s);
+}
+
+static void publish_activity(void)
+{
+	struct ring_activity a = {
+		.steps = steps_count(),
+		.cadence_spm = steps_cadence_spm(),
+		.kcal_x1000 = calories_total_x1000(),
+		.sleep_state = sleep_is_asleep() ? SLEEP_STATE_ASLEEP
+						 : SLEEP_STATE_AWAKE,
+		.sleep_session_min = sleep_session_minutes(),
+		.sleep_total_min = sleep_total_minutes(),
+		.restless_min = sleep_restless_minutes(),
+	};
+
+	ble_publish_activity(&a);
+}
+
+/* Every call site that used to publish_status() alone now also publishes
+ * activity, so the two characteristics never drift out of sync on the app
+ * side -- a status update with stale steps/sleep data would be confusing
+ * in exactly the way the health flags in publish_status() are not.
+ */
+static void publish_all(void)
+{
+	publish_status();
+	publish_activity();
 }
 
 static void report(uint32_t raw)
@@ -335,7 +380,7 @@ static void report(uint32_t raw)
 					? "finger on, acquiring" : "no finger");
 		}
 
-		publish_status();
+		publish_all();
 		win_count = 0;
 	}
 }
@@ -492,6 +537,7 @@ int main(void)
 	int64_t next_window = 0;
 	int64_t next_slow = 0;
 	int64_t next_imu_retry = 0;
+	int64_t next_activity_min = 0;
 	int64_t window_started = 0;
 	int64_t last_motion = 0;
 	bool waiting_for_finger = false;
@@ -634,6 +680,10 @@ int main(void)
 		subsystem_flags |= RING_FLAG_IMU_OK;
 	}
 
+	steps_init();
+	sleep_init();
+	calories_init();
+
 	/* Nothing to measure yet: shut the optics down and wait for motion. */
 	ppg_off();
 
@@ -694,6 +744,12 @@ int main(void)
 		 *   measuring       : ~0.5 s failed FIFO read
 		 *                     + ~0.5 s ppg_off() on the 5th failure,
 		 *                       doubled under BENCH (led_solid too) = 1.5 s
+		 *   measuring, pedometer feed: the imu_magnitude_mg() call added
+		 *                     for steps/sleep tracking is skipped by the
+		 *                     `break` on the 5th-failure path above, so
+		 *                     it never stacks with ppg_off() in the same
+		 *                     pass. On its own: ~0.5 s FIFO + ~0.5 s this
+		 *                     read = 1.0 s, under the 1.5 s figure above.
 		 *   idle, IMU retry : ~1.5 s imu_init() (fed straight after)
 		 *
 		 * ~4.5 s against the 10 s budget. Both ppg_off() and imu_init()
@@ -752,7 +808,7 @@ int main(void)
 							 PMIC_POLL_MS) / 1000U);
 						state = RING_IDLE;
 						next_window = now;
-						publish_status();
+						publish_all();
 					}
 				}
 			} else {
@@ -785,14 +841,14 @@ int main(void)
 								 BENCH_LED_PA);
 #endif
 					state = RING_CHARGING;
-					publish_status();
+					publish_all();
 				} else if (!charging &&
 					   state == RING_CHARGING) {
 					LOG_INF("state -> %s",
 						state_name[RING_IDLE]);
 					state = RING_IDLE;
 					next_window = now;
-					publish_status();
+					publish_all();
 				}
 			}
 		}
@@ -804,10 +860,25 @@ int main(void)
 		if (now >= next_slow && state != RING_CHARGING) {
 			slow_sense();
 			next_slow = now + SLOW_SENSE_MS;
-			publish_status();
+			publish_all();
 
 			/* Battery reads plus the 800 ms GSR settle. */
 			ring_wdt_feed();
+		}
+
+		/*
+		 * --- calories, once a minute ---
+		 *
+		 * steps_update()/sleep_feed() run inline wherever the IMU is
+		 * already being read (below); calories only needs the cadence
+		 * that leaves behind, and a per-minute MET lookup is all the
+		 * precision the formula in calories.c has to offer, so there is
+		 * no reason to recompute it on every pass. No I2C traffic here,
+		 * so no watchdog feed is needed beside it.
+		 */
+		if (now >= next_activity_min) {
+			calories_update_minute(steps_cadence_spm());
+			next_activity_min = now + 60000;
 		}
 
 		/*
@@ -932,6 +1003,15 @@ int main(void)
 				last_motion = now;
 			}
 
+			/* Feed the pedometer and sleep tracker off the same
+			 * magnitude read used for the motion timeout above --
+			 * no extra I2C traffic for either.
+			 */
+			if (mg >= 0) {
+				steps_update(mg, now);
+				sleep_feed(mg, now);
+			}
+
 			if (ble_imu_streaming()) {
 				struct imu_accel a;
 
@@ -957,7 +1037,7 @@ int main(void)
 					waiting_for_finger = !forced;
 					LOG_INF("state -> %s%s", state_name[state],
 						forced ? " (app requested)" : "");
-					publish_status();
+					publish_all();
 				} else {
 					next_window = now + measure_period_ms;
 				}
@@ -998,7 +1078,7 @@ int main(void)
 					subsystem_flags &= ~RING_FLAG_PPG_OK;
 					state = RING_IDLE;
 					next_window = now + measure_period_ms;
-					publish_status();
+					publish_all();
 					break;
 				}
 			}
@@ -1008,6 +1088,24 @@ int main(void)
 
 				if (imu_read_accel(&a) == 0) {
 					ble_publish_imu(a.x, a.y, a.z);
+				}
+			}
+
+			/*
+			 * Keep the pedometer and sleep tracker fed during a
+			 * measurement window too, not just while idle -- a
+			 * window covers up to 15 s in every 60, and skipping
+			 * it would silently undercount steps taken while
+			 * worn and moving. Gated on imu_ready so a part
+			 * already known dead is not charged a full I2C
+			 * timeout here as well as in RING_IDLE.
+			 */
+			if (imu_ready) {
+				int act_mg = imu_magnitude_mg();
+
+				if (act_mg >= 0) {
+					steps_update(act_mg, now);
+					sleep_feed(act_mg, now);
 				}
 			}
 
@@ -1032,7 +1130,7 @@ int main(void)
 				next_window = now + measure_period_ms;
 				LOG_INF("state -> %s%s", state_name[state],
 					give_up ? " (no finger)" : "");
-				publish_status();
+				publish_all();
 			} else {
 				k_msleep(POLL_INTERVAL_MS);
 			}

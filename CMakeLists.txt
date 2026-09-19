@@ -11,4 +11,7 @@ target_sources(app PRIVATE
 	src/ble.c
 	src/imu.c
 	src/wdt.c
+	src/steps.c
+	src/sleep.c
+	src/calories.c
 )

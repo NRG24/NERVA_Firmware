@@ -23,6 +23,7 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
  *   ppg          f0a10002-...   notify
  *   imu          f0a10003-...   notify
  *   control      f0a10004-...   write
+ *   activity     f0a10005-...   read / notify
  */
 #define RING_UUID_BASE(x)	BT_UUID_128_ENCODE(0xf0a10000 | (x), 0x1e5c, \
 						   0x4a2b, 0x8d3f, \
@@ -38,11 +39,14 @@ static const struct bt_uuid_128 uuid_imu =
 	BT_UUID_INIT_128(RING_UUID_BASE(3));
 static const struct bt_uuid_128 uuid_control =
 	BT_UUID_INIT_128(RING_UUID_BASE(4));
+static const struct bt_uuid_128 uuid_activity =
+	BT_UUID_INIT_128(RING_UUID_BASE(5));
 
 static atomic_t connected_count;
 static atomic_t status_subscribed;
 static atomic_t ppg_subscribed;
 static atomic_t imu_subscribed;
+static atomic_t activity_subscribed;
 static atomic_t ppg_stream_on;
 static atomic_t imu_stream_on;
 
@@ -69,6 +73,14 @@ static struct bt_conn *active_conn;
  */
 static struct k_spinlock status_lock;
 static struct ring_status latest_status;
+
+/* Same tear-safety reasoning as latest_status, own lock for the same
+ * reason: status and activity are unrelated and sharing one lock would
+ * only widen both.
+ */
+static struct k_spinlock activity_lock;
+static struct ring_activity latest_activity;
+
 static const struct ble_control_cbs *control_cbs;
 static uint32_t ppg_seq;
 
@@ -134,6 +146,27 @@ static void imu_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	atomic_set(&imu_subscribed, value == BT_GATT_CCC_NOTIFY);
 }
 
+static ssize_t read_activity(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr, void *buf,
+			     uint16_t len, uint16_t offset)
+{
+	struct ring_activity snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&activity_lock);
+	snapshot = latest_activity;
+	k_spin_unlock(&activity_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
+}
+
+static void activity_ccc_changed(const struct bt_gatt_attr *attr,
+				 uint16_t value)
+{
+	atomic_set(&activity_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
 /*
  * Control opcodes, see APP_INTEGRATION.md:
  *   0x01 <u8 on>                     raw PPG streaming
@@ -141,6 +174,8 @@ static void imu_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
  *   0x03                             start a measurement window now
  *   0x04 <u16 window_s> <u16 period_s>  set duty cycle
  *   0x05                             clear every bond
+ *   0x06 <u16 weight_kg_x10>         set body weight for calorie estimate
+ *   0x07                             reset steps/sleep/calories counters
  */
 static ssize_t write_control(struct bt_conn *conn,
 			     const struct bt_gatt_attr *attr, const void *buf,
@@ -229,6 +264,28 @@ static ssize_t write_control(struct bt_conn *conn,
 		break;
 	}
 
+	case 0x06: {
+		if (len < 3) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+
+		uint16_t weight_kg_x10 = p[1] | (p[2] << 8);
+
+		if (control_cbs && control_cbs->set_weight) {
+			control_cbs->set_weight(weight_kg_x10);
+		}
+		LOG_INF("control: body weight %u.%u kg", weight_kg_x10 / 10U,
+			weight_kg_x10 % 10U);
+		break;
+	}
+
+	case 0x07:
+		if (control_cbs && control_cbs->reset_activity) {
+			control_cbs->reset_activity();
+		}
+		LOG_INF("control: activity counters reset");
+		break;
+
 	default:
 		LOG_WRN("control: unknown opcode 0x%02x", p[0]);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
@@ -269,12 +326,24 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
 			       BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_control,
 			       NULL),
+
+	BT_GATT_CHARACTERISTIC(&uuid_activity.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ_ENCRYPT, read_activity, NULL,
+			       NULL),
+	BT_GATT_CCC(activity_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 );
 
-/* Attribute indices: 1 = status value, 4 = ppg value, 7 = imu value. */
+/*
+ * Attribute indices: 1 = status value, 4 = ppg value, 7 = imu value,
+ * 12 = activity value. Control (10-11) has no CCC and nothing else in this
+ * file indexes it directly, so it is not named here.
+ */
 #define ATTR_STATUS	(&ring_svc.attrs[1])
 #define ATTR_PPG	(&ring_svc.attrs[4])
 #define ATTR_IMU	(&ring_svc.attrs[7])
+#define ATTR_ACTIVITY	(&ring_svc.attrs[12])
 
 /* --- connection tracking ----------------------------------------------- */
 
@@ -635,6 +704,23 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 	}
 
 	(void)bt_gatt_notify(NULL, ATTR_PPG, buf, 5 + n * sizeof(uint32_t));
+}
+
+void ble_publish_activity(const struct ring_activity *activity)
+{
+	struct ring_activity snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&activity_lock);
+	latest_activity = *activity;
+	snapshot = latest_activity;
+	k_spin_unlock(&activity_lock, key);
+
+	if (!ble_is_connected() || !atomic_get(&activity_subscribed)) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, ATTR_ACTIVITY, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_imu(int16_t x, int16_t y, int16_t z)

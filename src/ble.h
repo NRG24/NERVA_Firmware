@@ -45,12 +45,33 @@ struct ring_status {
 	uint32_t uptime_s;
 } __packed;
 
+/* Values for ring_activity.sleep_state */
+#define SLEEP_STATE_AWAKE	0
+#define SLEEP_STATE_ASLEEP	1
+
+/*
+ * Activity payload: steps, calories, sleep. Everything here is derived
+ * from the accelerometer only (steps.c/sleep.c/calories.c) -- see those
+ * files for the "unvalidated" caveats that apply to every field.
+ */
+struct ring_activity {
+	uint32_t steps;
+	uint16_t cadence_spm;
+	uint32_t kcal_x1000;
+	uint8_t sleep_state;		/* see SLEEP_STATE_* above */
+	uint16_t sleep_session_min;	/* minutes into the current session */
+	uint16_t sleep_total_min;	/* minutes asleep since boot/reset */
+	uint16_t restless_min;
+} __packed;
+
 /* Callbacks the phone can trigger by writing to the control characteristic. */
 struct ble_control_cbs {
 	void (*stream_ppg)(bool on);
 	void (*stream_imu)(bool on);
 	void (*measure_now)(void);
 	void (*set_duty)(uint16_t window_s, uint16_t period_s);
+	void (*set_weight)(uint16_t weight_kg_x10);
+	void (*reset_activity)(void);
 };
 
 int ble_start(void);
@@ -66,6 +87,7 @@ void ble_notify_battery(uint8_t percent);
 void ble_publish_status(const struct ring_status *status);
 void ble_publish_ppg(const uint32_t *samples, uint8_t count);
 void ble_publish_imu(int16_t x, int16_t y, int16_t z);
+void ble_publish_activity(const struct ring_activity *activity);
 
 bool ble_ppg_streaming(void);
 bool ble_imu_streaming(void);

@@ -56,7 +56,7 @@ which firmware you are talking to before you decide what to trust.
 
 | Characteristic | UUID | Value |
 |---|---|---|
-| Firmware Revision | `0x2A26` | `0.4.0` |
+| Firmware Revision | `0x2A26` | `0.5.0` |
 | Manufacturer Name | `0x2A29` | `Ring project` |
 | Model Number | `0x2A24` | `Ring ANNA-B402` |
 
@@ -74,6 +74,7 @@ this service now requires an encrypted link** — see Pairing, below.
 | PPG stream | `f0a10002-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
 | IMU stream | `f0a10003-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
 | Control | `f0a10004-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Write, Write w/o response | Encrypted write |
+| Activity | `f0a10005-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 
 ### Pairing
 
@@ -242,9 +243,17 @@ Write (with or without response). First byte is the opcode.
 | `0x03` | none | Start a measurement window immediately, skipping the duty cycle |
 | `0x04` | `u16 window_s`, `u16 period_s` | Set duty cycle, little-endian |
 | `0x05` | none | Clear every bond, then disconnect |
+| `0x06` | `u16 weight_kg_x10` | Set body weight for the calorie estimate, little-endian, kilograms x10 (e.g. `700` = 70.0 kg) |
+| `0x07` | none | Reset steps, sleep and calorie counters to zero |
 
 Duty cycle values are clamped in firmware: window 5-300 s, period
 window-3600 s. Defaults are a **15 s window every 60 s**, i.e. 25% duty.
+
+Weight is clamped to 20.0-250.0 kg and defaults to 70.0 kg until set —
+without it the calorie estimate in the Activity characteristic (section 7)
+is only right for someone who happens to weigh 70 kg. It is not persisted
+across a reboot; send it again after every reconnect if you want it to
+stick, the same way you would re-apply a duty cycle.
 
 `0x05` is the unpair path. `CONFIG_BT_MAX_PAIRED` is 1 and
 `CONFIG_BT_KEYS_OVERWRITE_OLDEST` is deliberately off, so without it the
@@ -277,9 +286,60 @@ Example — hand the ring to somebody else:
 write [0x05]        then expect a disconnect
 ```
 
+Example — set body weight to 68.5 kg:
+
+```
+write [0x06, 0xAB, 0x02]
+              weight_kg_x10=685 (68.5 kg)
+```
+
+Example — start a new day (zero steps/sleep/calories):
+
+```
+write [0x07]
+```
+
 ---
 
-## 7. Behaviour your app has to expect
+## 7. Activity characteristic
+
+17 bytes, little-endian. Steps, sleep and calories, all derived from the
+accelerometer only — there is no independent sensor for any of these.
+Readable at any time; notified alongside Status, so the two never disagree
+about which measurement period they describe.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u32 | `steps` | Total since boot or the last reset (opcode `0x07`) |
+| 4 | u16 | `cadence_spm` | Current steps per minute, 0 within a few seconds of stopping |
+| 6 | u32 | `kcal_x1000` | Kilocalories x1000 since boot or the last reset |
+| 10 | u8 | `sleep_state` | 0 awake, 1 asleep |
+| 11 | u16 | `sleep_session_min` | Minutes into the current sleep session, 0 while awake |
+| 13 | u16 | `sleep_total_min` | Minutes asleep since boot or the last reset |
+| 15 | u16 | `restless_min` | Minutes of motion during the current/last session that did not end it |
+
+**None of this has been validated.** Steps come from peak-detecting the
+IMU's acceleration magnitude — the same "plausible, never checked against
+a reference" caveat that applies to heart rate in section 10 applies here,
+and more so: a finger-worn ring does not move the way a wrist or waist
+does, so even the detector's assumptions about what a footstep looks like
+are unproven on this hardware. Calories are steps run through a standard
+MET table, which only has a step count from the same unvalidated detector
+to work from, plus whatever weight the app sent (opcode `0x06`) or the
+70 kg default. Sleep is stillness-with-hysteresis, not a sleep-stage
+algorithm — it cannot tell "asleep" from "sitting motionless at a desk,"
+only "still for a while" from "not." Treat every field here as a rough,
+uncalibrated trend line, not a number to show without a caveat.
+
+There is also no RTC on this board (see README), so `sleep_session_min`
+and `sleep_total_min` are durations, not clock times. If you want to show
+"fell asleep at 11:42 PM," subtract `sleep_session_min` minutes from the
+phone's own clock at the moment you read the characteristic — the ring has
+no notion of wall-clock time to hand you instead.
+
+---
+
+## 8. Behaviour your app has to expect
 
 **The ring is not always measuring.** By default the optical front end is
 off for 45 seconds out of every 60, and completely off when the ring has
@@ -308,7 +368,7 @@ first detected, so the user gets confirmation without opening the app.
 
 ---
 
-## 8. Connection parameters
+## 9. Connection parameters
 
 The firmware does not request specific connection parameters, so you get
 whatever the phone proposes. Recommendations:
@@ -323,7 +383,7 @@ length extension if your stack exposes it.
 
 ---
 
-## 9. Caveats worth knowing
+## 10. Caveats worth knowing
 
 These are real limitations of the current hardware and firmware, not
 things to paper over in the UI.
@@ -385,7 +445,7 @@ and no bond has ever been cleared.
 
 ---
 
-## 10. Quick start
+## 11. Quick start
 
 1. Scan for service `0x180D`, connect
 2. Request MTU 247

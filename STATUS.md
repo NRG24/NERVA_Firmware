@@ -42,6 +42,8 @@ anything newer as a bring-up, not an update.
 | Advertising restart after disconnect | **Compile only** | `recycled()` traced in Zephyr source |
 | GSR reading | **Unknown** | see §5 |
 | Heart-rate accuracy | **Unvalidated** | never against a reference monitor |
+| Step count, sleep sessions, calorie estimate | **Compile only, unvalidated** | new this revision; no board, no reference pedometer or sleep log to compare against |
+| Activity characteristic (steps/sleep/calories over BLE) | **Never exercised by any phone** | same as the rest of the Ring Service, see row above |
 
 ---
 
@@ -58,12 +60,23 @@ Integer-only HR: DC tracker → 4 Hz low-pass → adaptive threshold → median 
 8 intervals with a 60 %-of-median refractory. Battery in millivolts from the
 PMIC monitor. GSR through a transimpedance stage into the SAADC.
 
+**Activity.** Steps, sleep and calories, all derived from the IMU's
+accelerometer magnitude and none of them from any new sensor. Steps:
+peak-detection pedometer (`steps.c`), same technique as the HR detector
+applied to motion. Sleep (`sleep.c`): one-minute stillness buckets, 10
+consecutive still minutes to start a session, 3 consecutive active minutes
+to end one. Calories (`calories.c`): a standard MET table keyed on step
+cadence, times body weight (default 70 kg, settable over BLE). **All three
+are new and, like heart rate, unvalidated** — see §2 and §5.
+
 **BLE.** Standard HRS (0x180D) and BAS (0x180F), open by default so generic
-apps work. Custom Ring Service (`f0a1…`) with a 20-byte status packet, raw
-PPG and IMU streams, and a control characteristic — all requiring an
-encrypted link. Just Works pairing, one bond, persisted. Device Information
-Service reports firmware `0.4.0`. Control opcode `0x05` clears bonds.
-Full wire contract: [APP_INTEGRATION.md](APP_INTEGRATION.md).
+apps work. Custom Ring Service (`f0a1…`) with a 20-byte status packet, a
+17-byte activity packet, raw PPG and IMU streams, and a control
+characteristic — all requiring an encrypted link. Just Works pairing, one
+bond, persisted. Device Information Service reports firmware `0.5.0`.
+Control opcode `0x05` clears bonds; `0x06`/`0x07` set body weight and reset
+the activity counters. Full wire contract:
+[APP_INTEGRATION.md](APP_INTEGRATION.md).
 
 **Survivability.** 10 s hardware watchdog fed only from the main loop;
 fatal errors reboot; reset cause logged at boot. Health flags reflect
@@ -89,6 +102,7 @@ Ordered by how much it would hurt, not how likely it is.
 | R3 | **NVS partition at 0x7c000 has never been written.** A used board has stale bytes there. | Medium on a reused board | `settings_load failed`, no advertising | `pyocd erase --chip` before the first v0.4 flash. `CONFIG_NVS_INIT_BAD_MEMORY_REGION=y` is the safety net, untested. |
 | R4 | **The first phone to pair owns the ring** until opcode `0x05` is sent over the bonded link. | Certain (by design) | owner's phone gets pairing failure | owner sends `0x05`; otherwise SWD erase |
 | R5 | **Heart rate is unvalidated.** Numbers are plausible, not correct. | Certain | none — it looks fine | validate against a chest strap before any clinical or health claim |
+| R5a | **Steps, sleep and calories are unvalidated,** and doubly so for a finger-worn ring, which does not move the way a wrist or waist does. | Certain | none — the numbers look plausible | compare against a reference pedometer/sleep log once hardware exists before showing these without a caveat |
 | R6 | **Resting heart rate leaks over open HRS** to anyone in range. | Certain (chosen) | none | `-DCONFIG_RING_HRS_OPEN=n` — costs generic-app compatibility |
 | R7 | **No MITM protection.** Just Works is encrypted but unauthenticated. | Certain | none | needs a display/keypad or OOB; not fixable in firmware alone |
 | R8 | **No OTA.** Field units can only be updated over SWD, which on this board needs series resistors and a fresh APPROTECT unlock. | Certain | — | MCUboot + DFU is the next big item |
@@ -127,6 +141,21 @@ Ordered by how much it would hurt, not how likely it is.
   bring-up, wasteful for a shipped image.
 * **No unit tests, no CI.** Verification is the five-configuration build
   sweep run by hand on one Windows machine with NCS installed at `C:\ncs`.
+* **Step/sleep sampling rate is whatever the main loop happens to be
+  polling the IMU at** — 5 Hz while idle and unworn, up to 50 Hz during a
+  measurement window or while IMU streaming is on. A pedometer built for a
+  fixed sample rate would reject this; this one uses timestamps rather
+  than sample counts specifically so it tolerates the variation (see
+  `steps.c`), but 5 Hz is a thin margin above the ~2 Hz cadence of a fast
+  walk and has not been checked against a real gait.
+* **Body weight for the calorie estimate is not persisted.** It lives in
+  RAM only (`calories.c`), defaults to 70 kg, and resets to that default on
+  every reboot. The app has to resend control opcode `0x06` after every
+  power cycle if the wearer is not 70 kg.
+* **No RTC**, so sleep sessions are durations from `k_uptime_get()`, not
+  clock times — see `APP_INTEGRATION.md` §7. A session spanning a reboot
+  (watchdog reset, battery pull) is lost: `sleep.c` has no persistence and
+  starts back in the awake state.
 
 ---
 
