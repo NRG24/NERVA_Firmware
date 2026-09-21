@@ -172,6 +172,15 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 /* Loop cadence needed to hit that interval, whatever state the ring is in. */
 #define GSR_STREAM_POLL_MS	20
 
+/*
+ * How long to wait before trying again after a failed start. The likely
+ * causes are permanent -- an ADC that is not ready, a channel that will not
+ * configure -- but each attempt costs an 800 ms settle, so retrying slowly
+ * is the difference between recovering from something transient and
+ * spending a third of the time asleep in a settle that never works.
+ */
+#define GSR_START_RETRY_MS	30000
+
 enum ring_state {
 	RING_IDLE,
 	RING_MEASURING,
@@ -475,7 +484,26 @@ static void service_gsr_stream(int64_t now, int64_t *next_sample)
 			batch_n = 0;
 			*next_sample = now;
 		} else {
-			LOG_ERR("GSR stream could not start");
+			/*
+			 * Retry rather than going silently dead. Without this
+			 * the request has already been consumed and
+			 * gsr_stream_active is still false, so neither branch
+			 * can fire again while the app still believes the
+			 * stream is on -- it would stay dead until the user
+			 * toggled it off and back on.
+			 */
+			LOG_ERR("GSR stream could not start, retrying in %u s",
+				GSR_START_RETRY_MS / 1000U);
+			*next_sample = now + GSR_START_RETRY_MS;
+		}
+	} else if (request == -1 && !gsr_stream_active &&
+		   ble_gsr_stream_requested() && now >= *next_sample) {
+		/* The retry itself. */
+		if (gsr_stream_start() == 0) {
+			gsr_stream_active = true;
+			*next_sample = now;
+		} else {
+			*next_sample = now + GSR_START_RETRY_MS;
 		}
 	} else if (request == 0 && gsr_stream_active) {
 		gsr_stream_stop();
@@ -628,13 +656,30 @@ static void publish_all(void)
  * was lost to a FIFO overflow -- pairing red against a stale IR from an
  * earlier frame would bias the ratio rather than merely add noise.
  */
+/* Consecutive IR samples with no red before the red channel is declared dead. */
+#define LONELY_IR_LIMIT		50
+
 static void report_spo2(uint8_t tag, uint32_t value)
 {
 	static uint32_t pending_ir;
 	static bool have_ir;
 	static uint32_t frames;
+	static uint16_t lonely_ir;
 
 	if (tag == TAG_PPG1_LEDC1) {
+		/*
+		 * Two IR samples in a row means slot 2 produced nothing. The
+		 * most likely cause is a sample-rate code that does not match
+		 * the number of populated slots, which the part accepts
+		 * without complaint -- so say so rather than sit here pairing
+		 * nothing for the whole window.
+		 */
+		if (have_ir && ++lonely_ir == LONELY_IR_LIMIT) {
+			LOG_ERR("SpO2: %d IR samples with no red -- slot 2 is "
+				"not firing, check PPG_CONFIG_2 against the "
+				"slot count", LONELY_IR_LIMIT);
+		}
+
 		pending_ir = value;
 		have_ir = true;
 		return;
@@ -651,6 +696,7 @@ static void report_spo2(uint8_t tag, uint32_t value)
 	}
 
 	have_ir = false;
+	lonely_ir = 0;
 	spo2_feed(value, pending_ir);
 
 	if (++frames < SAMPLE_RATE_HZ) {

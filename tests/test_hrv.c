@@ -364,6 +364,90 @@ static void test_outlier_interval_is_not_trusted(void)
 	      "so the agreement gate is not gating anything");
 }
 
+
+/*
+ * BUG: the HRV trust gate reused the heart rate's 40 % median-agreement
+ * band, which is far too loose when the error is going to be squared.
+ *
+ * A metronome pulse train with a motion artifact partway through each beat
+ * gets the artifact ACCEPTED as a real beat -- it falls outside the
+ * refractory window and inside the plausible bpm range -- producing an
+ * alternating 600/400 ms pattern. At 40 % that sails through and invents
+ * 200 ms of RMSSD from a rhythm with none. At the conventional 20 % it is
+ * rejected.
+ *
+ * Note what this does NOT cover: the separate fix that clears
+ * prev_ibi_trusted when a crossing is rejected rather than accepted.
+ * Reverting that alone does not make this fail, because the tightened
+ * gate catches the same intervals first. It is kept as defence in depth,
+ * and this comment exists so nobody mistakes it for something the suite
+ * is pinning.
+ */
+static void test_artifact_does_not_invent_hrv(void)
+{
+	struct hr h;
+	int period = 100;		/* 60 bpm at 100 sps */
+	/*
+	 * 60 samples in: late enough that the detector has dropped below
+	 * its re-arm threshold so the artifact DOES produce a crossing,
+	 * early enough to be inside the refractory window so that crossing
+	 * is rejected. Found by scanning positions against the unfixed
+	 * code -- 20-50 and 70+ produce no crossing at all and prove
+	 * nothing.
+	 */
+	int spike_at = 60;
+	int bad_successive = 0;
+	int beats = 0;
+
+	sim_section("a motion artifact does not invent HRV from a metronome");
+
+	hr_init(&h, PPG_RATE_HZ);
+	hrv_init();
+
+	for (int i = 0; i < 30 * period; i++) {
+		uint32_t raw = ppg_sample(i, period);
+		uint16_t bpm = 0;
+
+		/* A sharp artifact partway into each beat. */
+		if ((i % period) == spike_at) {
+			raw += PPG_AC * 3;
+		}
+
+		if (hr_update(&h, raw, &bpm)) {
+			beats++;
+			if (hr_last_ibi_trusted(&h)) {
+				uint16_t ms = hr_last_ibi_ms(&h);
+
+				/*
+				 * The real rhythm is 1000 ms. Anything far off
+				 * that which still claims to be successive is
+				 * the bug: it was measured from the artifact.
+				 */
+				if (hr_last_ibi_successive(&h) &&
+				    (ms < 800 || ms > 1200)) {
+					bad_successive++;
+				}
+				hrv_add_interval(ms,
+						 hr_last_ibi_successive(&h));
+			}
+		}
+	}
+
+	CHECK(beats > 10, "detector found only %d beats in 30 s", beats);
+	CHECK(bad_successive == 0,
+	      "%d intervals distorted by the artifact were still handed to "
+	      "RMSSD as trusted and successive", bad_successive);
+
+	/*
+	 * And the end-to-end consequence: the underlying rhythm is a
+	 * metronome, so whatever RMSSD survives must stay near the
+	 * quantisation floor rather than picking up the artifact.
+	 */
+	CHECK(hrv_rmssd_x10() < 400,
+	      "a metronome rhythm with artifacts gave RMSSD %u.%u ms",
+	      hrv_rmssd_x10() / 10, hrv_rmssd_x10() % 10);
+}
+
 int main(void)
 {
 	printf("HRV / RMSSD tests\n");
@@ -375,6 +459,7 @@ int main(void)
 	test_quantisation_noise_floor();
 	test_detector_feeds_hrv();
 	test_outlier_interval_is_not_trusted();
+	test_artifact_does_not_invent_hrv();
 
 	return sim_report("test_hrv");
 }

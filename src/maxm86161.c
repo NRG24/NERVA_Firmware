@@ -221,8 +221,19 @@ static int start_ppg_slots(struct maxm86161 *dev, const struct ppg_slot *slots,
 		/* ALC on, 16 uA full scale, 117.3 us integration time. */
 		{ REG_PPG_CONFIG_1, (PPG_ADC_RGE_16uA << 2) | PPG_TINT_117US },
 
-		/* ~100 sps, no on-chip averaging. */
-		{ REG_PPG_CONFIG_2, (PPG_SR_100HZ << 3) | PPG_SMP_AVE_1 },
+		/*
+		 * ~100 sps, no on-chip averaging.
+		 *
+		 * The sample-rate code carries the pulses-per-sample count as
+		 * well as the rate, so a two-slot sequence needs the P2 code.
+		 * Writing the one-pulse code with two slots populated does not
+		 * fail -- the part simply never runs the second slot, so the
+		 * red channel produces no samples at all and every downstream
+		 * consumer waits forever for data that is not coming.
+		 */
+		{ REG_PPG_CONFIG_2, (uint8_t)(((n_slots >= 2) ? PPG_SR_P2_100HZ
+							      : PPG_SR_100HZ) << 3) |
+				    PPG_SMP_AVE_1 },
 
 		/* 6 us LED settling, burst mode off. */
 		{ REG_PPG_CONFIG_3, (LED_SETLNG_6US << 6) },

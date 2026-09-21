@@ -199,10 +199,21 @@ opcode `0x01`.
 ```
 offset 0   u32  seq          increments per notification, gaps = dropped packets
 offset 4   u8   count        number of samples that follow
-offset 5   u32[count]        19-bit ADC values, zero-extended
+offset 5   u32[count]        raw FIFO words: tag in bits 23:19, ADC value in bits 18:0
 ```
 
-Sample rate is **100 Hz**. Packet size adapts to the negotiated MTU:
+Each word is the **raw FIFO entry**, not a bare ADC value: mask with
+`0x7FFFF` for the reading and shift right by 19 for the 5-bit tag that says
+which measurement slot produced it. In the normal single-LED mode every
+word carries tag `0x01` (green).
+
+**In SpO2 mode this stream changes shape.** Two LEDs means two slots, so
+words arrive interleaved at 200 a second — tag `0x01` for IR and tag `0x02`
+for red — rather than 100 single-channel samples. Demultiplex on the tag
+rather than assuming alternation, and do not feed the mixed stream into a
+heart-rate algorithm expecting one channel.
+
+Sample rate is **100 Hz** per channel. Packet size adapts to the negotiated MTU:
 
 | MTU | Samples per notification |
 |---|---|
@@ -436,7 +447,17 @@ Only intervals that passed both of the beat detector's gates:
 
 * the 30-220 bpm plausibility range, which every interval must pass to
   reach the heart-rate estimate at all, and
-* agreement with the median of the recent intervals.
+* agreement with the median of the recent intervals to within **20 %**.
+
+That second bar is deliberately far tighter than the 40 % the heart rate
+itself uses. A heart rate takes a median and shrugs off one odd interval;
+RMSSD squares the error and lands it in two successive differences.
+Measured: a metronome pulse train with a motion artifact partway through
+each beat gets the artifact accepted as a real beat, and at 40 % the
+resulting 600/400 ms alternation invents 200 ms of HRV from a rhythm that
+has none. 20 % is the conventional artifact-rejection bound in the HRV
+literature, and ordinary beat-to-beat variation sits far inside it — an
+RMSSD of 40 ms on 1000 ms intervals is a 4 % swing.
 
 A difference is only formed between two intervals that were genuinely
 adjacent. A beat that was detected and then rejected still moves the beat

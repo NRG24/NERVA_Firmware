@@ -63,6 +63,25 @@
  */
 #define SPREAD_MAX_PCT	40
 
+/*
+ * The same question asked far more strictly, for HRV only.
+ *
+ * 40 % is the right bar for a heart rate, which takes a median and shrugs
+ * off one odd interval. It is much too loose for RMSSD, where the error is
+ * squared and lands in two successive differences. Measured: a metronome
+ * pulse train with a motion artifact partway through each beat gets the
+ * artifact accepted as a real beat, producing an alternating 600/400 ms
+ * pattern that sails through a 40 % band and invents 200 ms of HRV out of
+ * a rhythm that has none.
+ *
+ * 20 % is the conventional artifact-rejection bound in the HRV literature
+ * (Malik's rule and its descendants), not a number invented here. Ordinary
+ * beat-to-beat variation sits far inside it -- an RMSSD of 40 ms on
+ * 1000 ms intervals is a 4 % swing -- so this rejects artifacts without
+ * touching physiology.
+ */
+#define HRV_SPREAD_MAX_PCT	20
+
 void hr_init(struct hr *hr, uint32_t sample_rate_hz)
 {
 	*hr = (struct hr){ .sample_rate_hz = sample_rate_hz };
@@ -255,6 +274,14 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 
 		uint32_t since = hr->ticks - hr->last_beat_tick;
 
+		/*
+		 * Every path below advances last_beat_tick, so a crossing that
+		 * does NOT yield a usable interval still moves the beat clock
+		 * and contaminates the next one. Assume that until proven
+		 * otherwise: `accepted` is what clears it.
+		 */
+		bool accepted = false;
+
 		if (hr->last_beat_tick != 0 && since >= refractory) {
 			uint32_t bpm = (60U * hr->sample_rate_hz) / since;
 
@@ -290,7 +317,7 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 								  : (med - since);
 
 					trusted = (d * 100U) <=
-						  (med * SPREAD_MAX_PCT);
+						  (med * HRV_SPREAD_MAX_PCT);
 				}
 
 				hr->last_ibi = since;
@@ -298,14 +325,7 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 				hr->last_ibi_successive = trusted &&
 							  hr->prev_ibi_trusted;
 				hr->prev_ibi_trusted = trusted;
-			} else {
-				/*
-				 * A rejected beat still moved last_beat_tick
-				 * below, so the next interval is measured from
-				 * it and cannot be adjacent to the last good
-				 * one.
-				 */
-				hr->prev_ibi_trusted = false;
+				accepted = true;
 			}
 			/*
 			 * An out-of-range interval means a missed or spurious
@@ -314,6 +334,29 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 			 * detector could never accumulate MIN_INTERVALS
 			 * whenever a single beat was dropped.
 			 */
+		}
+
+		if (!accepted) {
+			/*
+			 * This crossing produced no usable interval -- it was
+			 * inside the refractory window, out of the plausible
+			 * bpm range, or the very first one -- but it advances
+			 * the beat clock all the same. Whatever interval comes
+			 * next is measured from it, so it is adjacent to
+			 * nothing and must not form a successive difference.
+			 *
+			 * Defence in depth rather than a fix for an observed
+			 * failure: the tightened HRV_SPREAD_MAX_PCT band
+			 * rejects the intervals this would catch before they
+			 * reach RMSSD, and reverting this line alone does not
+			 * make the test suite fail. It stays because the
+			 * invariant is structural -- a crossing that moves the
+			 * beat clock without producing an interval must break
+			 * the run -- and relying on a threshold to cover a
+			 * bookkeeping error is how the threshold ends up
+			 * carrying weight nobody knows it carries.
+			 */
+			hr->prev_ibi_trusted = false;
 		}
 
 		hr->last_beat_tick = hr->ticks;

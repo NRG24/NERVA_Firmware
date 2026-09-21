@@ -106,7 +106,9 @@ on disconnect.
 **HRV.** RMSSD over a rolling window of the last 64 successive
 differences, on its own characteristic (`hrv.c`). Only intervals that pass
 the beat detector's plausibility range *and* agree with the recent median
-are used, and a difference is never formed across a rejected beat — that
+to within 20 % are used -- half the 40 % the heart rate itself tolerates,
+because a metronome rhythm with a motion artifact invents 200 ms of HRV at
+the looser bar, and a difference is never formed across a rejected beat — that
 one rule is worth 144 ms of false HRV in simulation. The hardware sets the
 ceiling: beats land on 100 sps samples, so a metronome heart measures
 about 8.5 ms of HRV that is not there, which inflates low readings

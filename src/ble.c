@@ -556,6 +556,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	atomic_set(&imu_stream_on, 0);
 	atomic_set(&gsr_stream_on, 0);
 
+	/*
+	 * SpO2 mode too. A phone that enables it and walks away would
+	 * otherwise leave the ring running red and IR with no heart rate,
+	 * no HRS notifications and no RMSSD accumulating, for the rest of
+	 * the boot.
+	 */
+	atomic_set(&spo2_mode_on, 0);
+
 	LOG_INF("disconnected (reason 0x%02x)", reason);
 }
 
