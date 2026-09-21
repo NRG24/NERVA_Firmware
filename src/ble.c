@@ -250,8 +250,17 @@ static ssize_t write_control(struct bt_conn *conn,
 {
 	const uint8_t *p = buf;
 
-	if (offset != 0 || len < 1) {
+	if (offset != 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	/*
+	 * A zero-length write is a length error, not an offset error. Both used
+	 * to come back as ATT 0x07, which sends an app author looking at an
+	 * offset it never set.
+	 */
+	if (len < 1) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
 	switch (p[0]) {

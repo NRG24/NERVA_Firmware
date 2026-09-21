@@ -1420,7 +1420,16 @@ int main(void)
 				ring_wdt_feed();
 			}
 
-			mg = imu_magnitude_mg();
+			/*
+			 * Once the part is written off there is no retry
+			 * left for a read to feed, so asking can only cost
+			 * a full I2C timeout on every pass, for ever --
+			 * the same waste RING_MEASURING already refuses to
+			 * pay by gating its feed on imu_ready. Report it as
+			 * the failed read it would have been, so each
+			 * branch below takes the path it takes for one.
+			 */
+			mg = imu_unrecoverable ? -EIO : imu_magnitude_mg();
 
 			/*
 			 * Keep the IMU flag current, the way the PPG and PMIC flags
@@ -1656,7 +1665,8 @@ int main(void)
 					}
 					steps_update(act_mg, now);
 					sleep_feed(act_mg, now);
-				} else if (act_fail_count < ACT_FAIL_LIMIT) {
+				} else {
+					/* Bounded by the enclosing condition. */
 					act_fail_count++;
 				}
 			}

@@ -401,6 +401,56 @@ static void test_a_gap_does_not_bank_provisional_minutes(void)
 }
 
 /*
+ * BUG: end_session() backed provisionally-credited minutes out of
+ * total_minutes and restless_minutes whether or not a session was actually
+ * in progress, and the feed-gap path calls it in both states. active_run
+ * keeps counting while awake -- the awake branch of evaluate_minute()
+ * returns before crediting anything -- so an ordinary day subtracted its
+ * own activity from the night before it. Wear the ring overnight, walk for
+ * an hour and a half, then put it on the charger, and 87 minutes went
+ * missing off a 419-minute night; a long enough active stretch zeroed the
+ * night outright, because the subtraction is clamped at 0 rather than
+ * skipped.
+ *
+ * This is the ordinary daily pattern, not a corner case, which is why it is
+ * worth a test of its own rather than relying on the asleep-path gap tests
+ * above.
+ */
+static void test_an_awake_gap_does_not_eat_banked_sleep(void)
+{
+	uint16_t banked, after_gap;
+
+	sim_section("a charger gap while awake does not eat banked sleep");
+
+	reset_all();
+
+	/* A night's sleep, banked and closed out by getting up. */
+	feed_still(7 * 3600, 200, 5);
+	CHECK(sleep_is_asleep(), "did not fall asleep overnight");
+	banked = sleep_total_minutes();
+	CHECK(banked > 6 * 60, "only %u minutes banked overnight", banked);
+
+	/*
+	 * Ninety minutes on the move with no still minute to reset the run,
+	 * so active_run reaches ~90 -- more than an hour of it.
+	 */
+	feed_walk(90 * 60, 40, 110, 200);
+	CHECK(!sleep_is_asleep(), "still asleep after 90 minutes of walking");
+	CHECK(sleep_total_minutes() == banked,
+	      "walking changed the sleep total (%u -> %u)", banked,
+	      sleep_total_minutes());
+
+	/* Onto the charger: no accelerometer at all for an hour. */
+	feed_gap(3600);
+	feed_still(120, 200, 5);
+
+	after_gap = sleep_total_minutes();
+	CHECK(after_gap == banked,
+	      "the charger gap took %u minutes off the night (%u -> %u)",
+	      banked - after_gap, banked, after_gap);
+}
+
+/*
  * Characterisation, not a bug guard: this pins WHERE the classifier's
  * cliff sits, because the honest description of this algorithm is not
  * "it detects sleep" but "it detects the absence of a movement above
@@ -583,6 +633,7 @@ int main(void)
 	test_waking_up_is_not_restlessness();
 	test_a_genuine_stir_is_still_counted();
 	test_a_gap_does_not_bank_provisional_minutes();
+	test_an_awake_gap_does_not_eat_banked_sleep();
 	test_where_the_sleep_cliff_sits();
 	test_reset_does_not_poison_the_next_minute();
 

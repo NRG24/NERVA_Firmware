@@ -281,16 +281,30 @@ static int start_ppg_slots(struct maxm86161 *dev, const struct ppg_slot *slots,
 		return err;
 	}
 
+	/*
+	 * Indexed by LEDC code, so it has to span the whole field and not just
+	 * the three LEDs this firmware uses: LEDC_PILOT_LED1 is 0x8 and
+	 * LEDC_DIRECT_AMBIENT 0x9, and a caller passing either would have read
+	 * off the end of a four-entry table and handed LOG_INF a garbage
+	 * pointer to dereference. ledc is a plain uint8_t argument, so nothing
+	 * in the type system stops that.
+	 */
 	static const char *const names[] = {
 		[LEDC_NONE] = "none",
 		[LEDC_LED1] = "LED1 green 530nm",
 		[LEDC_LED2] = "LED2 IR 880nm",
 		[LEDC_LED3] = "LED3 red 660nm",
+		[LEDC_PILOT_LED1] = "pilot LED1",
+		[LEDC_DIRECT_AMBIENT] = "direct ambient",
 	};
 
 	for (size_t i = 0; i < n_slots; i++) {
+		uint8_t ledc = slots[i].ledc;
+		const char *name = (ledc < ARRAY_SIZE(names) && names[ledc])
+				   ? names[ledc] : "unknown";
+
 		LOG_INF("PPG slot %u: %s, PA 0x%02x (~%u.%02u mA), 100 sps",
-			(unsigned)(i + 1), names[slots[i].ledc], slots[i].pa,
+			(unsigned)(i + 1), name, slots[i].pa,
 			(slots[i].pa * 12U) / 100U, (slots[i].pa * 12U) % 100U);
 	}
 

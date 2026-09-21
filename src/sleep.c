@@ -133,9 +133,31 @@ uint16_t sleep_restless_minutes(void)
  */
 static void end_session(uint16_t provisional_sleep, uint16_t provisional_restless)
 {
-	sl.total_minutes -= MIN((uint32_t)provisional_sleep, sl.total_minutes);
-	sl.restless_minutes -= MIN(provisional_restless, sl.restless_minutes);
+	/*
+	 * Only back anything out when a session was actually in progress.
+	 *
+	 * active_run keeps counting while awake, and nothing there is credited
+	 * to either counter -- the awake branch of evaluate_minute() returns
+	 * before it reaches them. The feed-gap path below calls this in both
+	 * states, so without the guard an ordinary day subtracted its own
+	 * activity from the night before it: 90 minutes of walking and then
+	 * the charger took 87 minutes off a 419-minute night, and a long
+	 * enough stretch zeroed it, because the subtraction is clamped at 0
+	 * rather than being skipped. restless_minutes went the same way,
+	 * wiping the value the app publishes for the most recently closed
+	 * session.
+	 */
+	if (sl.asleep) {
+		sl.total_minutes -= MIN((uint32_t)provisional_sleep,
+					sl.total_minutes);
+		sl.restless_minutes -= MIN(provisional_restless,
+					   sl.restless_minutes);
+	}
 
+	/*
+	 * The run counters are cleared either way: a gap is not evidence of
+	 * stillness, so the minutes before it must not count towards onset.
+	 */
 	sl.asleep = false;
 	sl.session_minutes = 0;
 	sl.still_run = 0;
