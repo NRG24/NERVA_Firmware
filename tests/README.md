@@ -98,6 +98,17 @@ reporting nothing, implausible inputs report nothing rather than a number,
 and the curve points the right way round — a sign error there would read
 high when it should read low and nothing else would catch it.
 
+### `test_driver` — MAXM86161 register writes
+
+Stubs the I2C layer, records every register write, and compares against
+the values the driver produced *before* the two-slot SpO2 refactor. The
+green channel at 100 sps is the only configuration this project has ever
+seen work on hardware, so a refactor quietly changing one value there
+would cost the next bring-up days and nothing else would notice. The
+expected table is transcribed from the pre-refactor driver rather than
+generated from the current code, which is what makes it a check rather
+than a tautology.
+
 ### `test_mainloop` — the polling policy
 
 Emulates main.c's `RING_IDLE` case: sample, update `last_step_motion`,
@@ -133,6 +144,8 @@ the fix was reverted and the suite confirmed to fail:
 | `test_hrv` detector plumbing | hr.c never marking an interval trusted, which would make RMSSD read 0 forever with no other symptom. |
 | `test_spo2` uncalibrated flag | The flag going missing on a good reading, which is precisely the case where an app would show the number. |
 | `test_spo2` channel order | Red and IR swapped in the ratio, which inverts R with no error anywhere. |
+| `test_driver` green path | The two-slot refactor changing a register on the one configuration proven on hardware. |
+| `test_driver` slot order | IR and red swapped in the LED sequence, which inverts R via the FIFO tags instead. |
 | `test_gatt_layout` | A characteristic inserted into the Ring Service shifting the raw `ATTR_*` indices in ble.c onto the wrong attribute. |
 
 `test_no_false_steps_across_a_gap` is deliberately *not* in that list: it

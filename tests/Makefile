@@ -17,7 +17,7 @@ LDLIBS  += -lm
 SRC     := ../src/steps.c ../src/sleep.c ../src/calories.c ../src/hrv.c ../src/hr.c ../src/spo2.c
 COMMON  := sim.c $(SRC)
 
-TESTS   := test_activity test_mainloop test_hrv test_spo2
+TESTS   := test_activity test_mainloop test_hrv test_spo2 test_driver
 
 # Every .c in src/, plus the GATT layout assertions.
 #
@@ -52,6 +52,11 @@ test_hrv: test_hrv.c $(COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_spo2: test_spo2.c $(COMMON)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# The driver, not a pure-logic module: it needs the I2C and kernel calls
+# stubbed, which test_driver.c supplies itself.
+test_driver: test_driver.c sim.c ../src/maxm86161.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 run: $(TESTS)
