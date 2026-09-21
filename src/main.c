@@ -33,6 +33,7 @@
 #include "maxm86161.h"
 #include "selftest.h"
 #include "sleep.h"
+#include "spo2.h"
 #include "steps.h"
 #include "wdt.h"
 
@@ -56,6 +57,15 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define PPG_LED		LEDC_LED1
 /* 0.12 mA per LSB in the 31 mA range: 0x80 is about 15.4 mA. */
 #define PPG_LED_PA	0x80
+
+/*
+ * Drive currents for the SpO2 pair. Starting points, not calibrated: the
+ * ratio of ratios divides out absolute intensity, so these only have to
+ * put both channels in a sensible part of the ADC range without
+ * saturating. Equal currents are the conventional place to begin.
+ */
+#define SPO2_IR_PA	0x80
+#define SPO2_RED_PA	0x80
 
 /*
  * BENCH ONLY -- remove before anything ships.
@@ -180,6 +190,15 @@ static uint32_t samples[FIFO_DEPTH];
 
 /* Cleared when the PPG stops answering, so ppg_on() knows to re-probe. */
 static bool ppg_present;
+
+/*
+ * Which LEDs the current measurement window is running.
+ *
+ * Latched when the window opens rather than read live, so a mode change
+ * part-way through cannot leave report() demultiplexing the FIFO by the
+ * wrong rule. The new mode takes effect at the next window.
+ */
+static bool spo2_window;
 
 /*
  * Consecutive failed FIFO reads.
@@ -378,6 +397,18 @@ static void cb_stream_gsr(bool on)
 	atomic_set(&gsr_stream_request, on ? 1 : 0);
 }
 
+static void cb_spo2_mode(bool on)
+{
+	/*
+	 * The mode itself is read at the top of each window, so this only
+	 * asks for a window to happen soon. A window already running in the
+	 * other mode finishes first -- switching the LEDs underneath a
+	 * half-collected measurement would corrupt both.
+	 */
+	ARG_UNUSED(on);
+	atomic_set(&force_measure, 1);
+}
+
 static const struct ble_control_cbs control_cbs = {
 	.stream_ppg = cb_stream_ppg,
 	.stream_imu = NULL,
@@ -386,6 +417,7 @@ static const struct ble_control_cbs control_cbs = {
 	.set_weight = cb_set_weight,
 	.reset_activity = cb_reset_activity,
 	.stream_gsr = cb_stream_gsr,
+	.spo2_mode = cb_spo2_mode,
 };
 
 /* --- status ------------------------------------------------------------ */
@@ -406,7 +438,13 @@ static void publish_status(void)
 	if (state == RING_CHARGING) {
 		s.flags |= RING_FLAG_CHARGER;
 	}
-	if (hr_finger_present(&hr_state)) {
+	/*
+	 * In SpO2 mode the green LED is dark, so hr_finger_present() -- which
+	 * watches the green DC level -- would report no finger throughout a
+	 * perfectly good measurement. The flag means "something is on the
+	 * sensor", which the red/IR DC answers just as well.
+	 */
+	if (spo2_window ? spo2_finger_present() : hr_finger_present(&hr_state)) {
 		s.flags |= RING_FLAG_FINGER;
 	}
 	if (s.ppg_dc > 0) {
@@ -555,6 +593,20 @@ static void publish_hrv(void)
 	ble_publish_hrv(&h);
 }
 
+static void publish_spo2(void)
+{
+	struct spo2_result r;
+	struct ring_spo2 out;
+
+	spo2_result(&r);
+
+	out.ratio_x1000 = r.ratio_x1000;
+	out.percent = r.percent;
+	out.flags = r.flags;
+
+	ble_publish_spo2(&out);
+}
+
 /* Every call site that used to publish_status() alone now also publishes
  * activity, so the two characteristics never drift out of sync on the app
  * side -- a status update with stale steps/sleep data would be confusing
@@ -565,6 +617,62 @@ static void publish_all(void)
 	publish_status();
 	publish_activity();
 	publish_hrv();
+	publish_spo2();
+}
+
+/*
+ * One SpO2 frame: the IR sample from slot 1 and the red sample from slot 2.
+ *
+ * The part emits them consecutively, so red is paired with the IR that
+ * came immediately before it. `have_ir` guards the case where the IR half
+ * was lost to a FIFO overflow -- pairing red against a stale IR from an
+ * earlier frame would bias the ratio rather than merely add noise.
+ */
+static void report_spo2(uint8_t tag, uint32_t value)
+{
+	static uint32_t pending_ir;
+	static bool have_ir;
+	static uint32_t frames;
+
+	if (tag == TAG_PPG1_LEDC1) {
+		pending_ir = value;
+		have_ir = true;
+		return;
+	}
+
+	if (tag != TAG_PPG1_LEDC2) {
+		LOG_WRN("unexpected FIFO tag 0x%02x in SpO2 mode (data %u)",
+			tag, value);
+		return;
+	}
+
+	if (!have_ir) {
+		return;
+	}
+
+	have_ir = false;
+	spo2_feed(value, pending_ir);
+
+	if (++frames < SAMPLE_RATE_HZ) {
+		return;
+	}
+	frames = 0;
+
+	struct spo2_result r;
+
+	spo2_result(&r);
+
+	if (r.flags & SPO2_FLAG_VALID) {
+		LOG_INF("SpO2 R %u.%03u -> %u%% (UNCALIBRATED)",
+			r.ratio_x1000 / 1000U, r.ratio_x1000 % 1000U,
+			r.percent);
+	} else {
+		LOG_INF("SpO2 acquiring (%s)",
+			spo2_finger_present() ? "finger on, no pulse yet"
+					      : "no finger");
+	}
+
+	publish_all();
 }
 
 static void report(uint32_t raw)
@@ -574,6 +682,11 @@ static void report(uint32_t raw)
 	uint8_t tag = FIFO_TAG(raw);
 	uint32_t value = FIFO_DATA(raw);
 	uint16_t bpm_x10 = 0;
+
+	if (spo2_window) {
+		report_spo2(tag, value);
+		return;
+	}
 
 	if (tag != TAG_PPG1_LEDC1) {
 		LOG_WRN("unexpected FIFO tag 0x%02x (data %u)", tag, value);
@@ -687,7 +800,19 @@ static int ppg_on(void)
 		return -ENODEV;
 	}
 
-	err = maxm86161_start_ppg(&ppg, PPG_LED, PPG_LED_PA);
+	/*
+	 * Latch the mode for this whole window. Red+IR and green are
+	 * different FIFO layouts, so report() has to know which one it is
+	 * decoding, and that answer must not change under it mid-window.
+	 */
+	spo2_window = ble_spo2_mode();
+
+	if (spo2_window) {
+		err = maxm86161_start_spo2(&ppg, SPO2_IR_PA, SPO2_RED_PA);
+	} else {
+		err = maxm86161_start_ppg(&ppg, PPG_LED, PPG_LED_PA);
+	}
+
 	if (err) {
 		LOG_ERR("PPG start failed (%d)", err);
 		(void)regulator_disable(VLED_BOOST);
@@ -695,6 +820,8 @@ static int ppg_on(void)
 	}
 
 	hr_init(&hr_state, SAMPLE_RATE_HZ);
+	spo2_reset();
+
 	return 0;
 }
 
@@ -927,6 +1054,7 @@ int main(void)
 	sleep_init();
 	calories_init();
 	hrv_init();
+	spo2_init();
 
 	/* Nothing to measure yet: shut the optics down and wait for motion. */
 	ppg_off();
@@ -1487,7 +1615,8 @@ int main(void)
 				}
 			}
 
-			if (hr_finger_present(&hr_state)) {
+			if (spo2_window ? spo2_finger_present()
+					: hr_finger_present(&hr_state)) {
 				waiting_for_finger = false;
 				last_motion = now;
 			}

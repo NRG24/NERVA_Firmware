@@ -1,7 +1,7 @@
-# Host tests for the activity modules
+# Host tests for the pure-logic modules
 
-Builds `steps.c`, `sleep.c` and `calories.c` with a host compiler and runs
-them against a simulated wearer. No Zephyr, no board, no debugger.
+Builds steps, sleep, calories, HRV and SpO2 with a host compiler and runs
+them against simulated signals. No Zephyr, no board, no debugger.
 
 ```sh
 cd tests
@@ -81,6 +81,23 @@ sleep onset/wake hysteresis, calorie arithmetic against hand-computed
 values, and the published wire format (offsets are asserted against the
 table in `APP_INTEGRATION.md` section 7, so the two cannot drift).
 
+### `test_hrv` — RMSSD
+
+Compares the integer pipeline against the textbook definition computed in
+floating point, checks the quantisation floor the hardware imposes, and
+builds `hr.c` so the gate deciding *which* intervals reach RMSSD is
+covered too — without that, nothing would notice if the detector stopped
+marking intervals trusted and RMSSD silently read 0 forever.
+
+### `test_spo2` — ratio of ratios
+
+The percentage is uncalibrated and cannot be tested against truth. What is
+tested: R comes out right for known AC/DC on each channel (R is physics,
+not a fit), the UNCALIBRATED flag is set on every path including the ones
+reporting nothing, implausible inputs report nothing rather than a number,
+and the curve points the right way round — a sign error there would read
+high when it should read low and nothing else would catch it.
+
 ### `test_mainloop` — the polling policy
 
 Emulates main.c's `RING_IDLE` case: sample, update `last_step_motion`,
@@ -112,6 +129,10 @@ the fix was reverted and the suite confirmed to fail:
 | `test_charging_does_not_accrue_calories` | The calorie tick ran above the state switch and billed ~147 kcal for a two-hour charge. |
 | `test_slow_polling_is_known_bad` | Documents the 200 ms cliff itself, so nobody quietly raises the poll interval back. |
 | `check-constants` | main.c and the test's copy of the polling constants drifting apart. |
+| `test_hrv` non-successive guard | Pairing intervals across a rejected beat — worth 144 ms of false HRV on a steady pulse train. |
+| `test_hrv` detector plumbing | hr.c never marking an interval trusted, which would make RMSSD read 0 forever with no other symptom. |
+| `test_spo2` uncalibrated flag | The flag going missing on a good reading, which is precisely the case where an app would show the number. |
+| `test_spo2` channel order | Red and IR swapped in the ratio, which inverts R with no error anywhere. |
 | `test_gatt_layout` | A characteristic inserted into the Ring Service shifting the raw `ATTR_*` indices in ble.c onto the wrong attribute. |
 
 `test_no_false_steps_across_a_gap` is deliberately *not* in that list: it

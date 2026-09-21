@@ -45,6 +45,9 @@ anything newer as a bring-up, not an update.
 | Step count, sleep sessions, calorie estimate | **Compile only, unvalidated** | new this revision; no board, no reference pedometer or sleep log to compare against |
 | RMSSD arithmetic | **Verified against the definition** | `tests/test_hrv.c` compares the integer pipeline to the textbook formula in floating point |
 | RMSSD against a real heart | **Unvalidated** | never compared to an ECG or a chest strap; rests on a beat detector that is itself unvalidated |
+| SpO2 ratio-of-ratios arithmetic | **Verified against the definition** | `tests/test_spo2.c`, known AC/DC on each channel |
+| SpO2 percentage | **UNCALIBRATED, and flagged as such on the wire** | the R-to-SpO2 curve is a literature default; fitting it needs desaturation against a reference oximeter |
+| Red and IR LEDs ever lit | **Never** | only the green LED has run on hardware; the two-slot sequence is compile-verified only |
 | Activity characteristic (steps/sleep/calories over BLE) | **Never exercised by any phone** | same as the rest of the Ring Service, see row above |
 
 ---
@@ -109,6 +112,17 @@ ceiling: beats land on 100 sps samples, so a metronome heart measures
 about 8.5 ms of HRV that is not there, which inflates low readings
 proportionally more than high ones.
 
+**SpO2.** Ratio of ratios on red and IR, opt-in via opcode `0x09`, on its
+own characteristic (`spo2.c`). The driver gained a two-slot LED sequence
+for it, refactored so the proven green path and the new red/IR path share
+one init table rather than acquiring two that drift. **R is published and
+is a real measurement; the percentage is not.** The R-to-SpO2 curve is the
+published default and has never been fitted against this hardware, so
+every reading carries an UNCALIBRATED flag that no build can clear, and
+anything outside 70-100 % is withheld rather than shown. Heart rate pauses
+while the mode is on, because every HR number here comes from the green
+channel.
+
 **BLE.** Standard HRS (0x180D) and BAS (0x180F), open by default so generic
 apps work. Custom Ring Service (`f0a1…`) with a 20-byte status packet, a
 17-byte activity packet, a 3-byte HRV packet, raw PPG and IMU streams, and
@@ -146,6 +160,7 @@ Ordered by how much it would hurt, not how likely it is.
 | R5a | **Steps, sleep and calories are unvalidated,** and doubly so for a finger-worn ring, which does not move the way a wrist or waist does. | Certain | none — the numbers look plausible | compare against a reference pedometer/sleep log once hardware exists before showing these without a caveat |
 | R6 | **Resting heart rate leaks over open HRS** to anyone in range. | Certain (chosen) | none | `-DCONFIG_RING_HRS_OPEN=n` — costs generic-app compatibility |
 | R7 | **No MITM protection.** Just Works is encrypted but unauthenticated. | Certain | none | needs a display/keypad or OOB; not fixable in firmware alone |
+| R7a | **An app could show the uncalibrated SpO2 percentage as a reading.** The flag is set on every path and the docs are explicit, but nothing in the firmware can stop a phone ignoring it. | Certain (by design) | a plausible-looking number that means nothing clinically | show `ratio_x1000`, or label the percentage; calibrate before any health claim |
 | R8 | **No OTA.** Field units can only be updated over SWD, which on this board needs series resistors and a fresh APPROTECT unlock. | Certain | — | MCUboot + DFU is the next big item |
 | R9 | **PMIC I2C dies while charging** → ring parks with optics off, then after 30 s guesses "idle" and may run LEDs against a 20 mA charger. | Low | `PMIC unreachable for 30 s` | power question, not a hazard; PMIC health flag tells the app |
 | R10 | **Custom BLE service has never been exercised.** Any of status/stream/control could be wrong on first contact. | Medium | app sees nothing / wrong bytes | it is all logged; fix from RTT |
@@ -299,7 +314,15 @@ something the next assumes:
    the answer the project has been waiting for since August — write it
    into `BRINGUP_RESULTS.md` either way. Expect the first notification
    about a second after enabling; that is the 800 ms front-end settle.
-6. **Calories.** Send control opcode `0x06` with a real body weight
+6. **SpO2, and its LEDs.** Send opcode `0x09` and watch for the two
+   `PPG slot` lines at window start — slot 1 IR, slot 2 red. **This is the
+   first time the red and IR drivers will ever have been lit on this
+   board**, so check they come up at all before trusting anything
+   downstream. Then look for `SpO2 R x.xxx -> nn%` once a second with a
+   finger on. Record R against a reference pulse oximeter on the same
+   finger: those pairs are exactly what a calibration needs, and until
+   somebody collects them the percentage is arithmetic, not a reading.
+7. **Calories.** Send control opcode `0x06` with a real body weight
    before believing any number; the default is 70 kg. At rest the total
    should climb about 1.2 kcal per minute for a 70 kg wearer, which is a
    figure you can check against the clock.

@@ -77,6 +77,7 @@ this service now requires an encrypted link** — see Pairing, below.
 | Activity | `f0a10005-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 | HRV | `f0a10006-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 | GSR stream | `f0a10007-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
+| SpO2 | `f0a10008-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 
 ### Pairing
 
@@ -248,6 +249,7 @@ Write (with or without response). First byte is the opcode.
 | `0x06` | `u16 weight_kg_x10` | Set body weight for the calorie estimate, little-endian, kilograms x10 (e.g. `700` = 70.0 kg) |
 | `0x07` | none | Reset steps, sleep and calorie counters to zero |
 | `0x08` | `u8 on` | Raw GSR streaming on/off. Powers the analog front end for as long as it runs |
+| `0x09` | `u8 on` | SpO2 mode on/off. Runs red+IR instead of green; **heart rate pauses** while on |
 
 Duty cycle values are clamped in firmware: window 5-300 s, period
 window-3600 s. Defaults are a **15 s window every 60 s**, i.e. 25% duty.
@@ -324,7 +326,7 @@ about which measurement period they describe.
 **None of this has been validated on hardware.** Steps come from
 peak-detecting the IMU's acceleration magnitude — the same "plausible,
 never checked against a reference" caveat that applies to heart rate in
-section 12 applies here, and more so: a finger-worn ring does not move the
+section 13 applies here, and more so: a finger-worn ring does not move the
 way a wrist or waist does, so even the detector's assumptions about what a
 footstep looks like are unproven on this board. Calories are steps run
 through a standard MET table, which only has a step count from the same
@@ -548,7 +550,78 @@ at.
 
 ---
 
-## 10. Behaviour your app has to expect
+## 10. SpO2 characteristic
+
+4 bytes, little-endian. Off by default; enable with control opcode `0x09`.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u16 | `ratio_x1000` | Ratio of ratios, R, x1000. **0 means not measured** |
+| 2 | u8 | `percent` | SpO2 percentage. **0 means not measured** |
+| 3 | u8 | `flags` | see below |
+
+| Bit | Meaning |
+|---|---|
+| 0 | `UNCALIBRATED` — the percentage comes from an uncalibrated curve |
+| 1 | `VALID` — the window held enough clean pulsatile signal for R to mean anything |
+
+### Read this before you display a percentage
+
+**Bit 0 is always set, in every build this firmware has.** It is not a
+transient condition you can wait out.
+
+`ratio_x1000` is a real measurement. R falls out of the optics and the
+arithmetic — the ratio of each channel's pulsatile component to its steady
+one — and needs no calibration:
+
+```
+R = (AC_red / DC_red) / (AC_ir / DC_ir)
+```
+
+`percent` is not. Turning R into a saturation takes an empirical curve
+that every manufacturer derives by desaturating volunteers under a
+reference oximeter and fitting the result. This firmware uses the
+published default (`SpO2 = 110 − 25R`) which assumes an optical geometry,
+LED wavelengths and photodiode response that **nobody has checked against
+this board**. The number it produces is an illustration of the arithmetic,
+not a measurement of anyone's blood.
+
+So: show R, or show the percentage clearly labelled as uncalibrated, or
+show nothing. Do not put a bare number next to a lung icon. If you only
+have room for one, R is the honest choice and it is the value a future
+calibration would be fitted against — record it alongside a reference
+oximeter reading and you are most of the way to fixing this properly.
+
+Readings outside 70-100 % are withheld entirely (`percent` reads 0, R is
+still reported). A number in the 50s reads as a medical emergency, and
+this firmware has no business generating one.
+
+### What it costs
+
+SpO2 mode lights the red and IR LEDs instead of green, so:
+
+* **Heart rate pauses.** Every HR number this firmware produces comes from
+  the green channel. While SpO2 mode is on, `hr_x10` reads 0, HRS
+  notifications stop, and `ppg_dc`, `ppg_ac` and `perfusion_x10` in Status
+  read 0 as well. RMSSD stops accumulating. Turn SpO2 off to get them
+  back.
+* `flags` bit 0 of Status — finger present — keeps working, because the
+  red/IR DC level answers that question as well as green did.
+* The mode takes effect at the **next measurement window**, not
+  immediately: switching LEDs underneath a half-collected measurement
+  would corrupt both. Sending `0x09` requests a window, so expect a result
+  within about 15 seconds; a window already running finishes first.
+* Two LEDs instead of one costs roughly twice the optical power for the
+  duration of a window. It is forced off on disconnect.
+
+Both LEDs run at the same drive current, which is the conventional
+starting point — the ratio of ratios divides absolute intensity out, so
+the currents only need to put both channels in a sensible part of the ADC
+range.
+
+---
+
+## 11. Behaviour your app has to expect
 
 **The ring is not always measuring.** By default the optical front end is
 off for 45 seconds out of every 60, and completely off when the ring has
@@ -577,7 +650,7 @@ first detected, so the user gets confirmation without opening the app.
 
 ---
 
-## 11. Connection parameters
+## 12. Connection parameters
 
 The firmware does not request specific connection parameters, so you get
 whatever the phone proposes. Recommendations:
@@ -592,7 +665,7 @@ length extension if your stack exposes it.
 
 ---
 
-## 12. Caveats worth knowing
+## 13. Caveats worth knowing
 
 These are real limitations of the current hardware and firmware, not
 things to paper over in the UI.
@@ -654,7 +727,7 @@ and no bond has ever been cleared.
 
 ---
 
-## 13. Quick start
+## 14. Quick start
 
 1. Scan for service `0x180D`, connect
 2. Request MTU 247

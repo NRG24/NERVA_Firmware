@@ -80,6 +80,24 @@ struct ring_hrv {
 	uint8_t rmssd_beats;	/* successive differences behind the value */
 } __packed;
 
+/*
+ * SpO2 payload.
+ *
+ * `ratio_x1000` is the real measurement: it comes out of the optics with
+ * no calibration and is what a comparison against a reference oximeter
+ * would be fitted to. `percent` is that ratio put through a literature
+ * curve that has never been calibrated for this hardware, which is why
+ * SPO2_FLAG_UNCALIBRATED is always set. See spo2.h.
+ */
+#define SPO2_FLAG_UNCALIBRATED	(1U << 0)
+#define SPO2_FLAG_VALID		(1U << 1)
+
+struct ring_spo2 {
+	uint16_t ratio_x1000;	/* R x1000; 0 = not measured */
+	uint8_t percent;	/* 0 = not measured */
+	uint8_t flags;
+} __packed;
+
 /* Callbacks the phone can trigger by writing to the control characteristic. */
 struct ble_control_cbs {
 	void (*stream_ppg)(bool on);
@@ -89,6 +107,7 @@ struct ble_control_cbs {
 	void (*set_weight)(uint16_t weight_kg_x10);
 	void (*reset_activity)(void);
 	void (*stream_gsr)(bool on);
+	void (*spo2_mode)(bool on);
 };
 
 int ble_start(void);
@@ -106,6 +125,7 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count);
 void ble_publish_imu(int16_t x, int16_t y, int16_t z);
 void ble_publish_activity(const struct ring_activity *activity);
 void ble_publish_hrv(const struct ring_hrv *hrv);
+void ble_publish_spo2(const struct ring_spo2 *spo2);
 
 /*
  * Raw GSR, in ADC counts. Sized by the caller to the negotiated MTU --
@@ -133,5 +153,8 @@ bool ble_gsr_streaming(void);
  * Cleared on disconnect, so this also catches a phone that walks away.
  */
 bool ble_gsr_stream_requested(void);
+
+/* True while the app has asked for SpO2 (red+IR) measurement windows. */
+bool ble_spo2_mode(void);
 
 #endif /* BLE_H_ */

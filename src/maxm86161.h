@@ -162,6 +162,21 @@ int maxm86161_probe(struct maxm86161 *dev, const struct device *i2c);
 int maxm86161_start_ppg(struct maxm86161 *dev, uint8_t ledc, uint8_t pa);
 
 /*
+ * Configure a two-slot sequence for SpO2: IR in slot 1, red in slot 2, at
+ * the same 100 sps. Each frame therefore produces TWO FIFO samples, so the
+ * FIFO fills twice as fast -- 128 entries is 0.64 s of headroom rather
+ * than 1.28 s, still comfortable at the 20 ms poll.
+ *
+ * Demultiplex on the tag: IR is TAG_PPG1_LEDC1 and red is TAG_PPG1_LEDC2,
+ * because the part tags by slot and not by which LED is in it.
+ *
+ * This does NOT drive the green LED, so nothing that depends on the green
+ * channel -- which is every heart-rate number this firmware produces --
+ * works while it is running.
+ */
+int maxm86161_start_spo2(struct maxm86161 *dev, uint8_t ir_pa, uint8_t red_pa);
+
+/*
  * Drive one LED hard enough to see, for ms milliseconds, then stop.
  *
  * At the normal 100 sps the LED is lit for 123.8 us per 10 ms sample --

@@ -26,6 +26,7 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
  *   activity     f0a10005-...   read / notify
  *   hrv          f0a10006-...   read / notify
  *   gsr stream   f0a10007-...   notify
+ *   spo2         f0a10008-...   read / notify
  */
 #define RING_UUID_BASE(x)	BT_UUID_128_ENCODE(0xf0a10000 | (x), 0x1e5c, \
 						   0x4a2b, 0x8d3f, \
@@ -47,6 +48,8 @@ static const struct bt_uuid_128 uuid_hrv =
 	BT_UUID_INIT_128(RING_UUID_BASE(6));
 static const struct bt_uuid_128 uuid_gsr =
 	BT_UUID_INIT_128(RING_UUID_BASE(7));
+static const struct bt_uuid_128 uuid_spo2 =
+	BT_UUID_INIT_128(RING_UUID_BASE(8));
 
 static atomic_t connected_count;
 static atomic_t status_subscribed;
@@ -55,9 +58,11 @@ static atomic_t imu_subscribed;
 static atomic_t activity_subscribed;
 static atomic_t hrv_subscribed;
 static atomic_t gsr_subscribed;
+static atomic_t spo2_subscribed;
 static atomic_t ppg_stream_on;
 static atomic_t imu_stream_on;
 static atomic_t gsr_stream_on;
+static atomic_t spo2_mode_on;
 
 /*
  * The one connection we allow (CONFIG_BT_MAX_CONN=1), held with a
@@ -93,6 +98,9 @@ static struct ring_activity latest_activity;
 /* Same pattern again: own lock, tear-safe snapshot for the GATT read. */
 static struct k_spinlock hrv_lock;
 static struct ring_hrv latest_hrv;
+
+static struct k_spinlock spo2_lock;
+static struct ring_spo2 latest_spo2;
 
 static const struct ble_control_cbs *control_cbs;
 static uint32_t ppg_seq;
@@ -205,6 +213,25 @@ static void gsr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	atomic_set(&gsr_subscribed, value == BT_GATT_CCC_NOTIFY);
 }
 
+static ssize_t read_spo2(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			 void *buf, uint16_t len, uint16_t offset)
+{
+	struct ring_spo2 snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&spo2_lock);
+	snapshot = latest_spo2;
+	k_spin_unlock(&spo2_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
+}
+
+static void spo2_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	atomic_set(&spo2_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
 /*
  * Control opcodes, see APP_INTEGRATION.md:
  *   0x01 <u8 on>                     raw PPG streaming
@@ -215,6 +242,7 @@ static void gsr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
  *   0x06 <u16 weight_kg_x10>         set body weight for calorie estimate
  *   0x07                             reset steps/sleep/calories counters
  *   0x08 <u8 on>                     raw GSR streaming
+ *   0x09 <u8 on>                     SpO2 mode (red+IR instead of green)
  */
 static ssize_t write_control(struct bt_conn *conn,
 			     const struct bt_gatt_attr *attr, const void *buf,
@@ -336,6 +364,18 @@ static ssize_t write_control(struct bt_conn *conn,
 		LOG_INF("control: GSR streaming %s", p[1] ? "on" : "off");
 		break;
 
+	case 0x09:
+		if (len < 2) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		atomic_set(&spo2_mode_on, p[1] != 0);
+		if (control_cbs && control_cbs->spo2_mode) {
+			control_cbs->spo2_mode(p[1] != 0);
+		}
+		LOG_INF("control: SpO2 mode %s (heart rate %s)",
+			p[1] ? "on" : "off", p[1] ? "pauses" : "resumes");
+		break;
+
 	default:
 		LOG_WRN("control: unknown opcode 0x%02x", p[0]);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
@@ -394,6 +434,12 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
 	BT_GATT_CCC(gsr_ccc_changed,
 		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+
+	BT_GATT_CHARACTERISTIC(&uuid_spo2.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ_ENCRYPT, read_spo2, NULL, NULL),
+	BT_GATT_CCC(spo2_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 );
 
 /*
@@ -410,6 +456,7 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
  *  12  activity decl  13 value  14 CCC
  *  15  hrv      decl  16 value  17 CCC
  *  18  gsr      decl  19 value  20 CCC
+ *  21  spo2     decl  22 value  23 CCC
  *
  * Pointing at the declaration rather than the value is deliberate and is
  * what bt_gatt_notify() documents: "The attribute object on the parameters
@@ -425,6 +472,7 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 #define ATTR_ACTIVITY	(&ring_svc.attrs[12])
 #define ATTR_HRV	(&ring_svc.attrs[15])
 #define ATTR_GSR	(&ring_svc.attrs[18])
+#define ATTR_SPO2	(&ring_svc.attrs[21])
 
 /* --- connection tracking ----------------------------------------------- */
 
@@ -630,6 +678,11 @@ bool ble_gsr_streaming(void)
 bool ble_gsr_stream_requested(void)
 {
 	return atomic_get(&gsr_stream_on) != 0;
+}
+
+bool ble_spo2_mode(void)
+{
+	return atomic_get(&spo2_mode_on) != 0;
 }
 
 void ble_set_control_cbs(const struct ble_control_cbs *cbs)
@@ -870,6 +923,23 @@ void ble_publish_gsr(const int16_t *samples, uint8_t count)
 	}
 
 	(void)bt_gatt_notify(NULL, ATTR_GSR, buf, 5 + n * sizeof(int16_t));
+}
+
+void ble_publish_spo2(const struct ring_spo2 *spo2)
+{
+	struct ring_spo2 snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&spo2_lock);
+	latest_spo2 = *spo2;
+	snapshot = latest_spo2;
+	k_spin_unlock(&spo2_lock, key);
+
+	if (!ble_is_connected() || !atomic_get(&spo2_subscribed)) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, ATTR_SPO2, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_hrv(const struct ring_hrv *hrv)

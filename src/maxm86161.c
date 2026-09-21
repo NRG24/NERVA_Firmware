@@ -146,7 +146,44 @@ int maxm86161_probe(struct maxm86161 *dev, const struct device *i2c)
 	return -ENODEV;
 }
 
-int maxm86161_start_ppg(struct maxm86161 *dev, uint8_t ledc, uint8_t pa)
+/*
+ * One measurement slot: which LED driver fires, and how hard.
+ *
+ * The FIFO tags samples by SLOT, not by LED -- slot 1 comes back as
+ * TAG_PPG1_LEDC1 whichever driver is in it. Callers demultiplex on the
+ * tag, so the slot order here is part of the contract with them.
+ */
+struct ppg_slot {
+	uint8_t ledc;
+	uint8_t pa;
+};
+
+/* The driver configured for slot `index`, or LEDC_NONE if the slot is unused. */
+static uint8_t slot_ledc(const struct ppg_slot *slots, size_t n, size_t index)
+{
+	return (index < n) ? slots[index].ledc : LEDC_NONE;
+}
+
+/* The drive current for a given LED, or 0 if it is not in the sequence. */
+static uint8_t slot_pa(const struct ppg_slot *slots, size_t n, uint8_t ledc)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (slots[i].ledc == ledc) {
+			return slots[i].pa;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * The single place the PPG is configured. Both the one-LED heart-rate mode
+ * and the two-LED SpO2 mode come through here, so there is one init table
+ * rather than two that drift apart -- the green path is proven on hardware
+ * and must not acquire a second, subtly different copy.
+ */
+static int start_ppg_slots(struct maxm86161 *dev, const struct ppg_slot *slots,
+			   size_t n_slots)
 {
 	uint8_t status;
 	int err;
@@ -193,17 +230,21 @@ int maxm86161_start_ppg(struct maxm86161 *dev, uint8_t ledc, uint8_t pa)
 		/* Internal photodiode. */
 		{ REG_PHOTO_DIODE_BIAS, PDBIAS1_0_65PF },
 
-		/* One exposure per sample, on the selected driver only. */
-		{ REG_LED_SEQ_1, (LEDC_NONE << 4) | ledc },
+		/*
+		 * Slot 1 in the low nibble, slot 2 in the high nibble. An
+		 * unused slot is LEDC_NONE, which the part skips.
+		 */
+		{ REG_LED_SEQ_1, (uint8_t)((slot_ledc(slots, n_slots, 1) << 4) |
+					   slot_ledc(slots, n_slots, 0)) },
 		{ REG_LED_SEQ_2, 0x00 },
 		{ REG_LED_SEQ_3, 0x00 },
 
 		/* 31 mA full-scale range, 0.12 mA per LSB. */
 		{ REG_LED_RANGE_1, (LED_RGE_31MA << 4) | (LED_RGE_31MA << 2) |
 				   LED_RGE_31MA },
-		{ REG_LED1_PA, (ledc == LEDC_LED1) ? pa : 0x00 },
-		{ REG_LED2_PA, (ledc == LEDC_LED2) ? pa : 0x00 },
-		{ REG_LED3_PA, (ledc == LEDC_LED3) ? pa : 0x00 },
+		{ REG_LED1_PA, slot_pa(slots, n_slots, LEDC_LED1) },
+		{ REG_LED2_PA, slot_pa(slots, n_slots, LEDC_LED2) },
+		{ REG_LED3_PA, slot_pa(slots, n_slots, LEDC_LED3) },
 
 		/* Roll over on full so a slow poll loses old samples, not new
 		 * ones, and let a FIFO read clear the status bits.
@@ -230,15 +271,42 @@ int maxm86161_start_ppg(struct maxm86161 *dev, uint8_t ledc, uint8_t pa)
 	}
 
 	static const char *const names[] = {
+		[LEDC_NONE] = "none",
 		[LEDC_LED1] = "LED1 green 530nm",
 		[LEDC_LED2] = "LED2 IR 880nm",
 		[LEDC_LED3] = "LED3 red 660nm",
 	};
 
-	LOG_INF("PPG running: %s, PA 0x%02x (~%u.%02u mA), 100 sps",
-		names[ledc], pa, (pa * 12U) / 100U, (pa * 12U) % 100U);
+	for (size_t i = 0; i < n_slots; i++) {
+		LOG_INF("PPG slot %u: %s, PA 0x%02x (~%u.%02u mA), 100 sps",
+			(unsigned)(i + 1), names[slots[i].ledc], slots[i].pa,
+			(slots[i].pa * 12U) / 100U, (slots[i].pa * 12U) % 100U);
+	}
 
 	return 0;
+}
+
+int maxm86161_start_ppg(struct maxm86161 *dev, uint8_t ledc, uint8_t pa)
+{
+	const struct ppg_slot slots[] = { { ledc, pa } };
+
+	return start_ppg_slots(dev, slots, ARRAY_SIZE(slots));
+}
+
+int maxm86161_start_spo2(struct maxm86161 *dev, uint8_t ir_pa, uint8_t red_pa)
+{
+	/*
+	 * IR first, red second, and callers depend on that order: the FIFO
+	 * tags by slot, so IR arrives as TAG_PPG1_LEDC1 and red as
+	 * TAG_PPG1_LEDC2. Swapping them here would invert the ratio of
+	 * ratios silently, with no error anywhere -- just a wrong SpO2.
+	 */
+	const struct ppg_slot slots[] = {
+		{ LEDC_LED2, ir_pa },
+		{ LEDC_LED3, red_pa },
+	};
+
+	return start_ppg_slots(dev, slots, ARRAY_SIZE(slots));
 }
 
 int maxm86161_leds_off(struct maxm86161 *dev)
