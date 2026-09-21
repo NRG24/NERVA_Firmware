@@ -14,4 +14,5 @@ target_sources(app PRIVATE
 	src/steps.c
 	src/sleep.c
 	src/calories.c
+	src/hrv.c
 )

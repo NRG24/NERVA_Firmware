@@ -73,6 +73,30 @@ int32_t hr_amplitude(const struct hr *hr)
 	return hr->amplitude;
 }
 
+uint16_t hr_last_ibi_ms(const struct hr *hr)
+{
+	if (hr->sample_rate_hz == 0 || hr->last_ibi == 0) {
+		return 0;
+	}
+
+	/*
+	 * Intervals are counted in samples, so at 100 sps this is exact to
+	 * 10 ms and no better. That quantisation is the dominant error in
+	 * RMSSD -- see the note in hrv.h.
+	 */
+	return (uint16_t)((hr->last_ibi * 1000U) / hr->sample_rate_hz);
+}
+
+bool hr_last_ibi_trusted(const struct hr *hr)
+{
+	return hr->last_ibi_trusted;
+}
+
+bool hr_last_ibi_successive(const struct hr *hr)
+{
+	return hr->last_ibi_successive;
+}
+
 int32_t hr_baseline(const struct hr *hr)
 {
 	return hr->baseline;
@@ -150,6 +174,10 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 
 	hr->ticks++;
 
+	/* Only ever true on the sample that reports a beat. */
+	hr->last_ibi_trusted = false;
+	hr->last_ibi_successive = false;
+
 	if (!hr->primed) {
 		hr->baseline = x;
 		hr->smooth = 0;
@@ -176,6 +204,8 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 		hr->ibi_next = 0;
 		hr->last_beat_tick = 0;
 		hr->above = false;
+		/* Whatever comes next starts a new run, not a difference. */
+		hr->prev_ibi_trusted = false;
 		if (bpm_x10) {
 			*bpm_x10 = 0;
 		}
@@ -237,6 +267,45 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 				}
 				hr->beats++;
 				beat = true;
+
+				/*
+				 * Second gate, for HRV only: does this interval
+				 * agree with the ones around it? The heart rate
+				 * can absorb an odd interval because it takes a
+				 * median; RMSSD cannot, because the error is
+				 * squared and lands in two differences.
+				 *
+				 * The median is taken after inserting this
+				 * interval, which lets a bad one pull its own
+				 * bar -- with eight samples it moves the median
+				 * by at most one position, so the effect is
+				 * small, and taking it before would leave the
+				 * first intervals of a window ungated entirely.
+				 */
+				uint32_t med = median_ibi(hr);
+				bool trusted = false;
+
+				if (hr->ibi_count >= MIN_INTERVALS && med != 0) {
+					uint32_t d = (since > med) ? (since - med)
+								  : (med - since);
+
+					trusted = (d * 100U) <=
+						  (med * SPREAD_MAX_PCT);
+				}
+
+				hr->last_ibi = since;
+				hr->last_ibi_trusted = trusted;
+				hr->last_ibi_successive = trusted &&
+							  hr->prev_ibi_trusted;
+				hr->prev_ibi_trusted = trusted;
+			} else {
+				/*
+				 * A rejected beat still moved last_beat_tick
+				 * below, so the next interval is measured from
+				 * it and cannot be adjacent to the last good
+				 * one.
+				 */
+				hr->prev_ibi_trusted = false;
 			}
 			/*
 			 * An out-of-range interval means a missed or spurious
@@ -255,6 +324,7 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 	if (hr->amplitude <= AMPLITUDE_FLOOR) {
 		hr->ibi_count = 0;
 		hr->ibi_next = 0;
+		hr->prev_ibi_trusted = false;
 	}
 
 	if (bpm_x10) {

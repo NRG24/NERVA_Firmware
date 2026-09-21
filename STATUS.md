@@ -43,6 +43,8 @@ anything newer as a bring-up, not an update.
 | GSR reading | **Unknown** | see §5 |
 | Heart-rate accuracy | **Unvalidated** | never against a reference monitor |
 | Step count, sleep sessions, calorie estimate | **Compile only, unvalidated** | new this revision; no board, no reference pedometer or sleep log to compare against |
+| RMSSD arithmetic | **Verified against the definition** | `tests/test_hrv.c` compares the integer pipeline to the textbook formula in floating point |
+| RMSSD against a real heart | **Unvalidated** | never compared to an ECG or a chest strap; rests on a beat detector that is itself unvalidated |
 | Activity characteristic (steps/sleep/calories over BLE) | **Never exercised by any phone** | same as the rest of the Ring Service, see row above |
 
 ---
@@ -89,9 +91,19 @@ entire stretch. The cliff is the ten consecutive still minutes that onset
 requires; `tests/test_activity.c` pins both ends of it so tuning cannot
 move it unnoticed.
 
+**HRV.** RMSSD over a rolling window of the last 64 successive
+differences, on its own characteristic (`hrv.c`). Only intervals that pass
+the beat detector's plausibility range *and* agree with the recent median
+are used, and a difference is never formed across a rejected beat — that
+one rule is worth 144 ms of false HRV in simulation. The hardware sets the
+ceiling: beats land on 100 sps samples, so a metronome heart measures
+about 8.5 ms of HRV that is not there, which inflates low readings
+proportionally more than high ones.
+
 **BLE.** Standard HRS (0x180D) and BAS (0x180F), open by default so generic
 apps work. Custom Ring Service (`f0a1…`) with a 20-byte status packet, a
-17-byte activity packet, raw PPG and IMU streams, and a control
+17-byte activity packet, a 3-byte HRV packet, raw PPG and IMU streams, and
+a control
 characteristic — all requiring an encrypted link. Just Works pairing, one
 bond, persisted. Device Information Service reports firmware `0.5.0`.
 Control opcode `0x05` clears bonds; `0x06`/`0x07` set body weight and reset

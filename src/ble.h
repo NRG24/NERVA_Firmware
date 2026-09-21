@@ -69,6 +69,17 @@ struct ring_activity {
 	uint8_t sleep_state;		/* see SLEEP_STATE_* above */
 } __packed;
 
+/*
+ * HRV payload. Separate characteristic rather than new fields on Status or
+ * Activity: both of those are already at the 20-byte payload a
+ * notification carries at the default 23-byte ATT MTU, and an app is being
+ * written against their current layout.
+ */
+struct ring_hrv {
+	uint16_t rmssd_x10;	/* milliseconds x10; 0 = not enough clean beats */
+	uint8_t rmssd_beats;	/* successive differences behind the value */
+} __packed;
+
 /* Callbacks the phone can trigger by writing to the control characteristic. */
 struct ble_control_cbs {
 	void (*stream_ppg)(bool on);
@@ -93,6 +104,7 @@ void ble_publish_status(const struct ring_status *status);
 void ble_publish_ppg(const uint32_t *samples, uint8_t count);
 void ble_publish_imu(int16_t x, int16_t y, int16_t z);
 void ble_publish_activity(const struct ring_activity *activity);
+void ble_publish_hrv(const struct ring_hrv *hrv);
 
 bool ble_ppg_streaming(void);
 bool ble_imu_streaming(void);

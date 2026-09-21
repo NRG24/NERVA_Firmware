@@ -28,6 +28,7 @@
 #include "ble.h"
 #include "calories.h"
 #include "hr.h"
+#include "hrv.h"
 #include "imu.h"
 #include "maxm86161.h"
 #include "selftest.h"
@@ -439,6 +440,16 @@ static void publish_activity(void)
 	ble_publish_activity(&a);
 }
 
+static void publish_hrv(void)
+{
+	struct ring_hrv h = {
+		.rmssd_x10 = hrv_rmssd_x10(),
+		.rmssd_beats = hrv_diffs(),
+	};
+
+	ble_publish_hrv(&h);
+}
+
 /* Every call site that used to publish_status() alone now also publishes
  * activity, so the two characteristics never drift out of sync on the app
  * side -- a status update with stale steps/sleep data would be confusing
@@ -448,6 +459,7 @@ static void publish_all(void)
 {
 	publish_status();
 	publish_activity();
+	publish_hrv();
 }
 
 static void report(uint32_t raw)
@@ -464,6 +476,19 @@ static void report(uint32_t raw)
 	}
 
 	bool beat = hr_update(&hr_state, value, &bpm_x10);
+
+	/*
+	 * Feed HRV only the intervals the detector vouches for. hr.c decides
+	 * both parts of that: trusted means the interval passed the bpm range
+	 * and agreed with the median, successive means the one before it did
+	 * too and was genuinely adjacent. An untrusted interval is still
+	 * offered, with successive false, so that it breaks the run rather
+	 * than silently letting the next difference span the gap it left.
+	 */
+	if (beat && hr_last_ibi_trusted(&hr_state)) {
+		hrv_add_interval(hr_last_ibi_ms(&hr_state),
+				 hr_last_ibi_successive(&hr_state));
+	}
 
 	win_count++;
 
@@ -795,6 +820,7 @@ int main(void)
 	steps_init();
 	sleep_init();
 	calories_init();
+	hrv_init();
 
 	/* Nothing to measure yet: shut the optics down and wait for motion. */
 	ppg_off();

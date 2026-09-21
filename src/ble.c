@@ -24,6 +24,7 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
  *   imu          f0a10003-...   notify
  *   control      f0a10004-...   write
  *   activity     f0a10005-...   read / notify
+ *   hrv          f0a10006-...   read / notify
  */
 #define RING_UUID_BASE(x)	BT_UUID_128_ENCODE(0xf0a10000 | (x), 0x1e5c, \
 						   0x4a2b, 0x8d3f, \
@@ -41,12 +42,15 @@ static const struct bt_uuid_128 uuid_control =
 	BT_UUID_INIT_128(RING_UUID_BASE(4));
 static const struct bt_uuid_128 uuid_activity =
 	BT_UUID_INIT_128(RING_UUID_BASE(5));
+static const struct bt_uuid_128 uuid_hrv =
+	BT_UUID_INIT_128(RING_UUID_BASE(6));
 
 static atomic_t connected_count;
 static atomic_t status_subscribed;
 static atomic_t ppg_subscribed;
 static atomic_t imu_subscribed;
 static atomic_t activity_subscribed;
+static atomic_t hrv_subscribed;
 static atomic_t ppg_stream_on;
 static atomic_t imu_stream_on;
 
@@ -80,6 +84,10 @@ static struct ring_status latest_status;
  */
 static struct k_spinlock activity_lock;
 static struct ring_activity latest_activity;
+
+/* Same pattern again: own lock, tear-safe snapshot for the GATT read. */
+static struct k_spinlock hrv_lock;
+static struct ring_hrv latest_hrv;
 
 static const struct ble_control_cbs *control_cbs;
 static uint32_t ppg_seq;
@@ -165,6 +173,25 @@ static void activity_ccc_changed(const struct bt_gatt_attr *attr,
 				 uint16_t value)
 {
 	atomic_set(&activity_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
+static ssize_t read_hrv(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			void *buf, uint16_t len, uint16_t offset)
+{
+	struct ring_hrv snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&hrv_lock);
+	snapshot = latest_hrv;
+	k_spin_unlock(&hrv_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
+}
+
+static void hrv_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	atomic_set(&hrv_subscribed, value == BT_GATT_CCC_NOTIFY);
 }
 
 /*
@@ -333,6 +360,12 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 			       NULL),
 	BT_GATT_CCC(activity_ccc_changed,
 		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+
+	BT_GATT_CHARACTERISTIC(&uuid_hrv.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ_ENCRYPT, read_hrv, NULL, NULL),
+	BT_GATT_CCC(hrv_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 );
 
 /*
@@ -347,6 +380,7 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
  *   7  imu      decl   8 value   9 CCC
  *  10  control  decl  11 value        (write-only, no CCC)
  *  12  activity decl  13 value  14 CCC
+ *  15  hrv      decl  16 value  17 CCC
  *
  * Pointing at the declaration rather than the value is deliberate and is
  * what bt_gatt_notify() documents: "The attribute object on the parameters
@@ -360,6 +394,7 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 #define ATTR_PPG	(&ring_svc.attrs[4])
 #define ATTR_IMU	(&ring_svc.attrs[7])
 #define ATTR_ACTIVITY	(&ring_svc.attrs[12])
+#define ATTR_HRV	(&ring_svc.attrs[15])
 
 /* --- connection tracking ----------------------------------------------- */
 
@@ -737,6 +772,23 @@ void ble_publish_activity(const struct ring_activity *activity)
 	}
 
 	(void)bt_gatt_notify(NULL, ATTR_ACTIVITY, &snapshot, sizeof(snapshot));
+}
+
+void ble_publish_hrv(const struct ring_hrv *hrv)
+{
+	struct ring_hrv snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&hrv_lock);
+	latest_hrv = *hrv;
+	snapshot = latest_hrv;
+	k_spin_unlock(&hrv_lock, key);
+
+	if (!ble_is_connected() || !atomic_get(&hrv_subscribed)) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, ATTR_HRV, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_imu(int16_t x, int16_t y, int16_t z)

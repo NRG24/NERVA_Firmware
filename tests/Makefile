@@ -14,10 +14,10 @@ CFLAGS  ?= -std=c11 -O1 -g -Wall -Wextra -Werror
 CFLAGS  += -I. -Istubs -I../src
 LDLIBS  += -lm
 
-SRC     := ../src/steps.c ../src/sleep.c ../src/calories.c
+SRC     := ../src/steps.c ../src/sleep.c ../src/calories.c ../src/hrv.c ../src/hr.c
 COMMON  := sim.c $(SRC)
 
-TESTS   := test_activity test_mainloop
+TESTS   := test_activity test_mainloop test_hrv
 
 # Every .c in src/, plus the GATT layout assertions.
 #
@@ -46,6 +46,9 @@ test_activity: test_activity.c $(COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_mainloop: test_mainloop.c $(COMMON)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test_hrv: test_hrv.c $(COMMON)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 run: $(TESTS)

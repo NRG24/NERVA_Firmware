@@ -75,6 +75,7 @@ this service now requires an encrypted link** — see Pairing, below.
 | IMU stream | `f0a10003-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
 | Control | `f0a10004-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Write, Write w/o response | Encrypted write |
 | Activity | `f0a10005-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
+| HRV | `f0a10006-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 
 ### Pairing
 
@@ -321,7 +322,7 @@ about which measurement period they describe.
 **None of this has been validated on hardware.** Steps come from
 peak-detecting the IMU's acceleration magnitude — the same "plausible,
 never checked against a reference" caveat that applies to heart rate in
-section 10 applies here, and more so: a finger-worn ring does not move the
+section 11 applies here, and more so: a finger-worn ring does not move the
 way a wrist or waist does, so even the detector's assumptions about what a
 footstep looks like are unproven on this board. Calories are steps run
 through a standard MET table, which only has a step count from the same
@@ -408,7 +409,80 @@ no notion of wall-clock time to hand you instead.
 
 ---
 
-## 8. Behaviour your app has to expect
+## 8. HRV characteristic
+
+3 bytes, little-endian. Notified alongside Status, so a reading always
+pairs with the `hr_x10` and signal-quality numbers from the same moment.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u16 | `rmssd_x10` | RMSSD in milliseconds x10. **0 means not enough clean beats** |
+| 2 | u8 | `rmssd_beats` | Successive differences behind the value |
+
+`rmssd_beats` is the count of successive differences, so N differences
+come from N+1 consecutive accepted beats. It is published so you can
+apply your own bar: the firmware reports from 10 differences upward,
+which is well under the 30-60 seconds of beats the HRV literature asks
+for. Treat a value with 10-15 behind it as indicative, and wait for 30+
+before showing a number you expect someone to act on.
+
+### What gets counted
+
+Only intervals that passed both of the beat detector's gates:
+
+* the 30-220 bpm plausibility range, which every interval must pass to
+  reach the heart-rate estimate at all, and
+* agreement with the median of the recent intervals.
+
+A difference is only formed between two intervals that were genuinely
+adjacent. A beat that was detected and then rejected still moves the beat
+clock, so the interval following it is measured from a suspect beat — that
+interval starts a new run rather than pairing across the gap. This matters
+more than it sounds: a difference spanning a missed beat is roughly a
+whole interval wide, and it enters the sum squared. Simulated, disabling
+that one rule took a steady pulse train from 0 ms to 144 ms of apparent
+HRV.
+
+### The 10 ms floor, which you should surface
+
+Beats are located to the nearest PPG sample and the PPG runs at 100 sps,
+so **every interval is a multiple of 10 ms**. That quantisation alone puts
+a floor under RMSSD: a metronome-steady heart with no variability at all
+measures about **8.5 ms**, which is measured in `tests/test_hrv.c` rather
+than estimated.
+
+It adds in quadrature, so the error is not uniform:
+
+| True RMSSD | Reads about |
+|---|---|
+| 40 ms | 41 ms |
+| 30 ms | 31 ms |
+| 20 ms | 22 ms |
+| 10 ms | 13 ms |
+
+A relaxed subject is barely affected. Low-HRV readings — stress,
+exertion, illness, exactly the states a user would most want to trust —
+are inflated the most and proportionally the most. Do not present small
+differences between low readings as meaningful.
+
+### It is not a 60-second RMSSD
+
+The power model runs the PPG for 15 s in every 60, which is not enough
+beats for a conventional window, so the ring keeps a rolling window of the
+last 64 successive differences instead. At the default duty cycle that
+window can span several minutes of wall time. No difference is ever
+manufactured across a gap, but the reading is an average over a longer and
+more ragged span than the literature's.
+
+**If you want a reading closer to the textbook definition, buy yourself a
+longer window**: control opcode `0x04` with a 60 s window and a 60 s
+period runs the PPG continuously, and opcode `0x03` forces one immediately.
+Both cost battery — the LEDs are the dominant draw — so do it while the
+user is looking at an HRV screen, not in the background.
+
+---
+
+## 9. Behaviour your app has to expect
 
 **The ring is not always measuring.** By default the optical front end is
 off for 45 seconds out of every 60, and completely off when the ring has
@@ -437,7 +511,7 @@ first detected, so the user gets confirmation without opening the app.
 
 ---
 
-## 9. Connection parameters
+## 10. Connection parameters
 
 The firmware does not request specific connection parameters, so you get
 whatever the phone proposes. Recommendations:
@@ -452,7 +526,7 @@ length extension if your stack exposes it.
 
 ---
 
-## 10. Caveats worth knowing
+## 11. Caveats worth knowing
 
 These are real limitations of the current hardware and firmware, not
 things to paper over in the UI.
@@ -514,7 +588,7 @@ and no bond has ever been cleared.
 
 ---
 
-## 11. Quick start
+## 12. Quick start
 
 1. Scan for service `0x180D`, connect
 2. Request MTU 247
