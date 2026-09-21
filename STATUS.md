@@ -91,6 +91,15 @@ entire stretch. The cliff is the ten consecutive still minutes that onset
 requires; `tests/test_activity.c` pins both ends of it so tuning cannot
 move it unnoticed.
 
+**GSR stream.** Raw ADC counts at 20 Hz on its own characteristic, opcode
+`0x08`, off by default. The 1 Hz `gsr_mv` in the status packet cannot
+resolve a skin conductance response at all -- they peak about 1.4 s after
+onset -- so this exists to find out whether the front end produces
+anything real. Counts rather than millivolts, because the conversion
+constants are board-specific and not yet trusted. It holds `GSR_PWR` on
+for as long as it runs, so it suspends the analog duty cycling; forced off
+on disconnect.
+
 **HRV.** RMSSD over a rolling window of the last 64 successive
 differences, on its own characteristic (`hrv.c`). Only intervals that pass
 the beat detector's plausibility range *and* agree with the recent median
@@ -147,7 +156,10 @@ Ordered by how much it would hurt, not how likely it is.
 
 ## 5. Known-bad and open
 
-* **GSR does not produce a meaningful reading and nobody knows why.** The
+* **GSR does not produce a meaningful reading and nobody knows why**, and
+  the new 20 Hz stream (opcode `0x08`) is the instrument meant to settle
+  it rather than a feature built on top of it. Look at a trace off a real
+  finger before trusting any of it. The
   ADC path had two firmware bugs; one (`zephyr,vref-mv` missing) is fixed
   and alone explains every 0 mV ever seen. The second (SAADC channel index)
   is a hypothesis; the move to channel 0 is made and harmless, and the
@@ -279,7 +291,15 @@ something the next assumes:
    minutes: expect `awake`. Note that a board on a bench passes this test
    perfectly while telling you nothing about a sleeping human — see the
    wear-detection caveat in §5.
-5. **Calories.** Send control opcode `0x06` with a real body weight
+5. **GSR, which is the point of the stream.** Enable it with control
+   opcode `0x08` and record a trace with the electrodes on a finger. Take
+   a deep breath, or have someone clap unexpectedly: a skin conductance
+   response should appear as a rise peaking roughly 1.4 s later. If the
+   trace is flat, or is pure noise with no response shape in it, that is
+   the answer the project has been waiting for since August — write it
+   into `BRINGUP_RESULTS.md` either way. Expect the first notification
+   about a second after enabling; that is the 800 ms front-end settle.
+6. **Calories.** Send control opcode `0x06` with a real body weight
    before believing any number; the default is 70 kg. At rest the total
    should climb about 1.2 kcal per minute for a 70 kg wearer, which is a
    figure you can check against the clock.

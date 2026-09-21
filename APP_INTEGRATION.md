@@ -76,6 +76,7 @@ this service now requires an encrypted link** — see Pairing, below.
 | Control | `f0a10004-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Write, Write w/o response | Encrypted write |
 | Activity | `f0a10005-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 | HRV | `f0a10006-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
+| GSR stream | `f0a10007-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
 
 ### Pairing
 
@@ -246,6 +247,7 @@ Write (with or without response). First byte is the opcode.
 | `0x05` | none | Clear every bond, then disconnect |
 | `0x06` | `u16 weight_kg_x10` | Set body weight for the calorie estimate, little-endian, kilograms x10 (e.g. `700` = 70.0 kg) |
 | `0x07` | none | Reset steps, sleep and calorie counters to zero |
+| `0x08` | `u8 on` | Raw GSR streaming on/off. Powers the analog front end for as long as it runs |
 
 Duty cycle values are clamped in firmware: window 5-300 s, period
 window-3600 s. Defaults are a **15 s window every 60 s**, i.e. 25% duty.
@@ -322,7 +324,7 @@ about which measurement period they describe.
 **None of this has been validated on hardware.** Steps come from
 peak-detecting the IMU's acceleration magnitude — the same "plausible,
 never checked against a reference" caveat that applies to heart rate in
-section 11 applies here, and more so: a finger-worn ring does not move the
+section 12 applies here, and more so: a finger-worn ring does not move the
 way a wrist or waist does, so even the detector's assumptions about what a
 footstep looks like are unproven on this board. Calories are steps run
 through a standard MET table, which only has a step count from the same
@@ -482,7 +484,71 @@ user is looking at an HRV screen, not in the background.
 
 ---
 
-## 9. Behaviour your app has to expect
+## 9. GSR stream
+
+Raw skin conductance, off by default. Enable with control opcode `0x08`.
+
+```
+offset 0   u32  seq          increments per notification, gaps = dropped packets
+offset 4   u8   count        number of samples that follow
+offset 5   i16[count]        raw ADC counts, signed
+```
+
+**Sampled at 20 Hz.** The 1 Hz `gsr_mv` in the status packet exists for a
+diagnostics view and is useless for event detection: a skin conductance
+response peaks roughly 1.4 s after onset, so at 1 Hz you get about one
+sample on the rise. 20 Hz is used rather than 10 so that ordinary jitter
+in the firmware's main loop cannot drop the effective rate below the 10 Hz
+floor where the shape stops being resolvable.
+
+Batches are sized to the **default 23-byte MTU**: seven samples per
+notification, about three notifications a second, always one unfragmented
+packet. Requesting a larger MTU makes the packets no bigger — unlike the
+PPG stream, this one is slow enough not to need it.
+
+**Counts, not millivolts, and deliberately so.** Converting to volts and
+from there to conductance needs `V_REF` and `R5`, which are board-specific
+and — on this revision — not yet trusted. Sending counts keeps that
+calibration on the phone, where you can change it without a firmware
+flash. If you want the firmware's current opinion of the conversion, read
+`gsr_mv` from Status and compare.
+
+### This costs real battery
+
+Enabling the stream holds `GSR_PWR` on continuously, because the front end
+takes **800 ms to settle** and paying that per sample would defeat the
+point. That suspends the analog side's duty cycling entirely for as long
+as the stream runs. Turn it off when the user leaves the screen. It is
+forced off on disconnect, so a phone that walks away cannot leave it
+powered.
+
+The first notification arrives roughly a second after you enable it: 800 ms
+of settle, then seven samples at 20 Hz. That delay is the settle, not a
+fault — and sampling before it completes would return the tail of a
+power-on transient that looks exactly like a large response at the start
+of every recording.
+
+Order does not matter: you may subscribe before or after sending `0x08`.
+Samples taken before you subscribe are simply not sent.
+
+### It is unvalidated, and that is why it exists
+
+**Nobody has confirmed the GSR front end produces a meaningful reading.**
+`STATUS.md` has carried it as "unknown" for the life of the project: the
+analog path had two firmware bugs, one is fixed, the second is a
+hypothesis, and even with the ADC correct, R5 = 91 kΩ against dry skin
+through 2 mm electrodes gives only a 1-10 % swing.
+
+The stream is shipped anyway because **it is the instrument that settles
+the question**. A 1 Hz scalar could never show whether the signal has the
+shape of a real skin conductance response; a 20 Hz trace can. Expect to
+use this for diagnosis before you use it for a feature, and do not build a
+user-facing number on it until a trace off a real finger has been looked
+at.
+
+---
+
+## 10. Behaviour your app has to expect
 
 **The ring is not always measuring.** By default the optical front end is
 off for 45 seconds out of every 60, and completely off when the ring has
@@ -511,7 +577,7 @@ first detected, so the user gets confirmation without opening the app.
 
 ---
 
-## 10. Connection parameters
+## 11. Connection parameters
 
 The firmware does not request specific connection parameters, so you get
 whatever the phone proposes. Recommendations:
@@ -526,7 +592,7 @@ length extension if your stack exposes it.
 
 ---
 
-## 11. Caveats worth knowing
+## 12. Caveats worth knowing
 
 These are real limitations of the current hardware and firmware, not
 things to paper over in the UI.
@@ -588,7 +654,7 @@ and no bond has ever been cleared.
 
 ---
 
-## 12. Quick start
+## 13. Quick start
 
 1. Scan for service `0x180D`, connect
 2. Request MTU 247

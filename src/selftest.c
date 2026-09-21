@@ -449,6 +449,81 @@ static void test_imu(const struct device *i2c)
 }
 #endif /* CONFIG_RING_BENCH */
 
+int gsr_stream_start(void)
+{
+	const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+	int err;
+
+	if (!adc_is_ready_dt(&gsr_adc)) {
+		return -ENODEV;
+	}
+
+	err = adc_channel_setup_dt(&gsr_adc);
+	if (err) {
+		return err;
+	}
+
+	gpio_pin_configure(gpio0, GSR_PWR_PIN, GPIO_OUTPUT_ACTIVE);
+
+	/*
+	 * The one settle for the whole stream. Measured at 0.5-1 s on
+	 * hardware: the output starts near 800 mV and decays to V_REF as
+	 * C14, C4 and C10 charge. Sampling before that returns the tail of
+	 * a power-on transient, which would look exactly like a large skin
+	 * conductance response at the start of every recording.
+	 */
+	k_msleep(800);
+
+	/*
+	 * Claim GSR_PWR so selftest_gsr_mv(), which slow_sense() calls every
+	 * 30 s, stops powering the front end down when it finishes. Without
+	 * this the stream gets a dip at 30 s intervals that is
+	 * indistinguishable from a real event -- the same trap the bench
+	 * monitor documented.
+	 */
+	gsr_pwr_owned = true;
+
+	LOG_INF("GSR stream started (GSR_PWR held on, duty cycling suspended)");
+
+	return 0;
+}
+
+void gsr_stream_stop(void)
+{
+	const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+
+	gsr_pwr_owned = false;
+	gpio_pin_configure(gpio0, GSR_PWR_PIN, GPIO_OUTPUT_INACTIVE);
+
+	LOG_INF("GSR stream stopped");
+}
+
+int gsr_stream_raw(int16_t *raw)
+{
+	int16_t sample = 0;
+	int err;
+	struct adc_sequence seq = {
+		.buffer = &sample,
+		.buffer_size = sizeof(sample),
+	};
+
+	if (raw == NULL) {
+		return -EINVAL;
+	}
+
+	err = adc_sequence_init_dt(&gsr_adc, &seq);
+	if (err == 0) {
+		err = adc_read_dt(&gsr_adc, &seq);
+	}
+	if (err) {
+		return err;
+	}
+
+	*raw = sample;
+
+	return 0;
+}
+
 int selftest_gsr_mv(void)
 {
 	const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));

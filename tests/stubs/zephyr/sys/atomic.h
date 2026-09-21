@@ -3,6 +3,8 @@
 #define ZSTUB_ATOMIC_H_
 #include <stdbool.h>
 typedef long atomic_t;
+/* Zephyr defines this as a plain initialiser, not a call. */
+#define ATOMIC_INIT(i)	(i)
 typedef long atomic_val_t;
 atomic_val_t atomic_set(atomic_t *target, atomic_val_t value);
 atomic_val_t atomic_get(const atomic_t *target);

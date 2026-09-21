@@ -88,6 +88,7 @@ struct ble_control_cbs {
 	void (*set_duty)(uint16_t window_s, uint16_t period_s);
 	void (*set_weight)(uint16_t weight_kg_x10);
 	void (*reset_activity)(void);
+	void (*stream_gsr)(bool on);
 };
 
 int ble_start(void);
@@ -106,7 +107,31 @@ void ble_publish_imu(int16_t x, int16_t y, int16_t z);
 void ble_publish_activity(const struct ring_activity *activity);
 void ble_publish_hrv(const struct ring_hrv *hrv);
 
+/*
+ * Raw GSR, in ADC counts. Sized by the caller to the negotiated MTU --
+ * ble_publish_gsr() caps `count` itself and never fragments.
+ */
+void ble_publish_gsr(const int16_t *samples, uint8_t count);
+
+/* Largest batch that fits an unnegotiated 23-byte MTU: seq(4) + count(1)
+ * + 7 samples x 2 bytes = 19 of the 20 payload bytes.
+ */
+#define GSR_MAX_SAMPLES_DEFAULT_MTU	7
+
 bool ble_ppg_streaming(void);
 bool ble_imu_streaming(void);
+bool ble_gsr_streaming(void);
+
+/*
+ * Whether the app has asked for the GSR stream, regardless of whether it
+ * has subscribed to the characteristic yet.
+ *
+ * The distinction matters here and nowhere else: enabling this stream
+ * powers the analog front end, so the firmware needs to know when to tear
+ * that down. An app that sends the opcode before subscribing would
+ * otherwise have the stream powered up and immediately powered back down.
+ * Cleared on disconnect, so this also catches a phone that walks away.
+ */
+bool ble_gsr_stream_requested(void);
 
 #endif /* BLE_H_ */

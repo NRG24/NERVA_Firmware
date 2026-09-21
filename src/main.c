@@ -146,6 +146,22 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  */
 #define STEP_POLL_HOLD_MS	10000
 
+/* --- GSR stream -------------------------------------------------------- */
+
+/*
+ * Sample interval for the raw GSR stream. Skin conductance responses peak
+ * roughly 1.4 s after onset, so 10 Hz is the floor at which the rise is
+ * resolvable at all; 20 Hz is used so ordinary loop jitter cannot drop the
+ * effective rate below that floor. The stream is opt-in and off by
+ * default, which is what pays for the extra conversions -- and for
+ * GSR_PWR being held on the whole time, which suspends the analog front
+ * end's duty cycling entirely.
+ */
+#define GSR_STREAM_INTERVAL_MS	50
+
+/* Loop cadence needed to hit that interval, whatever state the ring is in. */
+#define GSR_STREAM_POLL_MS	20
+
 enum ring_state {
 	RING_IDLE,
 	RING_MEASURING,
@@ -288,6 +304,17 @@ static atomic_t force_measure;
 static atomic_t activity_reset_pending;
 static atomic_t pending_weight_kg_x10;
 
+/*
+ * Requested GSR stream state, handed over from the BLE callback.
+ *
+ * gsr_stream_start() sleeps 800 ms for the analog front end to settle and
+ * touches the ADC and a GPIO; the control callback runs on the BT RX
+ * thread, where doing any of that would be wrong. -1 means nothing
+ * pending, 0 and 1 are the requested state.
+ */
+static atomic_t gsr_stream_request = ATOMIC_INIT(-1);
+static bool gsr_stream_active;
+
 static uint16_t last_hr_x10;
 static uint16_t battery_mv;
 static int16_t gsr_mv = -1;
@@ -346,6 +373,11 @@ static void cb_reset_activity(void)
 	atomic_set(&activity_reset_pending, 1);
 }
 
+static void cb_stream_gsr(bool on)
+{
+	atomic_set(&gsr_stream_request, on ? 1 : 0);
+}
+
 static const struct ble_control_cbs control_cbs = {
 	.stream_ppg = cb_stream_ppg,
 	.stream_imu = NULL,
@@ -353,6 +385,7 @@ static const struct ble_control_cbs control_cbs = {
 	.set_duty = cb_set_duty,
 	.set_weight = cb_set_weight,
 	.reset_activity = cb_reset_activity,
+	.stream_gsr = cb_stream_gsr,
 };
 
 /* --- status ------------------------------------------------------------ */
@@ -381,6 +414,78 @@ static void publish_status(void)
 	}
 
 	ble_publish_status(&s);
+}
+
+/*
+ * Start, stop and feed the raw GSR stream. Called from the main loop in
+ * every state, because skin conductance has nothing to do with whether the
+ * optical front end happens to be running.
+ *
+ * BLOCKING: the start path sleeps 800 ms for the front end to settle. That
+ * is charged to the watchdog budget by the caller, which feeds immediately
+ * afterwards.
+ */
+static void service_gsr_stream(int64_t now, int64_t *next_sample)
+{
+	static int16_t batch[GSR_MAX_SAMPLES_DEFAULT_MTU];
+	static uint8_t batch_n;
+	atomic_val_t request = atomic_set(&gsr_stream_request, -1);
+
+	if (request == 1 && !gsr_stream_active) {
+		if (gsr_stream_start() == 0) {
+			gsr_stream_active = true;
+			batch_n = 0;
+			*next_sample = now;
+		} else {
+			LOG_ERR("GSR stream could not start");
+		}
+	} else if (request == 0 && gsr_stream_active) {
+		gsr_stream_stop();
+		gsr_stream_active = false;
+		batch_n = 0;
+	}
+
+	/*
+	 * A phone that walks away without turning the stream off would
+	 * otherwise leave the analog front end powered until the battery
+	 * died; the stream flag is cleared on disconnect.
+	 *
+	 * Deliberately NOT ble_gsr_streaming(), which also requires the CCC
+	 * subscription: an app that sends the opcode before subscribing
+	 * would have the front end powered up and then torn straight back
+	 * down on the very next pass.
+	 */
+	if (gsr_stream_active && !ble_gsr_stream_requested()) {
+		gsr_stream_stop();
+		gsr_stream_active = false;
+		batch_n = 0;
+		return;
+	}
+
+	if (!gsr_stream_active || now < *next_sample) {
+		return;
+	}
+
+	*next_sample = now + GSR_STREAM_INTERVAL_MS;
+
+	int16_t raw = 0;
+
+	if (gsr_stream_raw(&raw) != 0) {
+		return;
+	}
+
+	batch[batch_n++] = raw;
+
+	/*
+	 * Publish a full batch only. At the default MTU that is seven
+	 * samples, so a notification every 350 ms -- comfortably inside one
+	 * unfragmented packet, which is the whole reason the batch is sized
+	 * against the default rather than the negotiated MTU.
+	 */
+	if (batch_n >= ARRAY_SIZE(batch)) {
+		ble_publish_gsr(batch, batch_n);
+		batch_n = 0;
+	}
 }
 
 /*
@@ -673,6 +778,7 @@ int main(void)
 	int64_t next_slow = 0;
 	int64_t next_imu_retry = 0;
 	int64_t next_activity_min = 0;
+	int64_t next_gsr_sample = 0;
 	int64_t window_started = 0;
 	int64_t last_motion = 0;
 	int64_t last_step_motion = 0;
@@ -900,6 +1006,8 @@ int main(void)
 		 *                     it never stacks with ppg_off() in the same
 		 *                     pass. On its own: ~0.5 s FIFO + ~0.5 s this
 		 *                     read = 1.0 s, under the 1.5 s figure above.
+		 *   GSR stream start: 0.8 s settle inside gsr_stream_start(),
+		 *                     once per stream, fed straight after
 		 *   idle, IMU retry : ~1.5 s imu_init() (fed straight after)
 		 *
 		 * ~4.5 s against the 10 s budget. Both ppg_off() and imu_init()
@@ -940,6 +1048,10 @@ int main(void)
 					w / 10U, w % 10U);
 			}
 		}
+
+		/* --- raw GSR stream, checked in every state --- */
+		service_gsr_stream(now, &next_gsr_sample);
+		ring_wdt_feed();	/* the start path holds 800 ms */
 
 		/* --- charger, checked in every state --- */
 		if (now >= next_pmic) {
@@ -1099,7 +1211,10 @@ int main(void)
 
 		switch (state) {
 		case RING_CHARGING:
-			k_msleep(200);
+			/* Skin conductance does not care that the ring is on
+			 * a charger, so the stream keeps its cadence here.
+			 */
+			k_msleep(ble_gsr_streaming() ? GSR_STREAM_POLL_MS : 200);
 			break;
 
 		case RING_IDLE: {
@@ -1276,6 +1391,7 @@ int main(void)
 					(now - last_step_motion) < STEP_POLL_HOLD_MS;
 
 				k_msleep(ble_imu_streaming() ? 20
+					 : ble_gsr_streaming() ? GSR_STREAM_POLL_MS
 					 : maybe_walking ? STEP_POLL_MS
 					 : IDLE_POLL_MS);
 			}
