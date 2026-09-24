@@ -1,8 +1,9 @@
+75f8320025e984b2b6d63dadb78eb987e4381b4301382db75fd99604689a389a *release/led-test-2026-09-23.hex
 5bab20692564bf01905194a21b7d8d08815e128f71ee39c1ccf954a78f1655f0 *release/ring-fw-v0.1-bench-greenled.hex
 3dfee000c4db49a2a88264c68e240693fbfb3892852b8f42764e178cae389997 *release/ring-fw-v0.1-bench-noled.hex
 0f0188c4fa215930118cb4bbff5ad6bdb0beb76f2088842ddfd61e520a2b35ef *release/ring-fw-v0.2-phase1-bench.hex
 65a14c86c6738a7cb8940763a740ce1b15fc5dfdb3c5566bca33382bc473dde4 *release/ring-fw-v0.2-phase1-production.hex
 72c13b736fec29c920bfc274b8af31041f9e46b9ed265ed605242a5e127381f1 *release/ring-fw-v0.3-bench.hex
 4304a848eae9331637964fe18549c99191cb266743fb6395875061ff56fe1c7a *release/ring-fw-v0.3-production.hex
-0c186f976df203281a3b2b58aad4070e72f4c7d1bc73e968e01f6b2d231a1035 *release/ring-fw-v0.4-bench.hex
-ab86ebd637b80b61e8e4e439fb114197f389a46fc81a2f16839c1d797bcce5ce *release/ring-fw-v0.4-production.hex
+7644455297997ad4a6cb52d18e1f13778ffeeb2b5f7198f037d20a50c52dc87d *release/ring-fw-v0.4-bench.hex
+60500d40a3ddcaa6b6be57b2dd00ff48df60ae299d06597788ad8f74a847c5bf *release/ring-fw-v0.4-production.hex

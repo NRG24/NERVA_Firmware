@@ -4,7 +4,7 @@
  * Board wiring taken from Netlist_New_Switch_2_2026-08-21.asc:
  *   U3  MAXM86161   I2C 0x62, VLED from the 5V boost, LDO_EN strapped to 1V8
  *   U4  LSM6DSV16BX I2C 0x6b, INT1 -> P0.16
- *   U6  BQ25120A    I2C 0x6a, CD -> P1.09
+ *   U6  BQ25120A    I2C 0x6a, CD -> P1.00 (P1.09 before the 2026-09-23 board)
  *   U1  TPS61240    5V boost, BOOST_EN on P0.12
  *   U5  ANNA-B402   SCL P0.14, SDA P0.20
  *

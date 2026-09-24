@@ -69,8 +69,14 @@ LOG_MODULE_REGISTER(selftest, LOG_LEVEL_INF);
 #define GSR_ADC_PIN		3
 /* ACC_INT = U5.36 = GPIO_36 = P0.16 */
 #define ACC_INT_PIN		16
-/* CD (charge detect from BQ25120A E2) = U5.13 = GPIO_13 = P1.09 */
-#define CD_PIN			9
+/*
+ * CD (BQ25120A E2) = U5.16 = GPIO_16 = P1.00 on the 2026-09-23 board.
+ *
+ * It was U5.13 = P1.09 on the 2026-08-21 board. Driving the old pin on the
+ * new board leaves CD floating on its 900k pull-down, the PMIC drops into
+ * Hi-Z and its I2C goes silent -- exactly the -5 seen on first bring-up.
+ */
+#define CD_PIN			0
 
 /*
  * Set once the live monitor is driving GSR_PWR. Without this, slow_sense()
@@ -94,7 +100,7 @@ static int reg_read(const struct device *i2c, uint8_t addr, uint8_t reg,
  * On battery only (VIN < VUVLO) the BQ25120A sits in High Impedance mode
  * while CD is low, and in Hi-Z its I2C interface is switched off
  * (datasheet 9.3.2, Table 1). CD has a 900k internal pull-down, so leaving
- * P1.09 as an input guarantees Hi-Z and a silent PMIC. Drive CD high for
+ * CD as an input guarantees Hi-Z and a silent PMIC. Drive CD high for
  * Active Battery mode, which is also what you want for normal running.
  *
  * Note the trade: with a charger attached, CD high disables charging. Drop
@@ -1020,7 +1026,7 @@ static void test_pins(void)
 	cd = gpio_pin_get_raw(gpio1, CD_PIN);
 	acc_int = gpio_pin_get_raw(gpio0, ACC_INT_PIN);
 
-	LOG_INF("PINS  CD (P1.09) = %d [%s],  ACC_INT (P0.16) = %d",
+	LOG_INF("PINS  CD (P1.00) = %d [%s],  ACC_INT (P0.16) = %d",
 		cd, cd ? "Active Battery, I2C enabled" : "Hi-Z, PMIC I2C OFF",
 		acc_int);
 }

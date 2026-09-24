@@ -27,6 +27,34 @@ image. Rebuild either with `git checkout v0.1-bench`, then set
 
 ---
 
+## 2026-09-23 board -- first contact, and what it showed
+
+**`led-test-2026-09-23.hex`** is a standalone MAXM86161 test, not the ring
+firmware. It writes every LED register, reads each one back, and cycles
+green -> red -> IR -> dark at ~61 mA peak, 4 s each, logging over RTT. It
+enables the chip's LED-compliance flag, so each line says outright whether
+LED current is flowing (`LED_COMPB=1` means it is not). Flash it on the next
+board and read the log -- that answers "hardware or firmware" for the LED
+without anyone having to argue about it. Put a finger on the sensor: a
+working LED reads far above the dark phase.
+
+On the first 2026-09-23 board: SWD unlock and flash worked first time, the
+MAXM86161 enumerated (PART_ID 0x36), every register verified, the chip ran
+-- and no light was seen. The compliance flag was not yet enabled then, so
+that run could not say why. The photodiode reading of ~0 is **not** proof
+either way: into open air there may be nothing to reflect.
+
+**CD moved** from U5.13 (P1.09) to U5.16 (P1.00) on this board. The v0.4
+hexes in this directory are now built with CD on P1.00; on the older board
+use a v0.1-v0.4.1 build from git. Driving the old pin is why the PMIC read
+-5 on first contact.
+
+GSR was confirmed on this board: AIN1 reads ~505 mV at V_REF, and every
+SAADC channel index reads the same, so the channel index was never the
+fault. The missing `zephyr,vref-mv` was the whole story.
+
+---
+
 ## v0.4.1 -- NOT YET RUN ON HARDWARE
 
 BLE security, plus the eight fixes an adversarial review of v0.4 turned up.
