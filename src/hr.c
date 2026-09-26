@@ -126,6 +126,11 @@ bool hr_finger_present(const struct hr *hr)
 	return hr->primed && hr->baseline >= FINGER_DC_MIN;
 }
 
+bool hr_primed(const struct hr *hr)
+{
+	return hr->primed;
+}
+
 /* Median is far more robust than a mean here: one dicrotic-notch false
  * beat or one dropped beat skews an average badly, but barely moves a
  * median.

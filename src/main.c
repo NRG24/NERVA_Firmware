@@ -23,6 +23,11 @@
  *
  * The phone can override the duty cycle or force a window at any time via
  * the Ring Service control characteristic. See APP_INTEGRATION.md.
+ *
+ * The one deliberate hole in that model is the sleep wear check: while a
+ * sleep session is open, IDLE opens a short PPG window anyway, because
+ * stillness alone cannot tell a sleeping hand from a nightstand. See
+ * "Sleep wear checks" below for the cost and the reasoning.
  */
 
 #include "ble.h"
@@ -49,6 +54,16 @@
 #include <stdlib.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+/*
+ * sleep.c's verdict goes straight out on the wire as ring_activity.wear_state,
+ * so the two numberings have to agree. They are declared apart on purpose --
+ * ble.h is the wire contract and must not depend on a sensing module -- which
+ * is exactly the arrangement that drifts silently. Not here.
+ */
+BUILD_ASSERT((int)SLEEP_WEAR_UNKNOWN == RING_WEAR_UNKNOWN);
+BUILD_ASSERT((int)SLEEP_WEAR_WORN == RING_WEAR_WORN);
+BUILD_ASSERT((int)SLEEP_WEAR_NOT_WORN == RING_WEAR_NOT_WORN);
 
 #define VLED_BOOST	DEVICE_DT_GET(DT_NODELABEL(vled_boost))
 #define I2C_BUS		DEVICE_DT_GET(DT_NODELABEL(i2c0))
@@ -118,6 +133,114 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  * timer and wait for the IMU interrupt instead.
  */
 #define STILL_TIMEOUT_MS	180000
+
+/* --- sleep wear checks -------------------------------------------------- */
+
+/*
+ * Sleep wear checks: why the power model has a hole in it.
+ *
+ * sleep.c decides "asleep" from stillness, and stillness cannot tell a
+ * sleeping hand from a nightstand. A ring left beside the bed logs a full
+ * night -- confirmed in simulation, not a hypothesis. The only wear signal
+ * this board has is the PPG DC level (hr.c: ~2,860 with nothing on the
+ * sensor against ~53,000 on skin, measured, one of the few things actually
+ * proven here), and a ring that is off a finger stops finding one, stops
+ * refreshing last_motion, and goes stale under STILL_TIMEOUT_MS about three
+ * minutes later -- after which nothing opens a window and there is nothing
+ * to read. The sensor switches itself off precisely when the answer would
+ * have been interesting.
+ *
+ * Three ways out were on the table:
+ *
+ *   1. Sample the PPG anyway, a few seconds at a time, while a session is
+ *      open. Costs LED current at night, which is what the whole idle model
+ *      exists to avoid, but it is the only option that produces evidence
+ *      rather than a guess.
+ *   2. Require some minimum micro-movement per session -- a worn ring
+ *      twitches, a table does not. Free, and an invented threshold: nothing
+ *      here has ever been compared against a sleeping person, and the
+ *      failure mode is rejecting the nights of whoever sleeps most still.
+ *      This codebase does not ship uncalibrated heuristics as measurements
+ *      (STATUS.md, R5/R5a), so no.
+ *   3. Say nothing and let the app work it out. Cheapest and honest, but
+ *      the app has no wear signal of its own either, so it amounts to
+ *      relabelling the bug.
+ *
+ * Taken: 1 for the evidence, 3 for what is done with it. The ring spends
+ * the LED current to take a real reading, and then reports the reading
+ * instead of acting on it -- a session that fails the check is still
+ * reported as sleep, with the verdict and the raw check counts alongside
+ * it. Suppressing it in firmware would trade a false positive the app can
+ * filter for a false negative nobody can see, and FINGER_DC_MIN was
+ * measured with a finger pressed against a bench sensor, never with a ring
+ * worn loosely on a sleeping hand.
+ *
+ * WHAT IT COSTS. Less than it looks, and the reason is worth reading,
+ * because it also corrects something the documentation had wrong.
+ *
+ * STILL_TIMEOUT_MS is not a stillness timeout. last_motion is refreshed by
+ * hr_finger_present() in every ordinary window (see RING_MEASURING), so a
+ * ring that is WORN never goes stale however still the wearer is: it keeps
+ * its 15 s-in-60 duty cycle right through the night. What actually goes
+ * stale is a ring that is OFF a finger, which stops finding one, stops
+ * refreshing last_motion, and falls silent about three minutes later.
+ *
+ * So the front end is already running during a worn night, and the sessions
+ * that need corroborating are exactly the ones nothing is looking at. The
+ * check is therefore paid for by the case it catches:
+ *
+ *   worn, 8 h    at most one extra 6 s window per session, and usually
+ *                none -- the scheduled windows answer the question on
+ *                their way out anyway. Simulated across 38 duty-cycle
+ *                phases: LED time changed by -9 s to +0 s. (Negative
+ *                because a 6 s wear window pushes next_window out like
+ *                any other, so it sometimes displaces a 15 s scheduled
+ *                one. That is lost heart rate, not a saving.)
+ *
+ *   nightstand,  16 windows x 6 s = ~96 s of LED1 per night, against the
+ *   8 h          ~12 s the same night cost before. At PPG_LED_PA (0x80),
+ *                ~15.4 mA off the 5 V rail, that is ~0.41 mAh at 5 V, or
+ *                ~0.65 mAh referred to a 3.7 V cell at an ASSUMED 85 %
+ *                boost efficiency, before the AFE's own draw.
+ *
+ * Against a battery NOBODY HAS EVER CHARACTERISED, so what fraction of a
+ * night that is remains unknown -- on a 15 mAh cell, a few percent. The
+ * arithmetic is arithmetic: the efficiency is assumed, the AFE current is
+ * unknown, and the window counts come from scratchpad/sim_sleep_wear.c,
+ * which models this policy rather than running this code. Measure it on the
+ * first board that works and move
+ * CONFIG_RING_SLEEP_WEAR_CHECK_INTERVAL_MIN against a real number.
+ *
+ * The number that should worry you is not this one. A worn night already
+ * costs ~5,745 s of LED -- roughly 39 mAh at the cell under the same
+ * assumptions -- because of the duty cycle described above. That is
+ * pre-existing, it is sixty times this, and it is STATUS.md R13.
+ */
+#if defined(CONFIG_RING_SLEEP_WEAR_CHECK)
+#define WEAR_CHECK_ENABLED	1
+#define WEAR_CHECK_INTERVAL_MS	\
+	((uint32_t)CONFIG_RING_SLEEP_WEAR_CHECK_INTERVAL_MIN * 60000U)
+#define WEAR_CHECK_WINDOW_MS	\
+	((uint32_t)CONFIG_RING_SLEEP_WEAR_CHECK_WINDOW_MS)
+#else
+/*
+ * Deliberately 0/0 rather than #ifdef'd out of the code below. Everything
+ * that uses these folds away at WEAR_CHECK_ENABLED == 0 but still gets
+ * compiled, so the disabled configuration cannot rot -- which is what
+ * happened to main.c.bench when a build variant stopped being compiled.
+ */
+#define WEAR_CHECK_ENABLED	0
+#define WEAR_CHECK_INTERVAL_MS	0U
+#define WEAR_CHECK_WINDOW_MS	0U
+#endif
+
+/*
+ * Shortest window whose DC reading is worth recording. Matches the ~4 s
+ * settling figure MEASURE_WINDOW_MS is sized around; a window cut shorter
+ * than this -- by a failing sensor, or by an app that set a very short duty
+ * cycle -- is recorded as "could not check", never as "not worn".
+ */
+#define WEAR_SETTLE_MS		4000
 
 /* --- pedometer sampling ------------------------------------------------ */
 
@@ -606,6 +729,9 @@ static void publish_activity(void)
 		.sleep_session_min = sleep_session_minutes(),
 		.sleep_total_min = sleep_total_minutes(),
 		.restless_min = sleep_restless_minutes(),
+		.wear_state = (uint8_t)sleep_wear_state(),
+		.wear_checks = sleep_wear_checks(),
+		.wear_confirmed = sleep_wear_confirmed(),
 	};
 
 	ble_publish_activity(&a);
@@ -821,7 +947,7 @@ static int ppg_probe(int attempts, int gap_ms)
 	return -ENODEV;
 }
 
-static int ppg_on(void)
+static int ppg_on(bool wear_only)
 {
 	int err = regulator_enable(VLED_BOOST);
 
@@ -850,8 +976,15 @@ static int ppg_on(void)
 	 * Latch the mode for this whole window. Red+IR and green are
 	 * different FIFO layouts, so report() has to know which one it is
 	 * decoding, and that answer must not change under it mid-window.
+	 *
+	 * A sleep wear check is always green, whatever the app asked for.
+	 * Its verdict is read from hr_state, which a red/IR window never
+	 * feeds, so an SpO2 wear check could only ever come back "could not
+	 * look" -- and FINGER_DC_MIN, the one threshold behind the verdict,
+	 * was measured on the green channel. It is also one LED instead of
+	 * two, in the middle of the night.
 	 */
-	spo2_window = ble_spo2_mode();
+	spo2_window = !wear_only && ble_spo2_mode();
 
 	if (spo2_window) {
 		err = maxm86161_start_spo2(&ppg, SPO2_IR_PA, SPO2_RED_PA);
@@ -957,6 +1090,11 @@ int main(void)
 	int64_t last_step_motion = 0;
 	uint32_t steps_at_last_min = 0;
 	bool waiting_for_finger = false;
+	/* True while the open window exists only to sample wear for sleep.c --
+	 * it runs short and must not be mistaken for the ring being handled.
+	 * See the last_motion guard in RING_MEASURING.
+	 */
+	bool wear_check_window = false;
 
 	LOG_INF("ring firmware starting");
 	report_reset_cause();
@@ -1187,6 +1325,16 @@ int main(void)
 		 * ~4.5 s against the 10 s budget. Both ppg_off() and imu_init()
 		 * stop at their first failed write rather than grinding through
 		 * every register, which is what keeps those two bounded.
+		 *
+		 * The sleep wear check adds no new blocking call and does not
+		 * move this number. It opens a window through the same ppg_on()
+		 * already counted on the "window opening" line, and everything
+		 * it adds on top -- sleep_wear_check_due(), sleep_note_wear*(),
+		 * hr_finger_present() -- is arithmetic on values already in RAM,
+		 * with no I2C behind any of it. What it does change is how OFTEN
+		 * that 4.5 s worst case can be reached: a window can now open
+		 * while the ring is still, which STILL_TIMEOUT_MS previously
+		 * ruled out. Same peak, more chances at it.
 		 *
 		 * Add a blocking call longer than the remaining margin and either
 		 * put a feed beside it or raise CONFIG_RING_WATCHDOG_TIMEOUT_MS.
@@ -1547,21 +1695,59 @@ int main(void)
 
 			bool forced = atomic_cas(&force_measure, 1, 0);
 			bool stale = (now - last_motion) > STILL_TIMEOUT_MS;
+			bool scheduled = (now >= next_window) && !stale;
 
-			if (forced || (now >= next_window && !stale)) {
-				if (ppg_on() == 0) {
+			/*
+			 * The one thing that opens a window while the ring is
+			 * still. `stale` is deliberately not consulted: a
+			 * sleeping hand is still by definition, so gating this
+			 * on motion would only ever check the sessions that did
+			 * not need checking. See "Sleep wear checks" above.
+			 */
+			bool wear_due = WEAR_CHECK_ENABLED &&
+				sleep_wear_check_due(now,
+						     WEAR_CHECK_INTERVAL_MS);
+
+			/*
+			 * A wear check yields to any other reason to be
+			 * measuring. A forced or scheduled window is longer,
+			 * already answers the same question at its close, and
+			 * has a caller waiting on it -- so a wear check only
+			 * shapes the window when it is the sole reason for
+			 * opening one.
+			 */
+			bool wear_only = wear_due && !forced && !scheduled;
+
+			if (forced || scheduled || wear_due) {
+				if (ppg_on(wear_only) == 0) {
 					state = RING_MEASURING;
 					window_started = now;
-					waiting_for_finger = !forced;
+					wear_check_window = wear_only;
+					waiting_for_finger = !forced && !wear_only;
 					/* Each window gets its own budget of
 					 * accelerometer retries.
 					 */
 					act_fail_count = 0;
 					LOG_INF("state -> %s%s", state_name[state],
-						forced ? " (app requested)" : "");
+						forced ? " (app requested)"
+						: wear_only ? " (sleep wear check)"
+						: "");
 					publish_all();
 				} else {
 					next_window = now + measure_period_ms;
+
+					/*
+					 * Restart the interval so a PPG that
+					 * cannot be brought up is retried once
+					 * per interval instead of on every pass
+					 * through this loop -- each attempt is a
+					 * boost enable and, on a stalled bus, up
+					 * to a 4 s probe. Records no verdict:
+					 * "could not look" is not "saw nothing".
+					 */
+					if (wear_due) {
+						sleep_note_wear_unavailable(now);
+					}
 				}
 			} else {
 				/*
@@ -1612,6 +1798,11 @@ int main(void)
 					subsystem_flags &= ~RING_FLAG_PPG_OK;
 					state = RING_IDLE;
 					next_window = now + measure_period_ms;
+					/* The window died before it could say
+					 * anything about wear. No-op unless a
+					 * sleep session is open.
+					 */
+					sleep_note_wear_unavailable(now);
 					publish_all();
 					break;
 				}
@@ -1674,12 +1865,44 @@ int main(void)
 			if (spo2_window ? spo2_finger_present()
 					: hr_finger_present(&hr_state)) {
 				waiting_for_finger = false;
-				last_motion = now;
+
+				/*
+				 * A wear check must NOT refresh last_motion,
+				 * and this is the whole reason wear_check_window
+				 * exists.
+				 *
+				 * last_motion is what STILL_TIMEOUT_MS measures,
+				 * so touching it here would clear `stale` -- and
+				 * a ring that is genuinely worn passes this test
+				 * on every wear check. The night would then look
+				 * like continuous motion to the power model, the
+				 * ordinary 15 s-in-60 duty cycle would resume,
+				 * and confirming that the ring is worn would cost
+				 * two orders of magnitude more LED time than the
+				 * check itself. The wearer is asleep; their hand
+				 * has not moved. Finding skin in front of the
+				 * sensor is not evidence that it did.
+				 *
+				 * Any other window keeps the old behaviour: a
+				 * finger found during a scheduled or app-forced
+				 * window really does mean the ring is in use.
+				 */
+				if (!wear_check_window) {
+					last_motion = now;
+				}
 			}
+
+			/*
+			 * A wear check runs only as long as the DC tracker needs
+			 * to settle; it is not trying to find a heart rate.
+			 */
+			uint32_t window_len = wear_check_window
+					    ? WEAR_CHECK_WINDOW_MS
+					    : measure_window_ms;
 
 			bool give_up = waiting_for_finger &&
 				(now - window_started) > NO_FINGER_TIMEOUT_MS;
-			bool done = (now - window_started) >= measure_window_ms;
+			bool done = (now - window_started) >= window_len;
 
 			/* Keep measuring as long as the app wants raw data. */
 			if (ble_ppg_streaming()) {
@@ -1688,11 +1911,52 @@ int main(void)
 			}
 
 			if (done || give_up) {
+				/*
+				 * Every window answers the wear question on its
+				 * way out, not just the ones opened to ask it --
+				 * a scheduled or app-forced window that happens
+				 * to land inside a sleep session has the reading
+				 * already and it costs nothing to keep. Read
+				 * before ppg_off() so it is plainly the value the
+				 * window produced.
+				 *
+				 * Judged once, at the close, never latched from
+				 * a sample partway through: hr_update() primes
+				 * its DC tracker to the very first raw sample, so
+				 * a startup transient can read as a finger for a
+				 * moment. By the end of the window the tracker
+				 * has settled and the reading means something.
+				 *
+				 * hr_primed() is the difference between "the
+				 * sensor was empty" and "the sensor never
+				 * reported". A window whose FIFO comes back
+				 * empty for its whole length leaves hr_state
+				 * untouched, and an empty read is not a failed
+				 * one, so it never trips PPG_FAIL_LIMIT either:
+				 * without this it would be recorded as a
+				 * confident "not worn" produced by no data at
+				 * all.
+				 *
+				 * Both calls no-op unless a sleep session is
+				 * open, so nothing here disturbs ordinary use.
+				 */
+				bool settled = (now - window_started) >=
+					       WEAR_SETTLE_MS;
+
+				if (settled && hr_primed(&hr_state)) {
+					sleep_note_wear(
+						hr_finger_present(&hr_state), now);
+				} else {
+					sleep_note_wear_unavailable(now);
+				}
+
 				ppg_off();
 				state = RING_IDLE;
 				next_window = now + measure_period_ms;
 				LOG_INF("state -> %s%s", state_name[state],
-					give_up ? " (no finger)" : "");
+					give_up ? " (no finger)"
+					: wear_check_window ? " (wear check done)"
+					: "");
 				publish_all();
 			} else {
 				k_msleep(POLL_INTERVAL_MS);

@@ -85,8 +85,8 @@ static void test_wire_format(void)
 {
 	sim_section("wire format (must match APP_INTEGRATION.md section 7)");
 
-	CHECK(sizeof(struct ring_activity) == 17,
-	      "ring_activity is %zu bytes, documented as 17",
+	CHECK(sizeof(struct ring_activity) == 20,
+	      "ring_activity is %zu bytes, documented as 20",
 	      sizeof(struct ring_activity));
 
 	/* Must stay inside a default 23-byte ATT MTU (3 bytes of header). */
@@ -104,6 +104,12 @@ static void test_wire_format(void)
 	      "restless_min offset");
 	CHECK(offsetof(struct ring_activity, sleep_state) == 16,
 	      "sleep_state offset");
+	CHECK(offsetof(struct ring_activity, wear_state) == 17,
+	      "wear_state offset");
+	CHECK(offsetof(struct ring_activity, wear_checks) == 18,
+	      "wear_checks offset");
+	CHECK(offsetof(struct ring_activity, wear_confirmed) == 19,
+	      "wear_confirmed offset");
 }
 
 /* --- steps ------------------------------------------------------------- */

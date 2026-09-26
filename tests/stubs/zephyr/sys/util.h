@@ -12,7 +12,7 @@
 #define TEST_STUB_ZEPHYR_SYS_UTIL_H_
 
 /*
- * ARG_UNUSED and __packed really come from Zephyr's toolchain headers,
+ * ARG_UNUSED, __packed and BUILD_ASSERT really come from Zephyr's toolchain headers,
  * which util.h pulls in. They are here so one -Istubs covers both the
  * behavioural tests and the syntax check.
  */
@@ -21,6 +21,9 @@
 #endif
 #ifndef __packed
 #define __packed	__attribute__((packed))
+#endif
+#ifndef BUILD_ASSERT
+#define BUILD_ASSERT(expr, ...)	_Static_assert(expr, "" __VA_ARGS__)
 #endif
 
 #define MAX(a, b)	(((a) > (b)) ? (a) : (b))

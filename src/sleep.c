@@ -52,6 +52,22 @@
  */
 #define FEED_GAP_LIMIT_MS	15000
 
+/*
+ * Negative wear checks needed before a session is called SLEEP_WEAR_NOT_WORN.
+ *
+ * Two, not one. A single empty reading is not only produced by a ring on a
+ * table: a ring that has rotated so the sensor sits off the pad, or one worn
+ * loosely enough to break optical contact for a few seconds, reads empty too,
+ * and the worn-at-rest DC level has never been measured on this board (only
+ * a finger pressed against a bench sensor has). A second check one interval
+ * later costs one more window and turns "the sensor saw nothing once" into
+ * "the sensor has seen nothing for half an hour", which a hand does not do
+ * and a nightstand does.
+ *
+ * A positive needs no such dwell and gets none -- see SLEEP_WEAR_WORN.
+ */
+#define WEAR_NEGATIVE_CONFIRM	2
+
 struct sleep_state {
 	bool primed;
 
@@ -67,6 +83,15 @@ struct sleep_state {
 
 	uint16_t session_minutes;
 	uint16_t restless_minutes;
+
+	/* Wear corroboration for the current or last session. Saturating,
+	 * because the counts are u8 on the wire and a session long enough to
+	 * overflow one is already past any question of what it means.
+	 */
+	bool wear_checked;
+	int64_t wear_check_ms;
+	uint8_t wear_checks;
+	uint8_t wear_confirmed;
 
 	uint32_t total_minutes;
 };
@@ -164,6 +189,91 @@ static void end_session(uint16_t provisional_sleep, uint16_t provisional_restles
 	sl.active_run = 0;
 }
 
+/* --- wear corroboration ------------------------------------------------ */
+
+bool sleep_wear_check_due(int64_t now_ms, uint32_t interval_ms)
+{
+	if (!sl.asleep) {
+		return false;
+	}
+
+	if (!sl.wear_checked) {
+		return true;
+	}
+
+	/*
+	 * Signed on purpose. now_ms going backwards relative to the stored
+	 * stamp cannot happen from k_uptime_get(), but this module is fed
+	 * whatever the caller passes, and unsigned arithmetic would turn a
+	 * small backwards step into an enormous elapsed time and a check on
+	 * every pass -- the LEDs held on, at night, which is the one failure
+	 * this whole mechanism must not have.
+	 */
+	return (now_ms - sl.wear_check_ms) >= (int64_t)interval_ms;
+}
+
+static void record_check(int64_t now_ms)
+{
+	sl.wear_checked = true;
+	sl.wear_check_ms = now_ms;
+}
+
+void sleep_note_wear(bool worn, int64_t now_ms)
+{
+	if (!sl.asleep) {
+		return;
+	}
+
+	record_check(now_ms);
+
+	if (sl.wear_checks < UINT8_MAX) {
+		sl.wear_checks++;
+	}
+
+	if (worn && sl.wear_confirmed < UINT8_MAX) {
+		sl.wear_confirmed++;
+	}
+}
+
+void sleep_note_wear_unavailable(int64_t now_ms)
+{
+	if (!sl.asleep) {
+		return;
+	}
+
+	/*
+	 * The interval restarts but no counter moves. A check that could not
+	 * be taken is not a check that found nothing: counting it would let a
+	 * dead PPG talk itself into SLEEP_WEAR_NOT_WORN after
+	 * WEAR_NEGATIVE_CONFIRM failures and declare every session a
+	 * nightstand.
+	 */
+	record_check(now_ms);
+}
+
+enum sleep_wear sleep_wear_state(void)
+{
+	if (sl.wear_confirmed > 0) {
+		return SLEEP_WEAR_WORN;
+	}
+
+	if (sl.wear_checks >= WEAR_NEGATIVE_CONFIRM) {
+		return SLEEP_WEAR_NOT_WORN;
+	}
+
+	return SLEEP_WEAR_UNKNOWN;
+}
+
+uint8_t sleep_wear_checks(void)
+{
+	return sl.wear_checks;
+}
+
+uint8_t sleep_wear_confirmed(void)
+{
+	return sl.wear_confirmed;
+}
+
 static void evaluate_minute(int32_t peak_dev_mg, uint32_t steps_in_minute)
 {
 	bool minute_still = (peak_dev_mg < SLEEP_STILL_MG) &&
@@ -189,6 +299,21 @@ static void evaluate_minute(int32_t peak_dev_mg, uint32_t steps_in_minute)
 			sl.session_minutes = SLEEP_ONSET_MINUTES;
 			sl.restless_minutes = 0;
 			sl.total_minutes += SLEEP_ONSET_MINUTES;
+
+			/*
+			 * A new session, so the last one's evidence no longer
+			 * applies -- cleared here rather than when a session
+			 * ends, which is what leaves the verdict readable
+			 * after a wake (see sleep_wear_state()).
+			 *
+			 * wear_checked false makes the first check due
+			 * immediately, so the app hears something about a new
+			 * session within one window rather than one interval.
+			 */
+			sl.wear_checked = false;
+			sl.wear_check_ms = 0;
+			sl.wear_checks = 0;
+			sl.wear_confirmed = 0;
 		}
 		return;
 	}

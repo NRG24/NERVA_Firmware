@@ -319,10 +319,15 @@ write [0x07]
 
 ## 7. Activity characteristic
 
-17 bytes, little-endian. Steps, sleep and calories, all derived from the
-accelerometer only — there is no independent sensor for any of these.
-Readable at any time; notified alongside Status, so the two never disagree
-about which measurement period they describe.
+20 bytes, little-endian. Steps, sleep and calories come from the
+accelerometer alone; the three wear fields come from the PPG. Readable at
+any time; notified alongside Status, so the two never disagree about which
+measurement period they describe.
+
+> **This grew from 17 bytes to 20 in v0.5.** The first 17 bytes are
+> unchanged, so an app that reads the old layout keeps working and simply
+> ignores the new fields. It is still one unfragmented notification at the
+> default 23-byte ATT MTU.
 
 | Offset | Type | Field | Notes |
 |---|---|---|---|
@@ -333,6 +338,45 @@ about which measurement period they describe.
 | 12 | u16 | `sleep_total_min` | Minutes asleep since boot or the last reset |
 | 14 | u16 | `restless_min` | Minutes of motion during the current/last session that did not end it |
 | 16 | u8 | `sleep_state` | 0 awake, 1 asleep |
+| 17 | u8 | `wear_state` | 0 unknown, 1 worn, 2 not worn — see below |
+| 18 | u8 | `wear_checks` | Wear checks taken during this session, saturating at 255 |
+| 19 | u8 | `wear_confirmed` | How many of those found a hand, saturating at 255 |
+
+### Wear corroboration
+
+Stillness cannot tell a sleeping hand from a nightstand, so while a sleep
+session is open the ring briefly powers the PPG — a 6 s window every 30
+minutes by default — purely to read the DC level and answer "is this on a
+hand?". That is the same signal `ppg_dc` and the finger flag in section 3
+are built on, and it is one of the few things ever actually measured on
+this board: ~2,800 with nothing on the sensor against ~53,000 on skin.
+
+| `wear_state` | Means | Reached when |
+|---|---|---|
+| 0 unknown | No usable evidence either way | Fewer than two checks have landed, or the PPG did not answer. **Not a synonym for "not worn"** |
+| 1 worn | At least one check saw skin | Any single positive. One is enough — there is a factor of five between an empty sensor and the threshold |
+| 2 not worn | Nothing on the sensor, twice running | Two or more checks, none positive |
+
+`wear_checks` and `wear_confirmed` are there so you can weigh the verdict
+instead of taking it. "Worn on 1 of 14" and "worn on 14 of 14" both report
+`worn`, and they do not mean the same thing — the first looks like a ring
+taken off shortly after going to bed.
+
+**The ring does not act on this, and neither should it.** A session that
+fails the check is still reported as sleep and its minutes are still in
+`sleep_total_min`. The threshold was measured with a finger pressed against
+a bench sensor, never with a ring worn loosely on a sleeping hand, so a
+genuinely worn night *can* read as `not worn` — a loose ring, or one that
+rotated off the pad. Suppressing sessions in firmware would hide that where
+nobody could ever see it. Filtering is yours to do, with the counts in hand.
+
+Both lifetimes are the same as `restless_min`: cleared when a new session
+starts, not when one ends, so you can still read the verdict for the night
+after the wearer gets up.
+
+Turning it off (`CONFIG_RING_SLEEP_WEAR_CHECK=n`) makes every session report
+`unknown`, except where a window opened for some other reason happened to
+land inside one.
 
 **None of this has been validated on hardware.** Steps come from
 peak-detecting the IMU's acceleration magnitude — the same "plausible,
@@ -364,14 +408,15 @@ confirmed in simulation rather than hypothetical:
   restless sleeper who shifts every few minutes may never register a
   session at all.
 
-* **A ring that is not being worn logs sleep too.** A ring on a
-  nightstand is perfectly still, so it scores as the deepest sleep the
-  algorithm can report. The only wear signal on this board is the PPG DC
-  level, and the power model deliberately stops opening PPG windows after
-  three minutes without motion — precisely the case that would need
-  checking. An eight-hour "session" with `restless_min == 0` and no steps
-  on either side of it is far more likely to be a bedside table than a
-  night's sleep; corroborate before showing it.
+* **A ring that is not being worn still logs sleep — but now it says so.**
+  A ring on a nightstand is perfectly still, and stillness is the only
+  signal the sleep *tracker* has. `wear_state` above is the corroboration:
+  a nightstand session settles on `not worn` about half an hour after
+  onset. Gate on it rather than on stillness heuristics of your own.
+  Where `wear_state` is `unknown` — a dead PPG, or a session too short for
+  two checks — the old advice still applies: an eight-hour "session" with
+  `restless_min == 0` and no steps on either side of it is far more likely
+  to be a bedside table than a night's sleep.
 * **Gentle motion is not counted.** The detector needs roughly a ±100 mg
   swing in acceleration magnitude. Slow, smooth walking that never reaches
   that — and any stepping done with the hand in a pocket or resting on a
@@ -645,9 +690,22 @@ range.
 ## 11. Behaviour your app has to expect
 
 **The ring is not always measuring.** By default the optical front end is
-off for 45 seconds out of every 60, and completely off when the ring has
-been still for 3 minutes. That is deliberate — the LEDs plus the 5 V boost
-dominate power draw.
+off for 45 seconds out of every 60. That is deliberate — the LEDs plus the
+5 V boost dominate power draw.
+
+What shuts it down entirely is the ring coming **off a finger**, not the
+ring being still. Finding a finger during a window refreshes the motion
+timeout, so a ring that is worn keeps its 15 s-in-60 duty cycle however
+motionless the wearer is, all night. A ring that is off a hand stops
+finding one and falls silent about three minutes later, until the
+accelerometer wakes it.
+
+> Earlier revisions of this document said the ring stopped probing after
+> three minutes of stillness. That was wrong, in the direction that costs
+> battery rather than data. If you are budgeting power for a worn night,
+> budget for ~20 % duty, and consider sending opcode `0x04` to widen the
+> period before bed. The sleep wear check in section 7 rides on those
+> existing windows and adds essentially nothing while the ring is worn.
 
 Consequences:
 

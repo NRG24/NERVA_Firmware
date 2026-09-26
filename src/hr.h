@@ -88,6 +88,18 @@ int32_t hr_amplitude(const struct hr *hr);
 /* True when the DC level says something is on the sensor. */
 bool hr_finger_present(const struct hr *hr);
 
+/*
+ * True once at least one sample has been fed since hr_init().
+ *
+ * hr_finger_present() answers false both for "the sensor is empty" and for
+ * "nothing has been measured yet", and those are not the same claim. A
+ * window that starts the part successfully but reads an empty FIFO for its
+ * whole length -- which does not trip the FIFO error path, because an empty
+ * read is not a failed one -- would otherwise look exactly like a ring on a
+ * table. main.c separates the two before recording a sleep wear verdict.
+ */
+bool hr_primed(const struct hr *hr);
+
 /* Tracked DC level. Finger-on should raise this a lot; the threshold has
  * to come from measuring this board, not from a guess.
  */
