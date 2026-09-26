@@ -23,8 +23,10 @@
 #include <zephyr/sys/util.h>	/* the stub under tests/stubs */
 #include "ble.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* --- feeding helpers --------------------------------------------------- */
 
@@ -110,6 +112,23 @@ static void test_wire_format(void)
 	      "wear_checks offset");
 	CHECK(offsetof(struct ring_activity, wear_confirmed) == 19,
 	      "wear_confirmed offset");
+
+	/* APP_INTEGRATION.md section 11, the Workout characteristic. */
+	CHECK(sizeof(struct ring_workout) == 16,
+	      "ring_workout is %zu bytes, documented as 16",
+	      sizeof(struct ring_workout));
+	CHECK(offsetof(struct ring_workout, type) == 1, "workout type offset");
+	CHECK(offsetof(struct ring_workout, minutes) == 2, "minutes offset");
+	CHECK(offsetof(struct ring_workout, hr_minutes) == 4,
+	      "hr_minutes offset");
+	CHECK(offsetof(struct ring_workout, rest_minutes) == 6,
+	      "rest_minutes offset");
+	CHECK(offsetof(struct ring_workout, fallback_minutes) == 8,
+	      "fallback_minutes offset");
+	CHECK(offsetof(struct ring_workout, avg_hr_x10) == 10,
+	      "avg_hr_x10 offset");
+	CHECK(offsetof(struct ring_workout, kcal_x1000) == 12,
+	      "workout kcal offset");
 }
 
 /* --- steps ------------------------------------------------------------- */
@@ -620,6 +639,235 @@ static void test_calories_do_not_depend_on_tick_phase(void)
 	      "expected roughly 22", mid_walk / 1000, mid_walk % 1000);
 }
 
+/* --- workouts ----------------------------------------------------------- */
+
+/* The published equations, in floating point, straight from the paper. */
+static double keytel_kcal(double hr, double kg, double age, int sex)
+{
+	double m = -55.0969 + 0.6309 * hr + 0.1988 * kg + 0.2017 * age;
+	double f = -20.4022 + 0.4472 * hr - 0.1263 * kg + 0.0740 * age;
+	double kj = sex == CAL_SEX_MALE ? m
+		  : sex == CAL_SEX_FEMALE ? f : (m + f) / 2.0;
+
+	return kj > 0 ? kj / 4.184 : 0;
+}
+
+static void test_keytel_matches_the_paper(void)
+{
+	int worst = 0;
+	int cases = 0;
+
+	sim_section("workout: integer Keytel matches the published equations");
+
+	/* One worked by hand: 30 y, 70 kg man at 150 bpm.
+	 * -55.0969 + 94.635 + 13.916 + 6.051 = 59.505 kJ/min = 14.222 kcal/min.
+	 */
+	calories_init();
+	calories_set_weight(700);
+	calories_set_body(30, CAL_SEX_MALE);
+	CHECK(abs((int)calories_keytel_x1000(1500) - 14222) <= 2,
+	      "70 kg, 30 y man at 150 bpm: %u, worked by hand as 14222",
+	      calories_keytel_x1000(1500));
+
+	for (int sex = 0; sex <= 2; sex++) {
+		for (int kg = 45; kg <= 130; kg += 17) {
+			for (int age = 18; age <= 78; age += 12) {
+				for (int hr = 90; hr <= 190; hr += 10) {
+					calories_init();
+					calories_set_weight((uint16_t)(kg * 10));
+					calories_set_body((uint8_t)age, (uint8_t)sex);
+
+					double want = keytel_kcal(hr, kg, age, sex)
+						      * 1000.0;
+					int got = (int)calories_keytel_x1000(
+						(uint16_t)(hr * 10));
+					int err = abs(got - (int)lround(want));
+
+					if (err > worst) {
+						worst = err;
+					}
+					cases++;
+				}
+			}
+		}
+	}
+	/* 1/1000 kcal from integer truncation, nothing more. */
+	CHECK(worst <= 2, "worst disagreement with the paper: %d kcal/1000",
+	      worst);
+	printf("    worst disagreement over %d cases: %d kcal/1000\n", cases,
+	       worst);
+
+	/* No age given: 35. No sex given: the mean of the two equations. */
+	calories_init();
+	calories_set_weight(700);
+	CHECK(abs((int)calories_keytel_x1000(1400) -
+		  (int)lround(keytel_kcal(140, 70, 35, 0) * 1000)) <= 2,
+	      "defaults are not age 35 / mean of both equations");
+}
+
+static void test_rowing_is_seen_by_heart_rate(void)
+{
+	struct calories_workout w;
+
+	sim_section("workout: rowing costs what heart rate says, not what steps say");
+
+	/* 30 minutes on a rowing machine: no steps at all, HR 140. */
+	calories_init();
+	calories_set_weight(800);
+	calories_set_body(40, CAL_SEX_MALE);
+	calories_workout_start(WORKOUT_ROW);
+	for (int m = 0; m < 30; m++) {
+		calories_update_minute_hr(0, 1400);
+	}
+	calories_workout_get(&w);
+
+	uint32_t per_min = w.kcal_x1000 / 30;
+	uint32_t want = (uint32_t)lround(keytel_kcal(140, 80, 40, CAL_SEX_MALE)
+					 * 1000);
+
+	CHECK(abs((int)per_min - (int)want) <= 2,
+	      "rowing minute %u, Keytel says %u", per_min, want);
+	CHECK(w.minutes == 30 && w.hr_minutes == 30,
+	      "%u minutes, %u priced by HR, wanted 30/30", w.minutes,
+	      w.hr_minutes);
+	CHECK(w.avg_hr_x10 == 1400, "average HR %u, wanted 1400", w.avg_hr_x10);
+	printf("    30 min rowing at 140 bpm, 80 kg: %u kcal "
+	       "(the step formula alone: %u)\n",
+	       w.kcal_x1000 / 1000, 30 * 1400 / 1000);
+
+	/* The same half hour outside a workout is billed as sitting still. */
+	calories_init();
+	calories_set_weight(800);
+	for (int m = 0; m < 30; m++) {
+		calories_update_minute_hr(0, 1400);
+	}
+	CHECK(calories_total_x1000() == 30 * 1400,
+	      "outside a workout heart rate must be ignored: %u, wanted %u",
+	      calories_total_x1000(), 30 * 1400);
+}
+
+static void test_workout_minute_paths(void)
+{
+	struct calories_workout w;
+	uint32_t before;
+
+	sim_section("workout: each minute takes the right path");
+
+	/* Below 90 bpm: the step formula, and counted as rest. */
+	calories_init();
+	calories_set_weight(700);
+	calories_workout_start(WORKOUT_OTHER);
+	calories_update_minute_hr(0, 850);
+	calories_workout_get(&w);
+	CHECK(w.kcal_x1000 == 1225, "85 bpm minute cost %u, wanted rest 1225",
+	      w.kcal_x1000);
+	CHECK(w.rest_minutes == 1 && w.hr_minutes == 0,
+	      "85 bpm counted as %u rest / %u HR", w.rest_minutes, w.hr_minutes);
+
+	/* No heart rate: the activity's MET. Rowing 7.0 x 70 kg x 0.0175. */
+	calories_init();
+	calories_set_weight(700);
+	calories_workout_start(WORKOUT_ROW);
+	calories_update_minute_hr(0, 0);
+	calories_workout_get(&w);
+	CHECK(w.kcal_x1000 == 8575, "no-HR rowing minute cost %u, wanted 8575",
+	      w.kcal_x1000);
+	CHECK(w.fallback_minutes == 1, "no-HR minute not counted as fallback");
+
+	/* ...but never below what the steps say (running, 170 spm -> 5.0). */
+	calories_init();
+	calories_set_weight(700);
+	calories_workout_start(WORKOUT_OTHER);	/* fallback 5.0 */
+	calories_update_minute_hr(170, 0);
+	calories_workout_get(&w);
+	CHECK(w.kcal_x1000 == 6125, "no-HR 170 spm minute cost %u, wanted 6125",
+	      w.kcal_x1000);
+
+	/* A low-reading HR during a visible run is floored at the steps. */
+	calories_init();
+	calories_set_weight(700);
+	calories_set_body(30, CAL_SEX_FEMALE);
+	calories_workout_start(WORKOUT_RUN);
+	calories_update_minute_hr(170, 950);
+	calories_workout_get(&w);
+	CHECK(w.kcal_x1000 >= 6125,
+	      "95 bpm while running at 170 spm cost %u, below the step price",
+	      w.kcal_x1000);
+
+	/* An absurd HR is capped, not believed. */
+	calories_init();
+	calories_set_weight(2500);
+	calories_set_body(100, CAL_SEX_MALE);
+	calories_workout_start(WORKOUT_RUN);
+	calories_update_minute_hr(0, 2500);
+	calories_workout_get(&w);
+	CHECK(w.kcal_x1000 == WORKOUT_MAX_KCAL_X1000,
+	      "250 bpm at 250 kg cost %u, wanted the %u cap", w.kcal_x1000,
+	      WORKOUT_MAX_KCAL_X1000);
+
+	/* Workout calories are part of the day's total too. */
+	calories_init();
+	calories_set_weight(700);
+	calories_update_minute_hr(0, 0);
+	before = calories_total_x1000();
+	calories_workout_start(WORKOUT_CYCLE);
+	calories_update_minute_hr(0, 1300);
+	calories_workout_get(&w);
+	CHECK(calories_total_x1000() == before + w.kcal_x1000,
+	      "total %u is not rest %u + workout %u", calories_total_x1000(),
+	      before, w.kcal_x1000);
+}
+
+static void test_workout_lifecycle(void)
+{
+	struct calories_workout w;
+
+	sim_section("workout: start, stop, restart");
+
+	calories_init();
+	calories_set_weight(700);
+	calories_workout_start(WORKOUT_RUN);
+	calories_update_minute_hr(0, 1500);
+	calories_workout_stop();
+	calories_workout_get(&w);
+	CHECK(!w.active && w.minutes == 1 && w.kcal_x1000 > 0,
+	      "a stopped workout lost its figures");
+
+	/* After stopping, minutes no longer count toward it. */
+	calories_update_minute_hr(0, 1500);
+	calories_workout_get(&w);
+	CHECK(w.minutes == 1, "a stopped workout kept counting (%u)", w.minutes);
+
+	/* Starting again begins from zero. */
+	calories_workout_start(WORKOUT_ROW);
+	calories_workout_get(&w);
+	CHECK(w.active && w.minutes == 0 && w.kcal_x1000 == 0 &&
+	      w.type == WORKOUT_ROW, "a new workout inherited the last one");
+
+	/* Starting while running changes the type and keeps the figures. */
+	calories_update_minute_hr(0, 1500);
+	calories_workout_start(WORKOUT_CYCLE);
+	calories_workout_get(&w);
+	CHECK(w.minutes == 1 && w.type == WORKOUT_CYCLE,
+	      "re-start mid-workout: %u minutes, type %u", w.minutes, w.type);
+
+	/* NONE stops; an unknown type is OTHER. */
+	calories_workout_start(WORKOUT_NONE);
+	CHECK(!calories_workout_active(), "WORKOUT_NONE did not stop");
+	calories_workout_start(200);
+	calories_workout_get(&w);
+	CHECK(w.active && w.type == WORKOUT_OTHER,
+	      "unknown type 200 read as %u, wanted OTHER", w.type);
+
+	/* Body data is clamped and sanitised. */
+	calories_set_body(3, 9);
+	CHECK(calories_age_years() == 10 && calories_sex() == CAL_SEX_UNSPECIFIED,
+	      "age 3 / sex 9 stored as %u / %u", calories_age_years(),
+	      calories_sex());
+	calories_set_body(0, CAL_SEX_FEMALE);
+	CHECK(calories_age_years() == 0, "age 0 must stay \"not given\"");
+}
+
 int main(void)
 {
 	printf("activity module tests\n");
@@ -645,6 +893,11 @@ int main(void)
 
 	test_calorie_arithmetic();
 	test_calories_do_not_depend_on_tick_phase();
+
+	test_keytel_matches_the_paper();
+	test_rowing_is_seen_by_heart_rate();
+	test_workout_minute_paths();
+	test_workout_lifecycle();
 
 	return sim_report("test_activity");
 }

@@ -50,6 +50,8 @@ anything newer as a bring-up, not an update.
 | SpO2 percentage | **UNCALIBRATED, and flagged as such on the wire** | the R-to-SpO2 curve is a literature default; fitting it needs desaturation against a reference oximeter |
 | Red and IR LEDs ever lit | **Never** | only the green LED has run on hardware; the two-slot sequence is compile-verified only |
 | Activity characteristic (steps/sleep/calories over BLE) | **Never exercised by any phone** | same as the rest of the Ring Service, see row above |
+| Workout calorie arithmetic (Keytel) | **Verified against the definition** | `tests/test_activity.c` compares the integer pipeline to the published equations in floating point over 1,188 cases |
+| Workout calories against a real person | **Unvalidated** | rests on finger PPG heart rate during exercise, which nobody has measured; a rowing grip squeezes the finger under the sensor |
 | Sleep wear check reaches the right verdict | **Simulated only** | `scratchpad/sim_sleep_wear.c`, 137 checks; compiles `sleep.c` for real, models `main.c` |
 | The DC threshold the wear check rests on, for a ring worn at rest | **Never measured** | 53,000 was a finger pressed on a bench sensor, not a ring on a sleeping hand — see §5 |
 
@@ -94,6 +96,20 @@ three stop dead in `CHARGING`, which reads no accelerometer: a ring on a
 charger is not a ring being worn, and none of them pretend otherwise.
 
 **All three are unvalidated, like heart rate** (§2, §5).
+
+**Workouts.** Steps cannot see rowing, cycling, or most of what separates
+a jog from a run, so the app can start a workout (opcode `0x0B`, with a
+type: running, rowing, cycling, other). During one the PPG stays on and
+each minute is priced from its mean heart rate with the Keytel et al.
+(2005) equations, which take heart rate, weight, age and sex (opcode
+`0x0A`, saved to flash beside weight). A minute under 90 bpm is priced
+from steps, and one with no usable heart rate from the activity's
+Compendium MET. Separate counts of each kind of minute are published so
+the app can tell a measurement from a guess. Nothing detects exercise
+automatically, so the everyday power budget is unchanged. A workout
+ends itself after four hours, closes its window after two minutes without
+a finger, and ends when a charger is attached. Wire format:
+`APP_INTEGRATION.md` §11.
 
 **Sleep wear check.** Sleep used to have no wear detection at all: a ring on
 a nightstand is perfectly still and logged a full night. It now corroborates
@@ -199,6 +215,7 @@ Ordered by how much it would hurt, not how likely it is.
 | R11 | **Bench probe uses the bus-wedging bare read.** Only in `-Bench` builds. | Certain in bench | MAXM86161 stops answering until bus idles | production has no bare read; see `POSTMORTEM.md` |
 | R12 | **Battery "percent" over BAS is a voltage bar,** not state of charge. | Certain | wrong mid-range | app should use `battery_mv` from the status packet |
 | R13 | **A worn ring measures 15 s in every 60 indefinitely,** including all night. `last_motion` is refreshed by finding a finger, so `STILL_TIMEOUT_MS` never fires while the ring is on a hand. Eight hours is ~5,745 s of LED — order 39 mAh at the cell under §5's assumptions, which is more than a plausible ring battery holds. | Certain (by design, and nobody noticed) | battery flat by morning | not touched here — it is a duty-cycle decision that needs a characterised battery first. The app can already drop the night-time duty cycle with opcode `0x04`. Found by the simulation in §5 |
+| R14 | **A workout holds the PPG on continuously,** about 15 mA plus the boost, on a battery nobody has characterised. A long session may flatten it. | Certain when used | ring dies mid-workout or soon after | bounded, not solved: four-hour cap, window closes after two minutes with no finger, charger ends it. Measure real draw during a workout before promising a session length |
 
 ---
 
@@ -277,10 +294,10 @@ Ordered by how much it would hurt, not how likely it is.
   accumulate its own totals, watching `uptime_s` in the status packet to
   spot a reboot — `APP_INTEGRATION.md` §7 spells out how. Revisit once
   NVS has demonstrably worked on real hardware.
-  **Body weight is the exception** (`profile.c`): it is saved under
-  `ring/weight` in the bonds' partition, written only when the app sends a
-  different value and at most once a minute, so it adds a handful of
-  2-byte writes over the ring's life to a partition that pairing already
+  **Body weight, age and sex are the exception** (`profile.c`): they are
+  saved under `ring/weight` and `ring/body` in the bonds' partition,
+  written only when the app sends a different value and at most once a
+  minute, so they add a handful of 2-byte writes over the ring's life to a partition that pairing already
   writes. That is why it was worth doing ahead of R3 when the counters were
   not. It is equally unproven on hardware: the check is in §7, item 7.
 * **No RTC**, so sleep sessions are durations from `k_uptime_get()`, not
@@ -439,9 +456,15 @@ something the next assumes:
    before believing any number; the default is 70 kg. At rest the total
    should climb about 1.2 kcal per minute for a 70 kg wearer, which is a
    figure you can check against the clock. Then prove the weight is
-   saved: wait for `body weight saved: xx.x kg` on RTT, power-cycle the
-   ring, and look for `body weight restored: xx.x kg` at boot. That one
-   reboot is also the first evidence NVS works on this board at all (R3).
+   saved: wait for `profile saved: weight` on RTT, power-cycle the ring,
+   and look for `body weight restored: xx.x kg` at boot. That one reboot
+   is also the first evidence NVS works on this board at all (R3).
+8. **Workouts.** Send `0x0A` with an age and sex, then `0x0B 01` and walk
+   briskly or jog. RTT prints `workout: min N, HR ...` each minute with
+   how that minute was priced. First check that the heart rate holds up
+   while moving at all: the split between HR, rest and fallback minutes
+   is the thing to record. Then compare HR against a chest strap on the
+   same run, and try a rowing machine to see what the grip does to it.
 
 Numbers worth recording in `BRINGUP_RESULTS.md` when you do: the step
 count against a hand count, the magnitude swing a real walking finger

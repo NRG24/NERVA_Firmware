@@ -1,15 +1,16 @@
 /*
  * The wearer's profile, kept in flash so a reboot does not forget it.
  *
- * Today that is body weight and nothing else: the one input the calorie
- * estimate needs that the ring cannot measure. It used to live only in
- * calories.c's RAM, so every reboot -- a watchdog reset, a flat battery,
+ * Body weight, and the age and sex the workout formula needs: the inputs
+ * to the calorie estimate that the ring cannot measure. Weight used to
+ * live only in calories.c's RAM, so every reboot -- a watchdog reset, a flat battery,
  * a reflash -- quietly put the wearer back at the 70 kg default, and the
  * estimate stayed wrong until the app happened to notice the reboot and
  * send the weight again. Nothing on the wire says which weight is in use,
  * so an app that missed the reboot had no way to find out.
  *
- * Stored through Zephyr's settings subsystem under "ring/weight", in the
+ * Stored through Zephyr's settings subsystem under "ring/weight" (u16,
+ * kg x10) and "ring/body" (u8 age, u8 sex code from calories.h), in the
  * same NVS partition that already holds the BLE bonds (prj.conf). No new
  * partition, no new Kconfig.
  *
@@ -17,7 +18,7 @@
  * is tested on a host with no Zephyr at all; flash belongs here.
  *
  * Main-thread only, like the activity modules: the BLE control callback
- * hands the weight over through an atomic in main.c, and only the main
+ * hands values over through atomics in main.c, and only the main
  * loop calls in. settings_load() -- which is what delivers the saved value
  * -- also runs on the main thread, from ble_start().
  */
@@ -60,8 +61,13 @@ bool profile_saved_weight(uint16_t *kg_x10);
  */
 void profile_note_weight(uint16_t kg_x10);
 
+/* The same pair for age and sex, stored as calories.h's codes. */
+bool profile_saved_body(uint8_t *age_years, uint8_t *sex);
+void profile_note_body(uint8_t age_years, uint8_t sex);
+
 /*
- * Write a pending weight if one is due. Call every pass of the main loop.
+ * Write whatever is pending, if a write is due. Call every pass of the
+ * main loop.
  *
  * A failed write is logged and retried after the same interval rather
  * than on every pass: a partition that will not take a write now will not

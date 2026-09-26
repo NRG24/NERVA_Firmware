@@ -109,6 +109,18 @@ expected table is transcribed from the pre-refactor driver rather than
 generated from the current code, which is what makes it a check rather
 than a tautology.
 
+### `test_activity` — workout calories
+
+Checks the integer Keytel implementation against the published equations
+in floating point, for both sexes and the unspecified mean, over 1,188
+combinations of heart rate, weight and age: the worst disagreement is
+1/1000 kcal. Then the three minute paths (heart rate, rest, fallback), the
+floor at the step price and the 20 kcal/min cap, that heart rate is
+ignored outside a workout, and start/stop/restart. It shows rowing at
+140 bpm coming out near 410 kcal for half an hour where steps alone
+say 42. It proves the arithmetic, not that the ring's heart rate is
+right during exercise.
+
 ### `test_profile` — body weight in flash
 
 Fakes the settings backend with a one-key "flash" that counts writes and
@@ -159,6 +171,9 @@ the fix was reverted and the suite confirmed to fail:
 | `test_spo2` channel order | Red and IR swapped in the ratio, which inverts R with no error anywhere. |
 | `test_driver` green path | The two-slot refactor changing a register on the one configuration proven on hardware. |
 | `test_driver` slot order | IR and red swapped in the LED sequence, which inverts R via the FIFO tags instead. |
+| `test_activity` Keytel vs paper | A mistyped coefficient in either equation. |
+| `test_activity` workout paths | The 90 bpm threshold, the step-price floor, or heart rate leaking into non-workout minutes. |
+| `test_profile` body record | Age and sex written under the weight's key, overwriting it. |
 | `test_profile` rate limit | Writing flash on every pass while a value is pending — every weight change, and every retry after a failure. |
 | `test_profile` dedupe | Rewriting an unchanged weight on every connection, which the app is told to send. |
 | `test_profile` junk in flash | A wrong-size record failing `settings_load()`, which would cost the ring its radio. |

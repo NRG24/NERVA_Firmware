@@ -30,11 +30,17 @@ void profile_test_reset(void);
 
 /* --- fake flash -------------------------------------------------------- */
 
-static struct {
+#define FLASH_SLOTS	4
+
+struct slot {
 	char key[32];
 	uint8_t val[8];
 	size_t len;
 	bool present;
+};
+
+static struct {
+	struct slot slot[FLASH_SLOTS];
 
 	int writes;
 	int fail_with;		/* nonzero: settings_save_one returns this */
@@ -42,17 +48,44 @@ static struct {
 
 int settings_save_one(const char *name, const void *value, size_t val_len)
 {
+	struct slot *free_slot = NULL;
+
 	if (flash.fail_with) {
 		return flash.fail_with;
 	}
 
-	snprintf(flash.key, sizeof(flash.key), "%s", name);
-	memcpy(flash.val, value, val_len);
-	flash.len = val_len;
-	flash.present = true;
+	for (int i = 0; i < FLASH_SLOTS; i++) {
+		struct slot *sl = &flash.slot[i];
+
+		if (sl->present && strcmp(sl->key, name) == 0) {
+			free_slot = sl;
+			break;
+		}
+		if (!sl->present && !free_slot) {
+			free_slot = sl;
+		}
+	}
+	if (!free_slot) {
+		return -28;
+	}
+
+	snprintf(free_slot->key, sizeof(free_slot->key), "%s", name);
+	memcpy(free_slot->val, value, val_len);
+	free_slot->len = val_len;
+	free_slot->present = true;
 	flash.writes++;
 
 	return 0;
+}
+
+static const struct slot *flash_find(const char *name)
+{
+	for (int i = 0; i < FLASH_SLOTS; i++) {
+		if (flash.slot[i].present && strcmp(flash.slot[i].key, name) == 0) {
+			return &flash.slot[i];
+		}
+	}
+	return NULL;
 }
 
 int settings_name_steq(const char *name, const char *key, const char **next)
@@ -117,10 +150,15 @@ static int load_key(const char *subkey, const void *data, size_t len)
 static void reboot(void)
 {
 	profile_test_reset();
-	if (flash.present) {
-		CHECK(strcmp(flash.key, "ring/weight") == 0,
-		      "stored under \"%s\", wanted \"ring/weight\"", flash.key);
-		(void)load_key("weight", flash.val, flash.len);
+	for (int i = 0; i < FLASH_SLOTS; i++) {
+		const struct slot *sl = &flash.slot[i];
+
+		if (!sl->present) {
+			continue;
+		}
+		CHECK(strncmp(sl->key, "ring/", 5) == 0,
+		      "stored under \"%s\", outside \"ring/\"", sl->key);
+		(void)load_key(sl->key + 5, sl->val, sl->len);
 	}
 }
 
@@ -331,6 +369,50 @@ static void test_clamped_value_is_saved(void)
 	CHECK(calories_weight_kg_x10() == 2500, "restore did not apply");
 }
 
+static void test_body_record(void)
+{
+	uint8_t age = 0, sex = 0;
+	uint16_t w = 0;
+
+	sim_section("age and sex are saved beside the weight, independently");
+	wipe_flash();
+
+	CHECK(!profile_saved_body(&age, &sex), "claimed a body record on empty flash");
+
+	/* The app sends all three together; one pass writes both records. */
+	profile_note_weight(640);
+	profile_note_body(41, CAL_SEX_FEMALE);
+	profile_service(0);
+	CHECK(flash.writes == 2, "%d writes for weight + body, wanted 2",
+	      flash.writes);
+	CHECK(flash_find("ring/body") != NULL, "no ring/body key in flash");
+
+	reboot();
+	CHECK(profile_saved_body(&age, &sex) && age == 41 &&
+	      sex == CAL_SEX_FEMALE, "restored age %u sex %u, wanted 41 / 1",
+	      age, sex);
+	CHECK(profile_saved_weight(&w) && w == 640,
+	      "weight %u lost alongside the body record", w);
+
+	/* Changing only age rewrites only that record. */
+	flash.writes = 0;
+	profile_note_weight(640);
+	profile_note_body(42, CAL_SEX_FEMALE);
+	profile_service(PROFILE_SAVE_MIN_INTERVAL_MS);
+	CHECK(flash.writes == 1, "%d writes for an age change, wanted 1",
+	      flash.writes);
+
+	/* Wrong size is skipped like the weight's. */
+	wipe_flash();
+	{
+		uint8_t three[3] = { 30, 2, 0 };
+
+		CHECK(load_key("body", three, sizeof(three)) == 0,
+		      "3-byte body record failed the load");
+	}
+	CHECK(!profile_saved_body(&age, &sex), "accepted a 3-byte body record");
+}
+
 int main(void)
 {
 	printf("Profile persistence tests\n");
@@ -344,6 +426,7 @@ int main(void)
 	test_failed_write();
 	test_backwards_time();
 	test_clamped_value_is_saved();
+	test_body_record();
 
 	return sim_report("test_profile");
 }

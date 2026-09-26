@@ -128,6 +128,28 @@ struct ring_spo2 {
 	uint8_t flags;
 } __packed;
 
+/*
+ * Workout payload: the figures for the workout the app started with
+ * opcode 0x0B, or the last one once it has stopped. Its own
+ * characteristic for the same reason as HRV -- Activity is full.
+ *
+ * The three minute counts say how each minute was priced (see
+ * calories.h): from heart rate, from steps because the heart rate was
+ * low, or from the activity's typical MET because there was no usable
+ * heart rate. They add up to `minutes`. A workout that is mostly
+ * fallback minutes is mostly a guess, and an app should say so.
+ */
+struct ring_workout {
+	uint8_t active;			/* 1 while running */
+	uint8_t type;			/* WORKOUT_* from calories.h */
+	uint16_t minutes;
+	uint16_t hr_minutes;
+	uint16_t rest_minutes;
+	uint16_t fallback_minutes;
+	uint16_t avg_hr_x10;		/* over hr_minutes; 0 = none */
+	uint32_t kcal_x1000;		/* this workout only */
+} __packed;
+
 /* Callbacks the phone can trigger by writing to the control characteristic. */
 struct ble_control_cbs {
 	void (*stream_ppg)(bool on);
@@ -138,6 +160,8 @@ struct ble_control_cbs {
 	void (*reset_activity)(void);
 	void (*stream_gsr)(bool on);
 	void (*spo2_mode)(bool on);
+	void (*set_body)(uint8_t age_years, uint8_t sex);
+	void (*workout)(uint8_t type);	/* 0 = stop */
 };
 
 int ble_start(void);
@@ -156,6 +180,7 @@ void ble_publish_imu(int16_t x, int16_t y, int16_t z);
 void ble_publish_activity(const struct ring_activity *activity);
 void ble_publish_hrv(const struct ring_hrv *hrv);
 void ble_publish_spo2(const struct ring_spo2 *spo2);
+void ble_publish_workout(const struct ring_workout *workout);
 
 /*
  * Raw GSR, in ADC counts. Sized by the caller to the negotiated MTU --

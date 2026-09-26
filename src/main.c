@@ -28,6 +28,11 @@
  * sleep session is open, IDLE opens a short PPG window anyway, because
  * stillness alone cannot tell a sleeping hand from a nightstand. See
  * "Sleep wear checks" below for the cost and the reasoning.
+ *
+ * The other is a workout the app has started (opcode 0x0B): the PPG then
+ * stays on for the whole session, because heart rate is what prices
+ * exercise the step counter cannot see. See WORKOUT_MAX_MS for the limits
+ * that stop a forgotten workout draining the battery.
  */
 
 #include "ble.h"
@@ -457,6 +462,52 @@ static atomic_t activity_reset_pending;
 static atomic_t pending_weight_kg_x10;
 
 /*
+ * Age and sex from opcode 0x0A, packed as BODY_PENDING | age << 8 | sex so
+ * that one atomic carries both and 0 still means "nothing pending".
+ */
+#define BODY_PENDING		(1 << 16)
+static atomic_t pending_body;
+
+/* Workout start/stop from opcode 0x0B: -1 nothing pending, else the type. */
+static atomic_t workout_request = ATOMIC_INIT(-1);
+
+/* --- workouts ---------------------------------------------------------- */
+
+/*
+ * A workout holds the PPG on for its whole length, because heart rate is
+ * the only thing that prices rowing or cycling and a 15 s sample in every
+ * 60 is too thin to average. That is the most expensive thing this ring
+ * can do, so two limits keep a forgotten workout from draining it:
+ *
+ * WORKOUT_MAX_MS ends any workout after four hours. Long enough for any
+ * session a ring wearer is plausibly doing, short enough that a phone
+ * that never sends the stop costs one bad afternoon rather than the
+ * battery.
+ *
+ * WORKOUT_NO_FINGER_MS closes a workout window that has seen no finger
+ * for two minutes -- a ring taken off mid-session. The workout itself
+ * carries on: the next window opens one measurement period later and
+ * gives up after NO_FINGER_TIMEOUT_MS if it still finds nothing, so an
+ * empty ring costs 6 s of LED a minute instead of 60.
+ */
+#define WORKOUT_MAX_MS		(4LL * 60 * 60 * 1000)
+#define WORKOUT_NO_FINGER_MS	120000
+
+/*
+ * A minute's heart rate is its mean over the seconds that had one, and it
+ * only counts if at least this many did. Fewer, and the minute is priced
+ * as having no heart rate (see calories.h) -- half a minute of readings
+ * is an average; five seconds of them is an anecdote.
+ */
+#define WORKOUT_HR_MIN_SECONDS	30
+
+static int64_t workout_started_ms;
+
+/* Heart rate collected by report() once a second, drained every minute. */
+static uint32_t minute_hr_sum_x10;
+static uint16_t minute_hr_count;
+
+/*
  * Requested GSR stream state, handed over from the BLE callback.
  *
  * gsr_stream_start() sleeps 800 ms for the analog front end to settle and
@@ -525,6 +576,21 @@ static void cb_reset_activity(void)
 	atomic_set(&activity_reset_pending, 1);
 }
 
+static void cb_set_body(uint8_t age_years, uint8_t sex)
+{
+	atomic_set(&pending_body,
+		   BODY_PENDING | ((atomic_val_t)age_years << 8) | sex);
+}
+
+static void cb_workout(uint8_t type)
+{
+	atomic_set(&workout_request, type);
+	if (type != WORKOUT_NONE) {
+		/* Look for a heart rate now, not at the next scheduled window. */
+		atomic_set(&force_measure, 1);
+	}
+}
+
 static void cb_stream_gsr(bool on)
 {
 	atomic_set(&gsr_stream_request, on ? 1 : 0);
@@ -551,6 +617,8 @@ static const struct ble_control_cbs control_cbs = {
 	.reset_activity = cb_reset_activity,
 	.stream_gsr = cb_stream_gsr,
 	.spo2_mode = cb_spo2_mode,
+	.set_body = cb_set_body,
+	.workout = cb_workout,
 };
 
 /* --- status ------------------------------------------------------------ */
@@ -762,6 +830,26 @@ static void publish_spo2(void)
 	ble_publish_spo2(&out);
 }
 
+static void publish_workout(void)
+{
+	struct calories_workout w;
+
+	calories_workout_get(&w);
+
+	struct ring_workout out = {
+		.active = w.active,
+		.type = w.type,
+		.minutes = w.minutes,
+		.hr_minutes = w.hr_minutes,
+		.rest_minutes = w.rest_minutes,
+		.fallback_minutes = w.fallback_minutes,
+		.avg_hr_x10 = w.avg_hr_x10,
+		.kcal_x1000 = w.kcal_x1000,
+	};
+
+	ble_publish_workout(&out);
+}
+
 /* Every call site that used to publish_status() alone now also publishes
  * activity, so the two characteristics never drift out of sync on the app
  * side -- a status update with stale steps/sleep data would be confusing
@@ -773,6 +861,7 @@ static void publish_all(void)
 	publish_activity();
 	publish_hrv();
 	publish_spo2();
+	publish_workout();
 }
 
 /*
@@ -894,6 +983,11 @@ static void report(uint32_t raw)
 
 		if (bpm_x10 > 0) {
 			last_hr_x10 = bpm_x10;
+			/* One reading a second, for the workout minute. */
+			if (minute_hr_count < UINT16_MAX) {
+				minute_hr_sum_x10 += bpm_x10;
+				minute_hr_count++;
+			}
 			ble_notify_hr((uint16_t)((bpm_x10 + 5U) / 10U));
 			LOG_INF("dc %d  ac %d  PI %d.%d%%  HR %u.%u bpm %s",
 				dc, amp, pi / 10, pi % 10,
@@ -948,7 +1042,7 @@ static int ppg_probe(int attempts, int gap_ms)
 	return -ENODEV;
 }
 
-static int ppg_on(bool wear_only)
+static int ppg_on(bool green_only)
 {
 	int err = regulator_enable(VLED_BOOST);
 
@@ -984,8 +1078,12 @@ static int ppg_on(bool wear_only)
 	 * look" -- and FINGER_DC_MIN, the one threshold behind the verdict,
 	 * was measured on the green channel. It is also one LED instead of
 	 * two, in the middle of the night.
+	 *
+	 * A workout window is green for the same reason: it exists to
+	 * produce a heart rate, and every heart rate here comes from green.
+	 * An SpO2 workout would price every minute as "no heart rate".
 	 */
-	spo2_window = !wear_only && ble_spo2_mode();
+	spo2_window = !green_only && ble_spo2_mode();
 
 	if (spo2_window) {
 		err = maxm86161_start_spo2(&ppg, SPO2_IR_PA, SPO2_RED_PA);
@@ -1096,6 +1194,8 @@ int main(void)
 	 * See the last_motion guard in RING_MEASURING.
 	 */
 	bool wear_check_window = false;
+	/* Last time an open window saw a finger; see WORKOUT_NO_FINGER_MS. */
+	int64_t last_finger_seen = 0;
 
 	LOG_INF("ring firmware starting");
 	report_reset_cause();
@@ -1254,6 +1354,14 @@ int main(void)
 				calories_weight_kg_x10() / 10U,
 				calories_weight_kg_x10() % 10U);
 		}
+
+		uint8_t age, sex;
+
+		if (profile_saved_body(&age, &sex)) {
+			calories_set_body(age, sex);
+			LOG_INF("age and sex restored: %u, code %u",
+				calories_age_years(), calories_sex());
+		}
 	}
 
 	hrv_init();
@@ -1401,7 +1509,48 @@ int main(void)
 			}
 		}
 
-		/* Rate-limited; a no-op unless a new weight is waiting. */
+		{
+			atomic_val_t b = atomic_set(&pending_body, 0);
+
+			if (b & BODY_PENDING) {
+				calories_set_body((uint8_t)(b >> 8), (uint8_t)b);
+				LOG_INF("age %u, sex code %u (app request)",
+					calories_age_years(), calories_sex());
+				profile_note_body(calories_age_years(),
+						  calories_sex());
+			}
+		}
+
+		{
+			atomic_val_t req = atomic_set(&workout_request, -1);
+
+			if (req == WORKOUT_NONE && calories_workout_active()) {
+				calories_workout_stop();
+				LOG_INF("workout stopped (app request)");
+				publish_all();
+			} else if (req > WORKOUT_NONE && state == RING_CHARGING) {
+				/* Nothing to measure on a charger. */
+				LOG_WRN("workout refused: ring is charging");
+			} else if (req > WORKOUT_NONE) {
+				if (!calories_workout_active()) {
+					workout_started_ms = now;
+				}
+				calories_workout_start((uint8_t)req);
+				LOG_INF("workout started, type %d (app request)",
+					(int)req);
+				publish_all();
+			}
+
+			if (calories_workout_active() &&
+			    (now - workout_started_ms) > WORKOUT_MAX_MS) {
+				calories_workout_stop();
+				LOG_WRN("workout stopped: four hours with no stop "
+					"from the app");
+				publish_all();
+			}
+		}
+
+		/* Rate-limited; a no-op unless a new profile value is waiting. */
 		profile_service(now);
 
 		/* --- raw GSR stream, checked in every state --- */
@@ -1475,6 +1624,11 @@ int main(void)
 					if (state == RING_MEASURING) {
 						ppg_off();
 					}
+					if (calories_workout_active()) {
+						calories_workout_stop();
+						LOG_INF("workout stopped: charger "
+							"attached");
+					}
 					LOG_INF("state -> %s",
 						state_name[RING_CHARGING]);
 					(void)regulator_enable(VLED_BOOST);
@@ -1536,14 +1690,43 @@ int main(void)
 			 * gap. The deadline still moves, so coming off the
 			 * charger does not fire a catch-up burst.
 			 */
+			/*
+			 * The minute's mean heart rate, or 0 when too few of
+			 * its seconds had one. Ignored outside a workout.
+			 */
+			uint16_t minute_hr_x10 =
+				(minute_hr_count >= WORKOUT_HR_MIN_SECONDS)
+				? (uint16_t)(minute_hr_sum_x10 / minute_hr_count)
+				: 0;
+
+			minute_hr_sum_x10 = 0;
+			minute_hr_count = 0;
+
 			if (state != RING_CHARGING) {
 				/* Clamped: the control characteristic can zero
 				 * the step counter between two ticks, and
 				 * unsigned, that wraps.
 				 */
-				calories_update_minute(
+				calories_update_minute_hr(
 					steps_now >= steps_at_last_min
-					? steps_now - steps_at_last_min : 0);
+					? steps_now - steps_at_last_min : 0,
+					minute_hr_x10);
+
+				if (calories_workout_active()) {
+					struct calories_workout w;
+
+					calories_workout_get(&w);
+					LOG_INF("workout: min %u, HR %u.%u, "
+						"%u.%03u kcal (%u HR / %u rest "
+						"/ %u fallback)", w.minutes,
+						minute_hr_x10 / 10U,
+						minute_hr_x10 % 10U,
+						w.kcal_x1000 / 1000U,
+						w.kcal_x1000 % 1000U,
+						w.hr_minutes, w.rest_minutes,
+						w.fallback_minutes);
+					publish_workout();
+				}
 			}
 
 			steps_at_last_min = steps_now;
@@ -1749,12 +1932,23 @@ int main(void)
 			 * shapes the window when it is the sole reason for
 			 * opening one.
 			 */
-			bool wear_only = wear_due && !forced && !scheduled;
+			/*
+			 * A workout opens a window whenever one is due,
+			 * stale or not: the wearer said they are exercising,
+			 * which outranks the motion heuristic.
+			 */
+			bool workout_due = calories_workout_active() &&
+					   now >= next_window;
 
-			if (forced || scheduled || wear_due) {
-				if (ppg_on(wear_only) == 0) {
+			bool wear_only = wear_due && !forced && !scheduled &&
+					 !workout_due;
+
+			if (forced || scheduled || wear_due || workout_due) {
+				if (ppg_on(wear_only ||
+					   calories_workout_active()) == 0) {
 					state = RING_MEASURING;
 					window_started = now;
+					last_finger_seen = now;
 					wear_check_window = wear_only;
 					waiting_for_finger = !forced && !wear_only;
 					/* Each window gets its own budget of
@@ -1898,6 +2092,7 @@ int main(void)
 			if (spo2_window ? spo2_finger_present()
 					: hr_finger_present(&hr_state)) {
 				waiting_for_finger = false;
+				last_finger_seen = now;
 
 				/*
 				 * A wear check must NOT refresh last_motion,
@@ -1936,6 +2131,27 @@ int main(void)
 			bool give_up = waiting_for_finger &&
 				(now - window_started) > NO_FINGER_TIMEOUT_MS;
 			bool done = (now - window_started) >= window_len;
+
+			/*
+			 * A workout window runs until the workout ends, unless
+			 * the ring has plainly come off: see
+			 * WORKOUT_NO_FINGER_MS. give_up still applies, so a
+			 * window that never finds a finger closes at 6 s as
+			 * usual.
+			 */
+			if (calories_workout_active() && !wear_check_window) {
+				/*
+				 * An SpO2 window that was already open when the
+				 * workout started closes at once: it would
+				 * otherwise run red/IR for the whole workout
+				 * and never produce a heart rate. force_measure,
+				 * set by the start request, reopens it in green
+				 * on the next pass through RING_IDLE.
+				 */
+				done = spo2_window ||
+				       (now - last_finger_seen) >
+				       WORKOUT_NO_FINGER_MS;
+			}
 
 			/* Keep measuring as long as the app wants raw data. */
 			if (ble_ppg_streaming()) {

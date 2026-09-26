@@ -4,28 +4,53 @@
 #include <zephyr/settings/settings.h>
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(profile, LOG_LEVEL_INF);
 
 #define PROFILE_TREE		"ring"
-#define WEIGHT_KEY		"weight"
 
-struct profile_state {
+/*
+ * One stored value. Each is small, fixed-size and written whole, so a
+ * record is just bytes: this module never interprets them beyond copying
+ * them in and out, and a size mismatch is the only corruption it checks.
+ */
+#define RECORD_MAX_LEN		2
+
+struct record {
+	const char *key;	/* under PROFILE_TREE */
+	uint8_t len;
+
 	/* What flash holds, as far as this module knows. */
 	bool have_stored;
-	uint16_t stored_kg_x10;
+	uint8_t stored[RECORD_MAX_LEN];
 
 	/* What should be in flash once profile_service() gets to it. */
 	bool dirty;
-	uint16_t pending_kg_x10;
+	uint8_t pending[RECORD_MAX_LEN];
+};
 
-	/* When the last write was attempted, successful or not. */
+enum { REC_WEIGHT, REC_BODY, REC_COUNT };
+
+struct profile_state {
+	struct record rec[REC_COUNT];
+
+	/*
+	 * When the last write was attempted, successful or not. Shared by
+	 * every record: the limit protects the flash, and the flash does not
+	 * care which key a write belongs to.
+	 */
 	bool attempted;
 	int64_t last_attempt_ms;
 };
 
-static struct profile_state pf;
+static struct profile_state pf = {
+	.rec = {
+		[REC_WEIGHT] = { .key = "weight", .len = sizeof(uint16_t) },
+		[REC_BODY]   = { .key = "body",   .len = 2 },
+	},
+};
 
 #if defined(CONFIG_SETTINGS)
 
@@ -34,33 +59,36 @@ static struct profile_state pf;
  *
  * Anything unexpected is skipped rather than failed: returning an error
  * here would propagate out of settings_load(), and ble_start() treats that
- * as fatal to BLE (see the comment there). A lost weight costs the wearer
+ * as fatal to BLE (see the comment there). A lost profile costs the wearer
  * a resend; a lost radio costs them the ring.
  */
 static int profile_set(const char *name, size_t len,
 		       settings_read_cb read_cb, void *cb_arg)
 {
-	const char *next;
+	for (int i = 0; i < REC_COUNT; i++) {
+		struct record *r = &pf.rec[i];
+		const char *next;
+		uint8_t buf[RECORD_MAX_LEN];
 
-	if (!settings_name_steq(name, WEIGHT_KEY, &next) || next) {
+		if (!settings_name_steq(name, r->key, &next) || next) {
+			continue;
+		}
+
+		if (len != r->len) {
+			LOG_WRN("stored %s is %u bytes, expected %u -- ignored",
+				r->key, (unsigned int)len, (unsigned int)r->len);
+			return 0;
+		}
+
+		if (read_cb(cb_arg, buf, r->len) != (ssize_t)r->len) {
+			LOG_WRN("stored %s could not be read -- ignored", r->key);
+			return 0;
+		}
+
+		memcpy(r->stored, buf, r->len);
+		r->have_stored = true;
 		return 0;
 	}
-
-	uint16_t kg_x10;
-
-	if (len != sizeof(kg_x10)) {
-		LOG_WRN("stored weight is %u bytes, expected %u -- ignored",
-			(unsigned int)len, (unsigned int)sizeof(kg_x10));
-		return 0;
-	}
-
-	if (read_cb(cb_arg, &kg_x10, sizeof(kg_x10)) != (ssize_t)sizeof(kg_x10)) {
-		LOG_WRN("stored weight could not be read -- ignored");
-		return 0;
-	}
-
-	pf.have_stored = true;
-	pf.stored_kg_x10 = kg_x10;
 
 	return 0;
 }
@@ -68,46 +96,89 @@ static int profile_set(const char *name, size_t len,
 SETTINGS_STATIC_HANDLER_DEFINE(ring_profile, PROFILE_TREE, NULL, profile_set,
 			       NULL, NULL);
 
-static int save_weight(uint16_t kg_x10)
+static int save_record(const struct record *r)
 {
-	return settings_save_one(PROFILE_TREE "/" WEIGHT_KEY, &kg_x10,
-				 sizeof(kg_x10));
+	char name[24];
+
+	(void)snprintf(name, sizeof(name), PROFILE_TREE "/%s", r->key);
+
+	return settings_save_one(name, r->pending, r->len);
 }
 
 #else
 
-static int save_weight(uint16_t kg_x10)
+static int save_record(const struct record *r)
 {
-	(void)kg_x10;
+	(void)r;
 	return -ENOTSUP;
 }
 
 #endif /* CONFIG_SETTINGS */
 
-bool profile_saved_weight(uint16_t *kg_x10)
+static bool saved(int idx, void *out)
 {
-	if (!pf.have_stored) {
+	const struct record *r = &pf.rec[idx];
+
+	if (!r->have_stored) {
 		return false;
 	}
 
-	*kg_x10 = pf.stored_kg_x10;
+	memcpy(out, r->stored, r->len);
 	return true;
 }
 
-void profile_note_weight(uint16_t kg_x10)
+static void note(int idx, const void *value)
 {
+	struct record *r = &pf.rec[idx];
+
 	/*
 	 * Compared against flash, not against the last pending value: a
 	 * burst that goes 70 -> 80 -> 70 before the interval is up ends
 	 * where it started, and should cost no write at all.
 	 */
-	pf.pending_kg_x10 = kg_x10;
-	pf.dirty = !(pf.have_stored && pf.stored_kg_x10 == kg_x10);
+	memcpy(r->pending, value, r->len);
+	r->dirty = !(r->have_stored && memcmp(r->stored, value, r->len) == 0);
+}
+
+bool profile_saved_weight(uint16_t *kg_x10)
+{
+	return saved(REC_WEIGHT, kg_x10);
+}
+
+void profile_note_weight(uint16_t kg_x10)
+{
+	note(REC_WEIGHT, &kg_x10);
+}
+
+bool profile_saved_body(uint8_t *age_years, uint8_t *sex)
+{
+	uint8_t v[2];
+
+	if (!saved(REC_BODY, v)) {
+		return false;
+	}
+
+	*age_years = v[0];
+	*sex = v[1];
+	return true;
+}
+
+void profile_note_body(uint8_t age_years, uint8_t sex)
+{
+	uint8_t v[2] = { age_years, sex };
+
+	note(REC_BODY, v);
 }
 
 void profile_service(int64_t now_ms)
 {
-	if (!pf.dirty) {
+	bool any_dirty = false;
+
+	for (int i = 0; i < REC_COUNT; i++) {
+		any_dirty |= pf.rec[i].dirty;
+	}
+
+	if (!any_dirty) {
 		return;
 	}
 
@@ -124,26 +195,45 @@ void profile_service(int64_t now_ms)
 	pf.attempted = true;
 	pf.last_attempt_ms = now_ms;
 
-	int err = save_weight(pf.pending_kg_x10);
+	/*
+	 * Every dirty record in this one pass. The app sends weight, age and
+	 * sex together, so this is normally one or two small writes a minute
+	 * at worst -- not one per record per interval.
+	 */
+	for (int i = 0; i < REC_COUNT; i++) {
+		struct record *r = &pf.rec[i];
 
-	if (err) {
-		LOG_ERR("saving body weight failed (%d) -- kept in RAM, will "
-			"retry", err);
-		return;
+		if (!r->dirty) {
+			continue;
+		}
+
+		int err = save_record(r);
+
+		if (err) {
+			LOG_ERR("saving %s failed (%d) -- kept in RAM, will retry",
+				r->key, err);
+			continue;
+		}
+
+		memcpy(r->stored, r->pending, r->len);
+		r->have_stored = true;
+		r->dirty = false;
+
+		LOG_INF("profile saved: %s", r->key);
 	}
-
-	pf.have_stored = true;
-	pf.stored_kg_x10 = pf.pending_kg_x10;
-	pf.dirty = false;
-
-	LOG_INF("body weight saved: %u.%u kg", pf.stored_kg_x10 / 10U,
-		pf.stored_kg_x10 % 10U);
 }
 
 #if defined(PROFILE_TESTING)
 /* Host tests only: forget everything, as a reboot would. */
 void profile_test_reset(void)
 {
-	memset(&pf, 0, sizeof(pf));
+	pf.attempted = false;
+	pf.last_attempt_ms = 0;
+	for (int i = 0; i < REC_COUNT; i++) {
+		pf.rec[i].have_stored = false;
+		pf.rec[i].dirty = false;
+		memset(pf.rec[i].stored, 0, sizeof(pf.rec[i].stored));
+		memset(pf.rec[i].pending, 0, sizeof(pf.rec[i].pending));
+	}
 }
 #endif

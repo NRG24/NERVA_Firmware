@@ -78,6 +78,7 @@ this service now requires an encrypted link** — see Pairing, below.
 | HRV | `f0a10006-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 | GSR stream | `f0a10007-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
 | SpO2 | `f0a10008-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
+| Workout | `f0a10009-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 
 ### Pairing
 
@@ -261,6 +262,8 @@ Write (with or without response). First byte is the opcode.
 | `0x07` | none | Reset steps, sleep and calorie counters to zero |
 | `0x08` | `u8 on` | Raw GSR streaming on/off. Powers the analog front end for as long as it runs |
 | `0x09` | `u8 on` | SpO2 mode on/off. Runs red+IR instead of green; **heart rate pauses** while on |
+| `0x0A` | `u8 age`, `u8 sex` | Age in years (0 = not given, else clamped to 10-100) and sex (0 not given, 1 female, 2 male) for workout calories. Saved to flash like weight |
+| `0x0B` | `u8 type` | Start a workout: 1 running, 2 rowing, 3 cycling, 4 other. `0` stops it. See section 11 |
 
 Duty cycle values are clamped in firmware: window 5-300 s, period
 window-3600 s. Defaults are a **15 s window every 60 s**, i.e. 25% duty.
@@ -274,6 +277,8 @@ same settings partition as the bonds. The value in use changes the
 moment the write arrives; flash follows within a minute at most, so a
 burst of writes (a slider) costs one or two flash writes, not dozens. A
 write equal to what is already saved costs nothing.
+
+Age and sex (opcode `0x0A`) are saved and restored the same way.
 
 **Still send it on every connection.** Nothing on the wire reports which
 weight the ring is using, the save path has not yet run on real hardware
@@ -391,13 +396,15 @@ land inside one.
 **None of this has been validated on hardware.** Steps come from
 peak-detecting the IMU's acceleration magnitude — the same "plausible,
 never checked against a reference" caveat that applies to heart rate in
-section 13 applies here, and more so: a finger-worn ring does not move the
+section 14 applies here, and more so: a finger-worn ring does not move the
 way a wrist or waist does, so even the detector's assumptions about what a
 footstep looks like are unproven on this board. Calories are steps run
 through a standard MET table, which only has a step count from the same
 unvalidated detector to work from, plus whatever weight the app sent
-(opcode `0x06`) or the 70 kg default. Treat every field here as a rough,
-uncalibrated trend line, not a number to show without a caveat.
+(opcode `0x06`) or the 70 kg default. Exercise that steps cannot see,
+such as rowing or cycling, needs a workout (section 11). Treat every field
+here as a rough, uncalibrated trend line, not a number to show without a
+caveat.
 
 Three specific behaviours are worth designing around, because they are
 confirmed in simulation rather than hypothetical:
@@ -698,7 +705,84 @@ range.
 
 ---
 
-## 11. Behaviour your app has to expect
+## 11. Workout characteristic
+
+16 bytes, little-endian. The figures for the workout the app started with
+opcode `0x0B`, or the last one after it stops. Notified at least once a
+minute during a workout, and on start and stop.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u8 | `active` | 1 while a workout is running |
+| 1 | u8 | `type` | 1 running, 2 rowing, 3 cycling, 4 other |
+| 2 | u16 | `minutes` | Minutes so far |
+| 4 | u16 | `hr_minutes` | Minutes priced from heart rate |
+| 6 | u16 | `rest_minutes` | Minutes with heart rate under 90 bpm, priced from steps |
+| 8 | u16 | `fallback_minutes` | Minutes with no usable heart rate, priced from the activity type |
+| 10 | u16 | `avg_hr_x10` | Mean heart rate over `hr_minutes`, bpm x10. 0 if none |
+| 12 | u32 | `kcal_x1000` | Kilocalories x1000 for this workout |
+
+The three minute counts always add up to `minutes`.
+
+### Why workouts exist
+
+The everyday calorie figure in the Activity packet comes from steps. It
+cannot see rowing, cycling or most of the difference between jogging and
+running. Heart rate can. During a workout the ring keeps the optical
+sensor on and prices each minute from its mean heart rate with the Keytel
+et al. (2005) equations, which use heart rate, weight, age and sex:
+
+```
+male    kJ/min = -55.0969 + 0.6309 HR + 0.1988 kg + 0.2017 age
+female  kJ/min = -20.4022 + 0.4472 HR - 0.1263 kg + 0.0740 age
+```
+
+With sex not given the ring uses the mean of the two; with age not given
+it uses 35. Send both with opcode `0x0A` for a better number.
+
+Each minute takes one of three paths:
+
+| Heart rate that minute | Priced by | Counted in |
+|---|---|---|
+| 90 bpm or more, on at least 30 of its seconds | Keytel, but never below the step estimate and never above 20 kcal/min | `hr_minutes` |
+| Present but under 90 bpm | The ordinary step formula: the wearer is resting between efforts | `rest_minutes` |
+| Missing (ring slipped, no finger, sensor trouble) | The activity's typical MET: running 8.3, rowing 7.0, cycling 7.5, other 5.0 — or the step formula if higher | `fallback_minutes` |
+
+**Show the split.** A workout made mostly of `fallback_minutes` is mostly
+an estimate from the activity type, not a measurement. Say so, or show
+the figure with less confidence.
+
+Workout calories are also added to `kcal_x1000` in the Activity packet,
+so the day's total already includes them. Don't add them again.
+
+### What it costs, and the limits
+
+The optical sensor stays on for the whole workout, about 15 mA plus the
+5 V boost. That is the most power the ring ever draws, so:
+
+* A workout ends by itself after **four hours** with no stop from the app.
+* If the sensor sees no finger for **two minutes**, the window closes. The
+  workout carries on and checks again every measurement period.
+* Attaching the charger ends it, and a start sent while charging is
+  refused. `active` stays 0.
+* SpO2 mode does not apply during a workout: the sensor uses the green LED,
+  because every heart rate comes from green.
+
+A workout is RAM-only, like the other counters. A reboot ends it. Watch
+`uptime_s` as section 7 describes.
+
+### How much to trust it
+
+Keytel's equations are population averages fitted to lab exercise, so
+for any one person they can be off by a meaningful margin. Here they rest on a
+finger-worn heart rate that has **never been compared to a chest strap**.
+That is harder during exercise, and hardest on a rowing machine, where
+the grip on the handle squeezes the finger under the sensor. Treat the
+number as a much better estimate than steps alone, not as a measurement.
+
+---
+
+## 12. Behaviour your app has to expect
 
 **The ring is not always measuring.** By default the optical front end is
 off for 45 seconds out of every 60. That is deliberate — the LEDs plus the
@@ -740,7 +824,7 @@ first detected, so the user gets confirmation without opening the app.
 
 ---
 
-## 12. Connection parameters
+## 13. Connection parameters
 
 The firmware does not request specific connection parameters, so you get
 whatever the phone proposes. Recommendations:
@@ -755,7 +839,7 @@ length extension if your stack exposes it.
 
 ---
 
-## 13. Caveats worth knowing
+## 14. Caveats worth knowing
 
 These are real limitations of the current hardware and firmware, not
 things to paper over in the UI.
@@ -817,7 +901,7 @@ and no bond has ever been cleared.
 
 ---
 
-## 14. Quick start
+## 15. Quick start
 
 1. Scan for service `0x180D`, connect
 2. Request MTU 247

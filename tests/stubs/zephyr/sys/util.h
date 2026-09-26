@@ -30,5 +30,6 @@
 #define MIN(a, b)	(((a) < (b)) ? (a) : (b))
 #define ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))
 #define BIT(n)		(1U << (n))
+#define CLAMP(v, lo, hi)	(((v) < (lo)) ? (lo) : (((v) > (hi)) ? (hi) : (v)))
 
 #endif /* TEST_STUB_ZEPHYR_SYS_UTIL_H_ */

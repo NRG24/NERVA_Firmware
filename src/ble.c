@@ -27,6 +27,7 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
  *   hrv          f0a10006-...   read / notify
  *   gsr stream   f0a10007-...   notify
  *   spo2         f0a10008-...   read / notify
+ *   workout      f0a10009-...   read / notify
  */
 #define RING_UUID_BASE(x)	BT_UUID_128_ENCODE(0xf0a10000 | (x), 0x1e5c, \
 						   0x4a2b, 0x8d3f, \
@@ -50,6 +51,8 @@ static const struct bt_uuid_128 uuid_gsr =
 	BT_UUID_INIT_128(RING_UUID_BASE(7));
 static const struct bt_uuid_128 uuid_spo2 =
 	BT_UUID_INIT_128(RING_UUID_BASE(8));
+static const struct bt_uuid_128 uuid_workout =
+	BT_UUID_INIT_128(RING_UUID_BASE(9));
 
 static atomic_t connected_count;
 static atomic_t status_subscribed;
@@ -59,6 +62,7 @@ static atomic_t activity_subscribed;
 static atomic_t hrv_subscribed;
 static atomic_t gsr_subscribed;
 static atomic_t spo2_subscribed;
+static atomic_t workout_subscribed;
 static atomic_t ppg_stream_on;
 static atomic_t imu_stream_on;
 static atomic_t gsr_stream_on;
@@ -101,6 +105,9 @@ static struct ring_hrv latest_hrv;
 
 static struct k_spinlock spo2_lock;
 static struct ring_spo2 latest_spo2;
+
+static struct k_spinlock workout_lock;
+static struct ring_workout latest_workout;
 
 static const struct ble_control_cbs *control_cbs;
 static uint32_t ppg_seq;
@@ -232,6 +239,27 @@ static void spo2_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	atomic_set(&spo2_subscribed, value == BT_GATT_CCC_NOTIFY);
 }
 
+static ssize_t read_workout(struct bt_conn *conn,
+			    const struct bt_gatt_attr *attr, void *buf,
+			    uint16_t len, uint16_t offset)
+{
+	struct ring_workout snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&workout_lock);
+	snapshot = latest_workout;
+	k_spin_unlock(&workout_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
+}
+
+static void workout_ccc_changed(const struct bt_gatt_attr *attr,
+				uint16_t value)
+{
+	atomic_set(&workout_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
 /*
  * Control opcodes, see APP_INTEGRATION.md:
  *   0x01 <u8 on>                     raw PPG streaming
@@ -243,6 +271,8 @@ static void spo2_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
  *   0x07                             reset steps/sleep/calories counters
  *   0x08 <u8 on>                     raw GSR streaming
  *   0x09 <u8 on>                     SpO2 mode (red+IR instead of green)
+ *   0x0A <u8 age> <u8 sex>           age and sex for workout calories
+ *   0x0B <u8 type>                   start a workout (0 = stop)
  */
 static ssize_t write_control(struct bt_conn *conn,
 			     const struct bt_gatt_attr *attr, const void *buf,
@@ -385,6 +415,27 @@ static ssize_t write_control(struct bt_conn *conn,
 			p[1] ? "on" : "off", p[1] ? "pauses" : "resumes");
 		break;
 
+	case 0x0A:
+		if (len < 3) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		if (control_cbs && control_cbs->set_body) {
+			control_cbs->set_body(p[1], p[2]);
+		}
+		LOG_INF("control: age %u, sex code %u", p[1], p[2]);
+		break;
+
+	case 0x0B:
+		if (len < 2) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		if (control_cbs && control_cbs->workout) {
+			control_cbs->workout(p[1]);
+		}
+		LOG_INF("control: workout %s (type %u)",
+			p[1] ? "start" : "stop", p[1]);
+		break;
+
 	default:
 		LOG_WRN("control: unknown opcode 0x%02x", p[0]);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
@@ -449,6 +500,13 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 			       BT_GATT_PERM_READ_ENCRYPT, read_spo2, NULL, NULL),
 	BT_GATT_CCC(spo2_ccc_changed,
 		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+
+	BT_GATT_CHARACTERISTIC(&uuid_workout.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ_ENCRYPT, read_workout, NULL,
+			       NULL),
+	BT_GATT_CCC(workout_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 );
 
 /*
@@ -466,6 +524,7 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
  *  15  hrv      decl  16 value  17 CCC
  *  18  gsr      decl  19 value  20 CCC
  *  21  spo2     decl  22 value  23 CCC
+ *  24  workout  decl  25 value  26 CCC
  *
  * Pointing at the declaration rather than the value is deliberate and is
  * what bt_gatt_notify() documents: "The attribute object on the parameters
@@ -482,6 +541,7 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 #define ATTR_HRV	(&ring_svc.attrs[15])
 #define ATTR_GSR	(&ring_svc.attrs[18])
 #define ATTR_SPO2	(&ring_svc.attrs[21])
+#define ATTR_WORKOUT	(&ring_svc.attrs[24])
 
 /* --- connection tracking ----------------------------------------------- */
 
@@ -957,6 +1017,23 @@ void ble_publish_spo2(const struct ring_spo2 *spo2)
 	}
 
 	(void)bt_gatt_notify(NULL, ATTR_SPO2, &snapshot, sizeof(snapshot));
+}
+
+void ble_publish_workout(const struct ring_workout *workout)
+{
+	struct ring_workout snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&workout_lock);
+	latest_workout = *workout;
+	snapshot = latest_workout;
+	k_spin_unlock(&workout_lock, key);
+
+	if (!ble_is_connected() || !atomic_get(&workout_subscribed)) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, ATTR_WORKOUT, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_hrv(const struct ring_hrv *hrv)
