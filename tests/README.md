@@ -109,6 +109,19 @@ expected table is transcribed from the pre-refactor driver rather than
 generated from the current code, which is what makes it a check rather
 than a tautology.
 
+### `test_profile` — body weight in flash
+
+Fakes the settings backend with a one-key "flash" that counts writes and
+can be made to fail, and replays it through `profile.c`'s handler the way
+`settings_load()` would. Tested: the weight survives a simulated reboot;
+a wrong-size record, an unknown key or a failed read is skipped rather
+than returned as an error (an error there would fail `settings_load()`,
+which takes BLE down with it); resending an unchanged weight writes
+nothing; a burst of changes writes at most once a minute and the last
+value is the one that lands; a failing backend retries once per interval
+rather than on every 20 ms pass; and the clamped weight, not the request,
+is what gets stored. It proves nothing about NVS on the real part.
+
 ### `test_mainloop` — the polling policy
 
 Emulates main.c's `RING_IDLE` case: sample, update `last_step_motion`,
@@ -146,6 +159,9 @@ the fix was reverted and the suite confirmed to fail:
 | `test_spo2` channel order | Red and IR swapped in the ratio, which inverts R with no error anywhere. |
 | `test_driver` green path | The two-slot refactor changing a register on the one configuration proven on hardware. |
 | `test_driver` slot order | IR and red swapped in the LED sequence, which inverts R via the FIFO tags instead. |
+| `test_profile` rate limit | Writing flash on every pass while a value is pending — every weight change, and every retry after a failure. |
+| `test_profile` dedupe | Rewriting an unchanged weight on every connection, which the app is told to send. |
+| `test_profile` junk in flash | A wrong-size record failing `settings_load()`, which would cost the ring its radio. |
 | `test_gatt_layout` | A characteristic inserted into the Ring Service shifting the raw `ATTR_*` indices in ble.c onto the wrong attribute. |
 
 `test_no_false_steps_across_a_gap` is deliberately *not* in that list: it

@@ -17,7 +17,8 @@ LDLIBS  += -lm
 SRC     := ../src/steps.c ../src/sleep.c ../src/calories.c ../src/hrv.c ../src/hr.c ../src/spo2.c
 COMMON  := sim.c $(SRC)
 
-TESTS   := test_activity test_mainloop test_hrv test_spo2 test_driver
+TESTS   := test_activity test_mainloop test_hrv test_spo2 test_driver \
+	   test_profile
 
 # Every .c in src/, plus the GATT layout assertions.
 #
@@ -33,7 +34,8 @@ SYNTAX_FLAGS := -std=c11 -fsyntax-only -Wall -Wextra -Werror -Wno-unused-paramet
 		-D__packed='__attribute__((packed))' \
 		-DCONFIG_BT_DIS_FW_REV_STR='"0.0.0"' \
 		-DCONFIG_BT_DEVICE_NAME='"Ring PPG"' \
-		-DCONFIG_BT_ID_MAX=1
+		-DCONFIG_BT_ID_MAX=1 \
+		-DCONFIG_SETTINGS
 SYNTAX_BENCH := -DCONFIG_RING_BENCH -DCONFIG_RING_BENCH_POWER_LED \
 		-DCONFIG_RING_IMU_WAKE_DIAG -DCONFIG_RING_GSR_MONITOR \
 		-DCONFIG_RING_WATCHDOG -DCONFIG_RING_WATCHDOG_TIMEOUT_MS=10000
@@ -58,6 +60,11 @@ test_spo2: test_spo2.c $(COMMON)
 # stubbed, which test_driver.c supplies itself.
 test_driver: test_driver.c sim.c ../src/maxm86161.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Flash persistence. Also not pure logic: test_profile.c fakes the settings
+# backend, and profile.c is built with its settings path switched on.
+test_profile: test_profile.c sim.c ../src/profile.c ../src/calories.c
+	$(CC) $(CFLAGS) -DCONFIG_SETTINGS -DPROFILE_TESTING -o $@ $^ $(LDLIBS)
 
 run: $(TESTS)
 	@fail=0; \

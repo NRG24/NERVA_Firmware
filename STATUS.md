@@ -267,9 +267,8 @@ Ordered by how much it would hurt, not how likely it is.
   gesturing in simulation and it rejects gentle walking too. Where that
   line actually belongs can only be settled on a wrist — sorry, a finger —
   with a reference count.
-* **Nothing in the activity feature is persisted.** Steps, sleep minutes,
-  calories and the body weight the estimate depends on all live in RAM and
-  start from zero on any reset — watchdog (R2), fatal error, flat battery,
+* **The activity counters are not persisted.** Steps, sleep minutes and
+  calories all live in RAM and start from zero on any reset — watchdog (R2), fatal error, flat battery,
   or the battery contact bouncing under flex (`HARDWARE_NOTES.md` §13).
   This is deliberate rather than an oversight: the settings partition has
   never been successfully written on this board (R3), and putting a step
@@ -278,6 +277,12 @@ Ordered by how much it would hurt, not how likely it is.
   accumulate its own totals, watching `uptime_s` in the status packet to
   spot a reboot — `APP_INTEGRATION.md` §7 spells out how. Revisit once
   NVS has demonstrably worked on real hardware.
+  **Body weight is the exception** (`profile.c`): it is saved under
+  `ring/weight` in the bonds' partition, written only when the app sends a
+  different value and at most once a minute, so it adds a handful of
+  2-byte writes over the ring's life to a partition that pairing already
+  writes. That is why it was worth doing ahead of R3 when the counters were
+  not. It is equally unproven on hardware: the check is in §7, item 7.
 * **No RTC**, so sleep sessions are durations from `k_uptime_get()`, not
   clock times — see `APP_INTEGRATION.md` §7. A session spanning a reboot
   (watchdog reset, battery pull) is lost: `sleep.c` has no persistence and
@@ -433,7 +438,10 @@ something the next assumes:
 7. **Calories.** Send control opcode `0x06` with a real body weight
    before believing any number; the default is 70 kg. At rest the total
    should climb about 1.2 kcal per minute for a 70 kg wearer, which is a
-   figure you can check against the clock.
+   figure you can check against the clock. Then prove the weight is
+   saved: wait for `body weight saved: xx.x kg` on RTT, power-cycle the
+   ring, and look for `body weight restored: xx.x kg` at boot. That one
+   reboot is also the first evidence NVS works on this board at all (R3).
 
 Numbers worth recording in `BRINGUP_RESULTS.md` when you do: the step
 count against a hand count, the magnitude swing a real walking finger

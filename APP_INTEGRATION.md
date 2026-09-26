@@ -267,9 +267,19 @@ window-3600 s. Defaults are a **15 s window every 60 s**, i.e. 25% duty.
 
 Weight is clamped to 20.0-250.0 kg and defaults to 70.0 kg until set —
 without it the calorie estimate in the Activity characteristic (section 7)
-is only right for someone who happens to weigh 70 kg. It is not persisted
-across a reboot; send it again after every reconnect if you want it to
-stick, the same way you would re-apply a duty cycle.
+is only right for someone who happens to weigh 70 kg.
+
+**The weight is saved to flash** and restored at boot, in the
+same settings partition as the bonds. The value in use changes the
+moment the write arrives; flash follows within a minute at most, so a
+burst of writes (a slider) costs one or two flash writes, not dozens. A
+write equal to what is already saved costs nothing.
+
+**Still send it on every connection.** Nothing on the wire reports which
+weight the ring is using, the save path has not yet run on real hardware
+(see STATUS.md, R3), and a resend of an unchanged value is free. Treat
+persistence as the ring covering for a reboot you missed, not as a reason
+to stop sending.
 
 `0x05` is the unpair path. `CONFIG_BT_MAX_PAIRED` is 1 and
 `CONFIG_BT_KEYS_OVERWRITE_OLDEST` is deliberately off, so without it the
@@ -438,10 +448,11 @@ a fatal error, a flat battery, or the battery contact bouncing under flex
 (`HARDWARE_NOTES.md` §13, and it is a known issue on this revision). The
 ring is not the system of record for anything here. **Your app is.**
 
-Persistence was deliberately not added in firmware: the settings
+Persistence was deliberately not added for these counters: the settings
 partition has never been successfully written on this board, and putting
 a step counter on a flash-write path before that is proven would risk the
-bonds alongside it.
+bonds alongside it. (Body weight is saved, because it is written only when
+the app changes it — see section 6.)
 
 So accumulate on the phone side, and detect the resets:
 
@@ -457,9 +468,9 @@ Polling only the Activity characteristic cannot detect this: it carries
 no uptime of its own, and a reboot mid-walk looks exactly like a step
 count that quietly stopped climbing.
 
-The same applies to body weight (opcode `0x06`), which also lives in RAM
-— resend it after any reboot you detect, or the calorie estimate silently
-reverts to assuming 70 kg.
+Body weight (opcode `0x06`) is the one exception: it is saved to flash
+and survives a reboot (section 6). Resend it on each connection anyway —
+see there for why.
 
 There is also no RTC on this board (see README), so `sleep_session_min`
 and `sleep_total_min` are durations, not clock times. If you want to show

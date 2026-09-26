@@ -36,6 +36,7 @@
 #include "hrv.h"
 #include "imu.h"
 #include "maxm86161.h"
+#include "profile.h"
 #include "selftest.h"
 #include "sleep.h"
 #include "spo2.h"
@@ -1237,6 +1238,24 @@ int main(void)
 	steps_init();
 	sleep_init();
 	calories_init();
+
+	/*
+	 * After calories_init(), which would otherwise put the default back.
+	 * The value itself was delivered by settings_load() inside
+	 * ble_start() above; if BLE failed to start there is none, and the
+	 * default stands until the app sends one.
+	 */
+	{
+		uint16_t saved;
+
+		if (profile_saved_weight(&saved)) {
+			calories_set_weight(saved);
+			LOG_INF("body weight restored: %u.%u kg",
+				calories_weight_kg_x10() / 10U,
+				calories_weight_kg_x10() % 10U);
+		}
+	}
+
 	hrv_init();
 	spo2_init();
 
@@ -1336,6 +1355,15 @@ int main(void)
 		 * while the ring is still, which STILL_TIMEOUT_MS previously
 		 * ruled out. Same peak, more chances at it.
 		 *
+		 * profile_service() writes flash at most once a minute, and only
+		 * after the app changes the weight. A settings write is
+		 * normally well under a millisecond; the worst case is NVS
+		 * garbage-collecting a sector first, one 4 kB page erase of
+		 * roughly 85 ms on nRF52, stretched somewhat by the radio's
+		 * flash timeslots. Not a new line above -- it is two orders of
+		 * magnitude below the margin -- but it is a blocking call, so
+		 * it is recorded here.
+		 *
 		 * Add a blocking call longer than the remaining margin and either
 		 * put a feed beside it or raise CONFIG_RING_WATCHDOG_TIMEOUT_MS.
 		 */
@@ -1368,8 +1396,13 @@ int main(void)
 				calories_set_weight(w);
 				LOG_INF("body weight set: %u.%u kg (app request)",
 					w / 10U, w % 10U);
+				/* The clamped value, not the request. */
+				profile_note_weight(calories_weight_kg_x10());
 			}
 		}
+
+		/* Rate-limited; a no-op unless a new weight is waiting. */
+		profile_service(now);
 
 		/* --- raw GSR stream, checked in every state --- */
 		service_gsr_stream(now, &next_gsr_sample);

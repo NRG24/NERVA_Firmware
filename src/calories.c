@@ -62,6 +62,11 @@ void calories_set_weight(uint16_t kg_x10)
 	weight_kg_x10 = kg_x10;
 }
 
+uint16_t calories_weight_kg_x10(void)
+{
+	return weight_kg_x10;
+}
+
 static uint16_t met_x10_for_cadence(uint16_t cadence_spm)
 {
 	for (size_t i = 0; i < ARRAY_SIZE(bands); i++) {

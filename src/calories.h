@@ -33,6 +33,9 @@ void calories_init(void);
  */
 void calories_set_weight(uint16_t weight_kg_x10);
 
+/* The weight in use, after clamping -- which is what profile.c persists. */
+uint16_t calories_weight_kg_x10(void);
+
 /*
  * Call once a minute with the number of steps taken since the last call.
  *
