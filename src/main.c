@@ -26,10 +26,15 @@
  */
 
 #include "ble.h"
+#include "calories.h"
 #include "hr.h"
+#include "hrv.h"
 #include "imu.h"
 #include "maxm86161.h"
 #include "selftest.h"
+#include "sleep.h"
+#include "spo2.h"
+#include "steps.h"
 #include "wdt.h"
 
 #include <zephyr/device.h>
@@ -52,6 +57,15 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define PPG_LED		LEDC_LED1
 /* 0.12 mA per LSB in the 31 mA range: 0x80 is about 15.4 mA. */
 #define PPG_LED_PA	0x80
+
+/*
+ * Drive currents for the SpO2 pair. Starting points, not calibrated: the
+ * ratio of ratios divides out absolute intensity, so these only have to
+ * put both channels in a sensible part of the ADC range without
+ * saturating. Equal currents are the conventional place to begin.
+ */
+#define SPO2_IR_PA	0x80
+#define SPO2_RED_PA	0x80
 
 /*
  * BENCH ONLY -- remove before anything ships.
@@ -105,6 +119,68 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
  */
 #define STILL_TIMEOUT_MS	180000
 
+/* --- pedometer sampling ------------------------------------------------ */
+
+/*
+ * How fast the IMU is polled while the ring might be walking.
+ *
+ * Not a tuning preference. Walking is 1.5-2.5 Hz and a footfall is a
+ * narrow peak, so the idle 200 ms poll sits barely above Nyquist and the
+ * detector loses steps outright rather than merely adding noise -- in
+ * simulation it counted essentially nothing at 200 ms below a 250 mg
+ * magnitude swing, against 0-1 % error at 40 ms. See the table in steps.h.
+ *
+ * The cost is bounded: an extra ~20 accelerometer reads a second, each one
+ * a 6-byte I2C burst, and only while the wearer is actually moving. Set
+ * against the optical front end's ~15 mA for 15 s in every 60 while worn,
+ * it is noise. While the ring is still -- which is the whole of the night,
+ * and the case the idle power model was built for -- polling stays at
+ * IDLE_POLL_MS, and there are no steps to miss.
+ */
+#define STEP_POLL_MS		40
+#define IDLE_POLL_MS		200
+
+/*
+ * Deviation from 1 g that switches to the fast poll. Deliberately well
+ * below STILL_MG: that threshold decides wear and measurement windows,
+ * where a false positive lights the LEDs, but this one only costs a
+ * faster poll, and it has to trip on gentle walking that never deviates
+ * 120 mg in the first place -- exactly the motion the 200 ms poll cannot
+ * see.
+ */
+#define STEP_MOTION_MG		50
+
+/*
+ * How long the fast poll is held after the last qualifying motion. Covers
+ * the pause at a kerb or between strides without flapping between rates.
+ */
+#define STEP_POLL_HOLD_MS	10000
+
+/* --- GSR stream -------------------------------------------------------- */
+
+/*
+ * Sample interval for the raw GSR stream. Skin conductance responses peak
+ * roughly 1.4 s after onset, so 10 Hz is the floor at which the rise is
+ * resolvable at all; 20 Hz is used so ordinary loop jitter cannot drop the
+ * effective rate below that floor. The stream is opt-in and off by
+ * default, which is what pays for the extra conversions -- and for
+ * GSR_PWR being held on the whole time, which suspends the analog front
+ * end's duty cycling entirely.
+ */
+#define GSR_STREAM_INTERVAL_MS	50
+
+/* Loop cadence needed to hit that interval, whatever state the ring is in. */
+#define GSR_STREAM_POLL_MS	20
+
+/*
+ * How long to wait before trying again after a failed start. The likely
+ * causes are permanent -- an ADC that is not ready, a channel that will not
+ * configure -- but each attempt costs an 800 ms settle, so retrying slowly
+ * is the difference between recovering from something transient and
+ * spending a third of the time asleep in a settle that never works.
+ */
+#define GSR_START_RETRY_MS	30000
+
 enum ring_state {
 	RING_IDLE,
 	RING_MEASURING,
@@ -123,6 +199,15 @@ static uint32_t samples[FIFO_DEPTH];
 
 /* Cleared when the PPG stops answering, so ppg_on() knows to re-probe. */
 static bool ppg_present;
+
+/*
+ * Which LEDs the current measurement window is running.
+ *
+ * Latched when the window opens rather than read live, so a mode change
+ * part-way through cannot leave report() demultiplexing the FIFO by the
+ * wrong rule. The new mode takes effect at the next window.
+ */
+static bool spo2_window;
 
 /*
  * Consecutive failed FIFO reads.
@@ -192,6 +277,17 @@ static uint8_t imu_reinit_count;
 /* Set when IMU_REINIT_LIMIT trips; only a reset clears it. */
 static bool imu_unrecoverable;
 
+/*
+ * Consecutive failures of the pedometer's own accelerometer read inside a
+ * measurement window. Separate from imu_fail_count, which belongs to the
+ * IMU health machinery in RING_IDLE and decides whether the part is dead;
+ * this one only decides whether to keep asking during this window. Three
+ * is enough to distinguish a wedged part from one bad transaction, and
+ * cheap to be wrong about -- the cost is some steps missed in one window.
+ */
+static uint8_t act_fail_count;
+#define ACT_FAIL_LIMIT		3
+
 /* How often to retry a failed imu_init(). It is idempotent and cheap. */
 #define IMU_RETRY_MS		60000
 
@@ -217,6 +313,35 @@ static enum ring_state state = RING_IDLE;
 static uint32_t measure_window_ms = MEASURE_WINDOW_MS;
 static uint32_t measure_period_ms = MEASURE_PERIOD_MS;
 static atomic_t force_measure;
+
+/*
+ * steps.c/sleep.c/calories.c have no locking of their own -- unlike
+ * latest_status/latest_activity in ble.c, their state is more than one
+ * scalar and is read-modify-written every pass through RING_IDLE and
+ * RING_MEASURING. Calling their reset/setter functions straight from a
+ * BLE control callback, which runs on the BT RX thread, would race the
+ * main loop's steps_update()/sleep_feed()/calories_update_minute() --
+ * concretely, sleep_feed() reads steps_count() and diffs it against a
+ * snapshot, so a steps_reset() landing in between the two makes that
+ * diff go deeply negative and wrap to a huge uint32_t, which
+ * evaluate_minute() would read as an enormous step count and
+ * misclassify the minute. Same atomic-handoff pattern as force_measure
+ * above: the callback only sets a flag/value, and only the main loop
+ * ever calls into steps.c/sleep.c/calories.c.
+ */
+static atomic_t activity_reset_pending;
+static atomic_t pending_weight_kg_x10;
+
+/*
+ * Requested GSR stream state, handed over from the BLE callback.
+ *
+ * gsr_stream_start() sleeps 800 ms for the analog front end to settle and
+ * touches the ADC and a GPIO; the control callback runs on the BT RX
+ * thread, where doing any of that would be wrong. -1 means nothing
+ * pending, 0 and 1 are the requested state.
+ */
+static atomic_t gsr_stream_request = ATOMIC_INIT(-1);
+static bool gsr_stream_active;
 
 static uint16_t last_hr_x10;
 static uint16_t battery_mv;
@@ -260,11 +385,48 @@ static void cb_stream_ppg(bool on)
 	}
 }
 
+static void cb_set_weight(uint16_t weight_kg_x10)
+{
+	/*
+	 * 0 is the "nothing pending" sentinel the main loop looks for, so a
+	 * literal 0 from the app is nudged to 1 -- calories_set_weight()
+	 * clamps anything below 20.0 kg up to the same 20.0 kg floor anyway,
+	 * so this changes nothing about the value that is actually applied.
+	 */
+	atomic_set(&pending_weight_kg_x10, weight_kg_x10 ? weight_kg_x10 : 1);
+}
+
+static void cb_reset_activity(void)
+{
+	atomic_set(&activity_reset_pending, 1);
+}
+
+static void cb_stream_gsr(bool on)
+{
+	atomic_set(&gsr_stream_request, on ? 1 : 0);
+}
+
+static void cb_spo2_mode(bool on)
+{
+	/*
+	 * The mode itself is read at the top of each window, so this only
+	 * asks for a window to happen soon. A window already running in the
+	 * other mode finishes first -- switching the LEDs underneath a
+	 * half-collected measurement would corrupt both.
+	 */
+	ARG_UNUSED(on);
+	atomic_set(&force_measure, 1);
+}
+
 static const struct ble_control_cbs control_cbs = {
 	.stream_ppg = cb_stream_ppg,
 	.stream_imu = NULL,
 	.measure_now = cb_measure_now,
 	.set_duty = cb_set_duty,
+	.set_weight = cb_set_weight,
+	.reset_activity = cb_reset_activity,
+	.stream_gsr = cb_stream_gsr,
+	.spo2_mode = cb_spo2_mode,
 };
 
 /* --- status ------------------------------------------------------------ */
@@ -285,7 +447,13 @@ static void publish_status(void)
 	if (state == RING_CHARGING) {
 		s.flags |= RING_FLAG_CHARGER;
 	}
-	if (hr_finger_present(&hr_state)) {
+	/*
+	 * In SpO2 mode the green LED is dark, so hr_finger_present() -- which
+	 * watches the green DC level -- would report no finger throughout a
+	 * perfectly good measurement. The flag means "something is on the
+	 * sensor", which the red/IR DC answers just as well.
+	 */
+	if (spo2_window ? spo2_finger_present() : hr_finger_present(&hr_state)) {
 		s.flags |= RING_FLAG_FINGER;
 	}
 	if (s.ppg_dc > 0) {
@@ -293,6 +461,264 @@ static void publish_status(void)
 	}
 
 	ble_publish_status(&s);
+}
+
+/*
+ * Start, stop and feed the raw GSR stream. Called from the main loop in
+ * every state, because skin conductance has nothing to do with whether the
+ * optical front end happens to be running.
+ *
+ * BLOCKING: the start path sleeps 800 ms for the front end to settle. That
+ * is charged to the watchdog budget by the caller, which feeds immediately
+ * afterwards.
+ */
+static void service_gsr_stream(int64_t now, int64_t *next_sample)
+{
+	static int16_t batch[GSR_MAX_SAMPLES_DEFAULT_MTU];
+	static uint8_t batch_n;
+	atomic_val_t request = atomic_set(&gsr_stream_request, -1);
+
+	if (request == 1 && !gsr_stream_active) {
+		if (gsr_stream_start() == 0) {
+			gsr_stream_active = true;
+			batch_n = 0;
+			*next_sample = now;
+		} else {
+			/*
+			 * Retry rather than going silently dead. Without this
+			 * the request has already been consumed and
+			 * gsr_stream_active is still false, so neither branch
+			 * can fire again while the app still believes the
+			 * stream is on -- it would stay dead until the user
+			 * toggled it off and back on.
+			 */
+			LOG_ERR("GSR stream could not start, retrying in %u s",
+				GSR_START_RETRY_MS / 1000U);
+			*next_sample = now + GSR_START_RETRY_MS;
+		}
+	} else if (request == -1 && !gsr_stream_active &&
+		   ble_gsr_stream_requested() && now >= *next_sample) {
+		/* The retry itself. */
+		if (gsr_stream_start() == 0) {
+			gsr_stream_active = true;
+			*next_sample = now;
+		} else {
+			*next_sample = now + GSR_START_RETRY_MS;
+		}
+	} else if (request == 0 && gsr_stream_active) {
+		gsr_stream_stop();
+		gsr_stream_active = false;
+		batch_n = 0;
+	}
+
+	/*
+	 * A phone that walks away without turning the stream off would
+	 * otherwise leave the analog front end powered until the battery
+	 * died; the stream flag is cleared on disconnect.
+	 *
+	 * Deliberately NOT ble_gsr_streaming(), which also requires the CCC
+	 * subscription: an app that sends the opcode before subscribing
+	 * would have the front end powered up and then torn straight back
+	 * down on the very next pass.
+	 */
+	if (gsr_stream_active && !ble_gsr_stream_requested()) {
+		gsr_stream_stop();
+		gsr_stream_active = false;
+		batch_n = 0;
+		return;
+	}
+
+	if (!gsr_stream_active || now < *next_sample) {
+		return;
+	}
+
+	*next_sample = now + GSR_STREAM_INTERVAL_MS;
+
+	int16_t raw = 0;
+
+	if (gsr_stream_raw(&raw) != 0) {
+		return;
+	}
+
+	batch[batch_n++] = raw;
+
+	/*
+	 * Publish a full batch only. At the default MTU that is seven
+	 * samples, so a notification every 350 ms -- comfortably inside one
+	 * unfragmented packet, which is the whole reason the batch is sized
+	 * against the default rather than the negotiated MTU.
+	 */
+	if (batch_n >= ARRAY_SIZE(batch)) {
+		ble_publish_gsr(batch, batch_n);
+		batch_n = 0;
+	}
+}
+
+/*
+ * Say what the activity counters are doing, over RTT.
+ *
+ * Not a diagnostic that can be compiled out: until a phone has
+ * successfully subscribed to the Ring Service -- which per STATUS.md R10
+ * has never happened -- this log line is the ONLY way to find out whether
+ * the pedometer counts anything on a real wrist, finger or bench shake.
+ * Bringing these features up without it means walking a hundred steps and
+ * then guessing.
+ *
+ * Only speaks when something changed. A still ring overnight has nothing
+ * to report and would otherwise push the boot messages out of an 8 kB RTT
+ * buffer with identical lines; a sleep transition is exactly the event
+ * worth seeing, so it is never suppressed.
+ */
+static void log_activity(void)
+{
+	static uint32_t last_steps;
+	static bool last_asleep;
+	static bool primed;
+
+	uint32_t steps = steps_count();
+	bool asleep = sleep_is_asleep();
+
+	if (primed && steps == last_steps && asleep == last_asleep) {
+		return;
+	}
+
+	primed = true;
+	last_steps = steps;
+	last_asleep = asleep;
+
+	uint32_t kcal_x1000 = calories_total_x1000();
+
+	LOG_INF("activity: %u steps, %u spm, %u.%03u kcal, %s (%u min, "
+		"%u restless, %u total)", steps, steps_cadence_spm(),
+		kcal_x1000 / 1000U, kcal_x1000 % 1000U,
+		asleep ? "asleep" : "awake", sleep_session_minutes(),
+		sleep_restless_minutes(), sleep_total_minutes());
+}
+
+static void publish_activity(void)
+{
+	struct ring_activity a = {
+		.steps = steps_count(),
+		.cadence_spm = steps_cadence_spm(),
+		.kcal_x1000 = calories_total_x1000(),
+		.sleep_state = sleep_is_asleep() ? SLEEP_STATE_ASLEEP
+						 : SLEEP_STATE_AWAKE,
+		.sleep_session_min = sleep_session_minutes(),
+		.sleep_total_min = sleep_total_minutes(),
+		.restless_min = sleep_restless_minutes(),
+	};
+
+	ble_publish_activity(&a);
+}
+
+static void publish_hrv(void)
+{
+	struct ring_hrv h = {
+		.rmssd_x10 = hrv_rmssd_x10(),
+		.rmssd_beats = hrv_diffs(),
+	};
+
+	ble_publish_hrv(&h);
+}
+
+static void publish_spo2(void)
+{
+	struct spo2_result r;
+	struct ring_spo2 out;
+
+	spo2_result(&r);
+
+	out.ratio_x1000 = r.ratio_x1000;
+	out.percent = r.percent;
+	out.flags = r.flags;
+
+	ble_publish_spo2(&out);
+}
+
+/* Every call site that used to publish_status() alone now also publishes
+ * activity, so the two characteristics never drift out of sync on the app
+ * side -- a status update with stale steps/sleep data would be confusing
+ * in exactly the way the health flags in publish_status() are not.
+ */
+static void publish_all(void)
+{
+	publish_status();
+	publish_activity();
+	publish_hrv();
+	publish_spo2();
+}
+
+/*
+ * One SpO2 frame: the IR sample from slot 1 and the red sample from slot 2.
+ *
+ * The part emits them consecutively, so red is paired with the IR that
+ * came immediately before it. `have_ir` guards the case where the IR half
+ * was lost to a FIFO overflow -- pairing red against a stale IR from an
+ * earlier frame would bias the ratio rather than merely add noise.
+ */
+/* Consecutive IR samples with no red before the red channel is declared dead. */
+#define LONELY_IR_LIMIT		50
+
+static void report_spo2(uint8_t tag, uint32_t value)
+{
+	static uint32_t pending_ir;
+	static bool have_ir;
+	static uint32_t frames;
+	static uint16_t lonely_ir;
+
+	if (tag == TAG_PPG1_LEDC1) {
+		/*
+		 * Two IR samples in a row means slot 2 produced nothing. The
+		 * most likely cause is a sample-rate code that does not match
+		 * the number of populated slots, which the part accepts
+		 * without complaint -- so say so rather than sit here pairing
+		 * nothing for the whole window.
+		 */
+		if (have_ir && ++lonely_ir == LONELY_IR_LIMIT) {
+			LOG_ERR("SpO2: %d IR samples with no red -- slot 2 is "
+				"not firing, check PPG_CONFIG_2 against the "
+				"slot count", LONELY_IR_LIMIT);
+		}
+
+		pending_ir = value;
+		have_ir = true;
+		return;
+	}
+
+	if (tag != TAG_PPG1_LEDC2) {
+		LOG_WRN("unexpected FIFO tag 0x%02x in SpO2 mode (data %u)",
+			tag, value);
+		return;
+	}
+
+	if (!have_ir) {
+		return;
+	}
+
+	have_ir = false;
+	lonely_ir = 0;
+	spo2_feed(value, pending_ir);
+
+	if (++frames < SAMPLE_RATE_HZ) {
+		return;
+	}
+	frames = 0;
+
+	struct spo2_result r;
+
+	spo2_result(&r);
+
+	if (r.flags & SPO2_FLAG_VALID) {
+		LOG_INF("SpO2 R %u.%03u -> %u%% (UNCALIBRATED)",
+			r.ratio_x1000 / 1000U, r.ratio_x1000 % 1000U,
+			r.percent);
+	} else {
+		LOG_INF("SpO2 acquiring (%s)",
+			spo2_finger_present() ? "finger on, no pulse yet"
+					      : "no finger");
+	}
+
+	publish_all();
 }
 
 static void report(uint32_t raw)
@@ -303,12 +729,30 @@ static void report(uint32_t raw)
 	uint32_t value = FIFO_DATA(raw);
 	uint16_t bpm_x10 = 0;
 
+	if (spo2_window) {
+		report_spo2(tag, value);
+		return;
+	}
+
 	if (tag != TAG_PPG1_LEDC1) {
 		LOG_WRN("unexpected FIFO tag 0x%02x (data %u)", tag, value);
 		return;
 	}
 
 	bool beat = hr_update(&hr_state, value, &bpm_x10);
+
+	/*
+	 * Feed HRV only the intervals the detector vouches for. hr.c decides
+	 * both parts of that: trusted means the interval passed the bpm range
+	 * and agreed with the median, successive means the one before it did
+	 * too and was genuinely adjacent. An untrusted interval is still
+	 * offered, with successive false, so that it breaks the run rather
+	 * than silently letting the next difference span the gap it left.
+	 */
+	if (beat && hr_last_ibi_trusted(&hr_state)) {
+		hrv_add_interval(hr_last_ibi_ms(&hr_state),
+				 hr_last_ibi_successive(&hr_state));
+	}
 
 	win_count++;
 
@@ -335,7 +779,7 @@ static void report(uint32_t raw)
 					? "finger on, acquiring" : "no finger");
 		}
 
-		publish_status();
+		publish_all();
 		win_count = 0;
 	}
 }
@@ -402,7 +846,19 @@ static int ppg_on(void)
 		return -ENODEV;
 	}
 
-	err = maxm86161_start_ppg(&ppg, PPG_LED, PPG_LED_PA);
+	/*
+	 * Latch the mode for this whole window. Red+IR and green are
+	 * different FIFO layouts, so report() has to know which one it is
+	 * decoding, and that answer must not change under it mid-window.
+	 */
+	spo2_window = ble_spo2_mode();
+
+	if (spo2_window) {
+		err = maxm86161_start_spo2(&ppg, SPO2_IR_PA, SPO2_RED_PA);
+	} else {
+		err = maxm86161_start_ppg(&ppg, PPG_LED, PPG_LED_PA);
+	}
+
 	if (err) {
 		LOG_ERR("PPG start failed (%d)", err);
 		(void)regulator_disable(VLED_BOOST);
@@ -410,6 +866,8 @@ static int ppg_on(void)
 	}
 
 	hr_init(&hr_state, SAMPLE_RATE_HZ);
+	spo2_reset();
+
 	return 0;
 }
 
@@ -492,8 +950,12 @@ int main(void)
 	int64_t next_window = 0;
 	int64_t next_slow = 0;
 	int64_t next_imu_retry = 0;
+	int64_t next_activity_min = 0;
+	int64_t next_gsr_sample = 0;
 	int64_t window_started = 0;
 	int64_t last_motion = 0;
+	int64_t last_step_motion = 0;
+	uint32_t steps_at_last_min = 0;
 	bool waiting_for_finger = false;
 
 	LOG_INF("ring firmware starting");
@@ -634,6 +1096,12 @@ int main(void)
 		subsystem_flags |= RING_FLAG_IMU_OK;
 	}
 
+	steps_init();
+	sleep_init();
+	calories_init();
+	hrv_init();
+	spo2_init();
+
 	/* Nothing to measure yet: shut the optics down and wait for motion. */
 	ppg_off();
 
@@ -651,7 +1119,19 @@ int main(void)
 
 	(void)imu_arm_wake(WAKE_THRESHOLD_MG);
 	last_motion = k_uptime_get();
+	/* Same assumption last_motion makes: the ring was just handled. Left
+	 * at 0 this would instead depend on how long boot happened to take.
+	 */
+	last_step_motion = k_uptime_get();
 	next_window = k_uptime_get() + measure_period_ms;
+
+	/*
+	 * A minute from now, not immediately. The other periodic timers start
+	 * at 0 so their first poll happens on the first pass, which is right
+	 * for a poll and wrong for an accumulator: firing at boot would credit
+	 * a minute of resting calories to a minute that has not happened.
+	 */
+	next_activity_min = k_uptime_get() + 60000;
 
 	/*
 	 * Watchdog last, once every subsystem has had its chance.
@@ -694,6 +1174,14 @@ int main(void)
 		 *   measuring       : ~0.5 s failed FIFO read
 		 *                     + ~0.5 s ppg_off() on the 5th failure,
 		 *                       doubled under BENCH (led_solid too) = 1.5 s
+		 *   measuring, pedometer feed: the imu_magnitude_mg() call added
+		 *                     for steps/sleep tracking is skipped by the
+		 *                     `break` on the 5th-failure path above, so
+		 *                     it never stacks with ppg_off() in the same
+		 *                     pass. On its own: ~0.5 s FIFO + ~0.5 s this
+		 *                     read = 1.0 s, under the 1.5 s figure above.
+		 *   GSR stream start: 0.8 s settle inside gsr_stream_start(),
+		 *                     once per stream, fed straight after
 		 *   idle, IMU retry : ~1.5 s imu_init() (fed straight after)
 		 *
 		 * ~4.5 s against the 10 s budget. Both ppg_off() and imu_init()
@@ -704,6 +1192,40 @@ int main(void)
 		 * put a feed beside it or raise CONFIG_RING_WATCHDOG_TIMEOUT_MS.
 		 */
 		ring_wdt_feed();
+
+		/*
+		 * --- activity control, checked in every state ---
+		 *
+		 * The only place steps_reset()/sleep_reset()/calories_reset()/
+		 * calories_set_weight() are called -- see the comment above
+		 * activity_reset_pending's declaration for why the BLE
+		 * callbacks only set these instead of calling straight in.
+		 */
+		if (atomic_cas(&activity_reset_pending, 1, 0)) {
+			/* steps_reset() first: sleep_reset() re-snapshots the
+			 * step count and would otherwise keep a snapshot from
+			 * before the counter was zeroed.
+			 */
+			steps_reset();
+			sleep_reset();
+			calories_reset();
+			steps_at_last_min = 0;
+			LOG_INF("activity counters reset (app request)");
+		}
+
+		{
+			uint16_t w = (uint16_t)atomic_set(&pending_weight_kg_x10, 0);
+
+			if (w != 0) {
+				calories_set_weight(w);
+				LOG_INF("body weight set: %u.%u kg (app request)",
+					w / 10U, w % 10U);
+			}
+		}
+
+		/* --- raw GSR stream, checked in every state --- */
+		service_gsr_stream(now, &next_gsr_sample);
+		ring_wdt_feed();	/* the start path holds 800 ms */
 
 		/* --- charger, checked in every state --- */
 		if (now >= next_pmic) {
@@ -752,7 +1274,7 @@ int main(void)
 							 PMIC_POLL_MS) / 1000U);
 						state = RING_IDLE;
 						next_window = now;
-						publish_status();
+						publish_all();
 					}
 				}
 			} else {
@@ -785,14 +1307,14 @@ int main(void)
 								 BENCH_LED_PA);
 #endif
 					state = RING_CHARGING;
-					publish_status();
+					publish_all();
 				} else if (!charging &&
 					   state == RING_CHARGING) {
 					LOG_INF("state -> %s",
 						state_name[RING_IDLE]);
 					state = RING_IDLE;
 					next_window = now;
-					publish_status();
+					publish_all();
 				}
 			}
 		}
@@ -804,10 +1326,49 @@ int main(void)
 		if (now >= next_slow && state != RING_CHARGING) {
 			slow_sense();
 			next_slow = now + SLOW_SENSE_MS;
-			publish_status();
+			publish_all();
 
 			/* Battery reads plus the 800 ms GSR settle. */
 			ring_wdt_feed();
+		}
+
+		/*
+		 * --- calories, once a minute ---
+		 *
+		 * steps_update()/sleep_feed() run inline wherever the IMU is
+		 * already being read (below); calories only needs how many
+		 * steps that left behind since the last tick, which is an
+		 * average over the minute rather than a sample of whatever was
+		 * happening at the instant it fired. No I2C traffic here, so no
+		 * watchdog feed is needed beside it.
+		 */
+		if (now >= next_activity_min) {
+			uint32_t steps_now = steps_count();
+
+			/*
+			 * Not while charging. The ring reads no accelerometer
+			 * in that state, so steps and sleep already stop dead;
+			 * accruing resting calories through a two-hour charge
+			 * would credit ~147 kcal at 70 kg to a wearer the ring
+			 * has no reason to believe is wearing it, and would
+			 * contradict the rule sleep.c applies to the very same
+			 * gap. The deadline still moves, so coming off the
+			 * charger does not fire a catch-up burst.
+			 */
+			if (state != RING_CHARGING) {
+				/* Clamped: the control characteristic can zero
+				 * the step counter between two ticks, and
+				 * unsigned, that wraps.
+				 */
+				calories_update_minute(
+					steps_now >= steps_at_last_min
+					? steps_now - steps_at_last_min : 0);
+			}
+
+			steps_at_last_min = steps_now;
+			next_activity_min = now + 60000;
+
+			log_activity();
 		}
 
 		/*
@@ -824,7 +1385,10 @@ int main(void)
 
 		switch (state) {
 		case RING_CHARGING:
-			k_msleep(200);
+			/* Skin conductance does not care that the ring is on
+			 * a charger, so the stream keeps its cadence here.
+			 */
+			k_msleep(ble_gsr_streaming() ? GSR_STREAM_POLL_MS : 200);
 			break;
 
 		case RING_IDLE: {
@@ -856,7 +1420,16 @@ int main(void)
 				ring_wdt_feed();
 			}
 
-			mg = imu_magnitude_mg();
+			/*
+			 * Once the part is written off there is no retry
+			 * left for a read to feed, so asking can only cost
+			 * a full I2C timeout on every pass, for ever --
+			 * the same waste RING_MEASURING already refuses to
+			 * pay by gating its feed on imu_ready. Report it as
+			 * the failed read it would have been, so each
+			 * branch below takes the path it takes for one.
+			 */
+			mg = imu_unrecoverable ? -EIO : imu_magnitude_mg();
 
 			/*
 			 * Keep the IMU flag current, the way the PPG and PMIC flags
@@ -932,6 +1505,31 @@ int main(void)
 				last_motion = now;
 			}
 
+			/*
+			 * Feed the pedometer and sleep tracker off the same
+			 * magnitude read used for the motion timeout above --
+			 * no extra I2C traffic for either.
+			 *
+			 * imu_ready, not just mg >= 0. A part that was never
+			 * configured answers reads perfectly well and returns
+			 * zeros (the failure the comment above describes), and
+			 * zeros are not a failed read: they are a magnitude of
+			 * 0 mg, a full 1 g away from rest. That would refresh
+			 * last_step_motion on every pass -- pinning the ring to
+			 * the fast poll for as long as it ran -- and make every
+			 * sleep bucket look active, so a session could never
+			 * start. Feeding nothing is the honest answer when
+			 * there is no working accelerometer; sleep.c's gap
+			 * handling closes any session that was open.
+			 */
+			if (imu_ready && mg >= 0) {
+				if (abs(mg - 1000) > STEP_MOTION_MG) {
+					last_step_motion = now;
+				}
+				steps_update(mg, now);
+				sleep_feed(mg, now);
+			}
+
 			if (ble_imu_streaming()) {
 				struct imu_accel a;
 
@@ -955,14 +1553,30 @@ int main(void)
 					state = RING_MEASURING;
 					window_started = now;
 					waiting_for_finger = !forced;
+					/* Each window gets its own budget of
+					 * accelerometer retries.
+					 */
+					act_fail_count = 0;
 					LOG_INF("state -> %s%s", state_name[state],
 						forced ? " (app requested)" : "");
-					publish_status();
+					publish_all();
 				} else {
 					next_window = now + measure_period_ms;
 				}
 			} else {
-				k_msleep(ble_imu_streaming() ? 20 : 200);
+				/*
+				 * Poll fast enough to actually see footfalls
+				 * while the ring is moving, and fall back to
+				 * the idle rate once it is still. See
+				 * STEP_POLL_MS.
+				 */
+				bool maybe_walking =
+					(now - last_step_motion) < STEP_POLL_HOLD_MS;
+
+				k_msleep(ble_imu_streaming() ? 20
+					 : ble_gsr_streaming() ? GSR_STREAM_POLL_MS
+					 : maybe_walking ? STEP_POLL_MS
+					 : IDLE_POLL_MS);
 			}
 			break;
 		}
@@ -998,7 +1612,7 @@ int main(void)
 					subsystem_flags &= ~RING_FLAG_PPG_OK;
 					state = RING_IDLE;
 					next_window = now + measure_period_ms;
-					publish_status();
+					publish_all();
 					break;
 				}
 			}
@@ -1011,7 +1625,54 @@ int main(void)
 				}
 			}
 
-			if (hr_finger_present(&hr_state)) {
+			/*
+			 * Keep the pedometer and sleep tracker fed during a
+			 * measurement window too, not just while idle -- a
+			 * window covers up to 15 s in every 60, and skipping
+			 * it would silently undercount steps taken while
+			 * worn and moving. Gated on imu_ready so a part
+			 * already known dead is not charged a full I2C
+			 * timeout here as well as in RING_IDLE.
+			 *
+			 * The IMU health machinery deliberately lives in
+			 * RING_IDLE and is not duplicated here, so this read
+			 * has no fail counter behind it to stop it retrying.
+			 * Without a limit, an IMU that wedges while the PPG
+			 * stays healthy would cost a full I2C timeout on
+			 * every 20 ms pass for the whole window -- roughly
+			 * 500 ms of stalled bus per pass, for 15 s of
+			 * window, achieving nothing. Give up on the feed for
+			 * the rest of this window instead; the next window
+			 * starts fresh, and RING_IDLE still owns deciding
+			 * whether the part is actually dead.
+			 */
+			if (imu_ready && act_fail_count < ACT_FAIL_LIMIT) {
+				int act_mg = imu_magnitude_mg();
+
+				if (act_mg >= 0) {
+					act_fail_count = 0;
+					if (abs(act_mg - 1000) > STEP_MOTION_MG) {
+						/*
+						 * Keeps the fast idle poll from
+						 * being re-earned from scratch
+						 * when the window closes: the
+						 * hold would otherwise have
+						 * expired mid-window and the
+						 * first idle pass would use the
+						 * slow rate that counts nothing.
+						 */
+						last_step_motion = now;
+					}
+					steps_update(act_mg, now);
+					sleep_feed(act_mg, now);
+				} else {
+					/* Bounded by the enclosing condition. */
+					act_fail_count++;
+				}
+			}
+
+			if (spo2_window ? spo2_finger_present()
+					: hr_finger_present(&hr_state)) {
 				waiting_for_finger = false;
 				last_motion = now;
 			}
@@ -1032,7 +1693,7 @@ int main(void)
 				next_window = now + measure_period_ms;
 				LOG_INF("state -> %s%s", state_name[state],
 					give_up ? " (no finger)" : "");
-				publish_status();
+				publish_all();
 			} else {
 				k_msleep(POLL_INTERVAL_MS);
 			}

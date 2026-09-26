@@ -56,7 +56,7 @@ which firmware you are talking to before you decide what to trust.
 
 | Characteristic | UUID | Value |
 |---|---|---|
-| Firmware Revision | `0x2A26` | `0.4.0` |
+| Firmware Revision | `0x2A26` | `0.5.0` |
 | Manufacturer Name | `0x2A29` | `Ring project` |
 | Model Number | `0x2A24` | `Ring ANNA-B402` |
 
@@ -74,6 +74,10 @@ this service now requires an encrypted link** — see Pairing, below.
 | PPG stream | `f0a10002-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
 | IMU stream | `f0a10003-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
 | Control | `f0a10004-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Write, Write w/o response | Encrypted write |
+| Activity | `f0a10005-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
+| HRV | `f0a10006-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
+| GSR stream | `f0a10007-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
+| SpO2 | `f0a10008-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 
 ### Pairing
 
@@ -195,10 +199,21 @@ opcode `0x01`.
 ```
 offset 0   u32  seq          increments per notification, gaps = dropped packets
 offset 4   u8   count        number of samples that follow
-offset 5   u32[count]        19-bit ADC values, zero-extended
+offset 5   u32[count]        raw FIFO words: tag in bits 23:19, ADC value in bits 18:0
 ```
 
-Sample rate is **100 Hz**. Packet size adapts to the negotiated MTU:
+Each word is the **raw FIFO entry**, not a bare ADC value: mask with
+`0x7FFFF` for the reading and shift right by 19 for the 5-bit tag that says
+which measurement slot produced it. In the normal single-LED mode every
+word carries tag `0x01` (green).
+
+**In SpO2 mode this stream changes shape.** Two LEDs means two slots, so
+words arrive interleaved at 200 a second — tag `0x01` for IR and tag `0x02`
+for red — rather than 100 single-channel samples. Demultiplex on the tag
+rather than assuming alternation, and do not feed the mixed stream into a
+heart-rate algorithm expecting one channel.
+
+Sample rate is **100 Hz** per channel. Packet size adapts to the negotiated MTU:
 
 | MTU | Samples per notification |
 |---|---|
@@ -242,9 +257,19 @@ Write (with or without response). First byte is the opcode.
 | `0x03` | none | Start a measurement window immediately, skipping the duty cycle |
 | `0x04` | `u16 window_s`, `u16 period_s` | Set duty cycle, little-endian |
 | `0x05` | none | Clear every bond, then disconnect |
+| `0x06` | `u16 weight_kg_x10` | Set body weight for the calorie estimate, little-endian, kilograms x10 (e.g. `700` = 70.0 kg) |
+| `0x07` | none | Reset steps, sleep and calorie counters to zero |
+| `0x08` | `u8 on` | Raw GSR streaming on/off. Powers the analog front end for as long as it runs |
+| `0x09` | `u8 on` | SpO2 mode on/off. Runs red+IR instead of green; **heart rate pauses** while on |
 
 Duty cycle values are clamped in firmware: window 5-300 s, period
 window-3600 s. Defaults are a **15 s window every 60 s**, i.e. 25% duty.
+
+Weight is clamped to 20.0-250.0 kg and defaults to 70.0 kg until set —
+without it the calorie estimate in the Activity characteristic (section 7)
+is only right for someone who happens to weigh 70 kg. It is not persisted
+across a reboot; send it again after every reconnect if you want it to
+stick, the same way you would re-apply a duty cycle.
 
 `0x05` is the unpair path. `CONFIG_BT_MAX_PAIRED` is 1 and
 `CONFIG_BT_KEYS_OVERWRITE_OLDEST` is deliberately off, so without it the
@@ -277,9 +302,347 @@ Example — hand the ring to somebody else:
 write [0x05]        then expect a disconnect
 ```
 
+Example — set body weight to 68.5 kg:
+
+```
+write [0x06, 0xAD, 0x02]
+              weight_kg_x10=685 (68.5 kg, 0x02AD little-endian)
+```
+
+Example — start a new day (zero steps/sleep/calories):
+
+```
+write [0x07]
+```
+
 ---
 
-## 7. Behaviour your app has to expect
+## 7. Activity characteristic
+
+17 bytes, little-endian. Steps, sleep and calories, all derived from the
+accelerometer only — there is no independent sensor for any of these.
+Readable at any time; notified alongside Status, so the two never disagree
+about which measurement period they describe.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u32 | `steps` | Total since boot or the last reset (opcode `0x07`) |
+| 4 | u32 | `kcal_x1000` | Kilocalories x1000 since boot or the last reset |
+| 8 | u16 | `cadence_spm` | Current steps per minute, 0 within a few seconds of stopping |
+| 10 | u16 | `sleep_session_min` | Minutes into the current sleep session, 0 while awake |
+| 12 | u16 | `sleep_total_min` | Minutes asleep since boot or the last reset |
+| 14 | u16 | `restless_min` | Minutes of motion during the current/last session that did not end it |
+| 16 | u8 | `sleep_state` | 0 awake, 1 asleep |
+
+**None of this has been validated on hardware.** Steps come from
+peak-detecting the IMU's acceleration magnitude — the same "plausible,
+never checked against a reference" caveat that applies to heart rate in
+section 13 applies here, and more so: a finger-worn ring does not move the
+way a wrist or waist does, so even the detector's assumptions about what a
+footstep looks like are unproven on this board. Calories are steps run
+through a standard MET table, which only has a step count from the same
+unvalidated detector to work from, plus whatever weight the app sent
+(opcode `0x06`) or the 70 kg default. Treat every field here as a rough,
+uncalibrated trend line, not a number to show without a caveat.
+
+Three specific behaviours are worth designing around, because they are
+confirmed in simulation rather than hypothetical:
+
+* **"Asleep" really means "has not moved much for a while".** The
+  classifier has one input — whether any minute saw a peak deviation of
+  100 mg — and its behaviour is close to binary. Measured in simulation
+  over an 8-hour stretch:
+
+  | Wearer moves… | Logged as sleep |
+  |---|---|
+  | at least every 8 minutes | 0 of 8 hours |
+  | only every 16 minutes | 8 of 8 hours |
+
+  The transition sits at the 10 consecutive still minutes sleep onset
+  requires. So anyone genuinely motionless for quarter-hours at a time —
+  a long film, a flight, a nap on a sofa — is reported as asleep, and a
+  restless sleeper who shifts every few minutes may never register a
+  session at all.
+
+* **A ring that is not being worn logs sleep too.** A ring on a
+  nightstand is perfectly still, so it scores as the deepest sleep the
+  algorithm can report. The only wear signal on this board is the PPG DC
+  level, and the power model deliberately stops opening PPG windows after
+  three minutes without motion — precisely the case that would need
+  checking. An eight-hour "session" with `restless_min == 0` and no steps
+  on either side of it is far more likely to be a bedside table than a
+  night's sleep; corroborate before showing it.
+* **Gentle motion is not counted.** The detector needs roughly a ±100 mg
+  swing in acceleration magnitude. Slow, smooth walking that never reaches
+  that — and any stepping done with the hand in a pocket or resting on a
+  pram handle — registers as nothing. Under-counting is the deliberate
+  choice here: the threshold that would catch those also counts typing and
+  gesturing as walking.
+* **Everything stops while charging.** The ring reads no accelerometer at
+  all in that state, so steps stop, a sleep session in progress ends
+  rather than spanning the charge (`sleep_total_min` keeps whatever was
+  credited before it), and `kcal_x1000` stops advancing — the ring has no
+  reason to believe it is on a finger. Expect a flat spot, not a gap in
+  the counters, and do not interpolate across it.
+
+### Counters are since-boot, and a reboot zeroes them
+
+**None of this is stored in flash.** Every field in this characteristic
+lives in RAM and starts again from zero on any reset — a watchdog reboot,
+a fatal error, a flat battery, or the battery contact bouncing under flex
+(`HARDWARE_NOTES.md` §13, and it is a known issue on this revision). The
+ring is not the system of record for anything here. **Your app is.**
+
+Persistence was deliberately not added in firmware: the settings
+partition has never been successfully written on this board, and putting
+a step counter on a flash-write path before that is proven would risk the
+bonds alongside it.
+
+So accumulate on the phone side, and detect the resets:
+
+1. Subscribe to **Status** as well as Activity, and watch `uptime_s`.
+2. **If `uptime_s` goes backwards, the ring rebooted.** Everything in the
+   Activity packet restarted from zero at that moment.
+3. Keep your own running totals. On each read, add the *delta* since your
+   last sample, and after a reboot treat the new value as the delta
+   directly rather than subtracting your previous total from it — which
+   would otherwise go negative and, unsigned, wrap.
+
+Polling only the Activity characteristic cannot detect this: it carries
+no uptime of its own, and a reboot mid-walk looks exactly like a step
+count that quietly stopped climbing.
+
+The same applies to body weight (opcode `0x06`), which also lives in RAM
+— resend it after any reboot you detect, or the calorie estimate silently
+reverts to assuming 70 kg.
+
+There is also no RTC on this board (see README), so `sleep_session_min`
+and `sleep_total_min` are durations, not clock times. If you want to show
+"fell asleep at 11:42 PM," subtract `sleep_session_min` minutes from the
+phone's own clock at the moment you read the characteristic — the ring has
+no notion of wall-clock time to hand you instead.
+
+---
+
+## 8. HRV characteristic
+
+3 bytes, little-endian. Notified alongside Status, so a reading always
+pairs with the `hr_x10` and signal-quality numbers from the same moment.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u16 | `rmssd_x10` | RMSSD in milliseconds x10. **0 means not enough clean beats** |
+| 2 | u8 | `rmssd_beats` | Successive differences behind the value |
+
+`rmssd_beats` is the count of successive differences, so N differences
+come from N+1 consecutive accepted beats. It is published so you can
+apply your own bar: the firmware reports from 10 differences upward,
+which is well under the 30-60 seconds of beats the HRV literature asks
+for. Treat a value with 10-15 behind it as indicative, and wait for 30+
+before showing a number you expect someone to act on.
+
+### What gets counted
+
+Only intervals that passed both of the beat detector's gates:
+
+* the 30-220 bpm plausibility range, which every interval must pass to
+  reach the heart-rate estimate at all, and
+* agreement with the median of the recent intervals to within **20 %**.
+
+That second bar is deliberately far tighter than the 40 % the heart rate
+itself uses. A heart rate takes a median and shrugs off one odd interval;
+RMSSD squares the error and lands it in two successive differences.
+Measured: a metronome pulse train with a motion artifact partway through
+each beat gets the artifact accepted as a real beat, and at 40 % the
+resulting 600/400 ms alternation invents 200 ms of HRV from a rhythm that
+has none. 20 % is the conventional artifact-rejection bound in the HRV
+literature, and ordinary beat-to-beat variation sits far inside it — an
+RMSSD of 40 ms on 1000 ms intervals is a 4 % swing.
+
+A difference is only formed between two intervals that were genuinely
+adjacent. A beat that was detected and then rejected still moves the beat
+clock, so the interval following it is measured from a suspect beat — that
+interval starts a new run rather than pairing across the gap. This matters
+more than it sounds: a difference spanning a missed beat is roughly a
+whole interval wide, and it enters the sum squared. Simulated, disabling
+that one rule took a steady pulse train from 0 ms to 144 ms of apparent
+HRV.
+
+### The 10 ms floor, which you should surface
+
+Beats are located to the nearest PPG sample and the PPG runs at 100 sps,
+so **every interval is a multiple of 10 ms**. That quantisation alone puts
+a floor under RMSSD: a metronome-steady heart with no variability at all
+measures about **8.5 ms**, which is measured in `tests/test_hrv.c` rather
+than estimated.
+
+It adds in quadrature, so the error is not uniform:
+
+| True RMSSD | Reads about |
+|---|---|
+| 40 ms | 41 ms |
+| 30 ms | 31 ms |
+| 20 ms | 22 ms |
+| 10 ms | 13 ms |
+
+A relaxed subject is barely affected. Low-HRV readings — stress,
+exertion, illness, exactly the states a user would most want to trust —
+are inflated the most and proportionally the most. Do not present small
+differences between low readings as meaningful.
+
+### It is not a 60-second RMSSD
+
+The power model runs the PPG for 15 s in every 60, which is not enough
+beats for a conventional window, so the ring keeps a rolling window of the
+last 64 successive differences instead. At the default duty cycle that
+window can span several minutes of wall time. No difference is ever
+manufactured across a gap, but the reading is an average over a longer and
+more ragged span than the literature's.
+
+**If you want a reading closer to the textbook definition, buy yourself a
+longer window**: control opcode `0x04` with a 60 s window and a 60 s
+period runs the PPG continuously, and opcode `0x03` forces one immediately.
+Both cost battery — the LEDs are the dominant draw — so do it while the
+user is looking at an HRV screen, not in the background.
+
+---
+
+## 9. GSR stream
+
+Raw skin conductance, off by default. Enable with control opcode `0x08`.
+
+```
+offset 0   u32  seq          increments per notification, gaps = dropped packets
+offset 4   u8   count        number of samples that follow
+offset 5   i16[count]        raw ADC counts, signed
+```
+
+**Sampled at 20 Hz.** The 1 Hz `gsr_mv` in the status packet exists for a
+diagnostics view and is useless for event detection: a skin conductance
+response peaks roughly 1.4 s after onset, so at 1 Hz you get about one
+sample on the rise. 20 Hz is used rather than 10 so that ordinary jitter
+in the firmware's main loop cannot drop the effective rate below the 10 Hz
+floor where the shape stops being resolvable.
+
+Batches are sized to the **default 23-byte MTU**: seven samples per
+notification, about three notifications a second, always one unfragmented
+packet. Requesting a larger MTU makes the packets no bigger — unlike the
+PPG stream, this one is slow enough not to need it.
+
+**Counts, not millivolts, and deliberately so.** Converting to volts and
+from there to conductance needs `V_REF` and `R5`, which are board-specific
+and — on this revision — not yet trusted. Sending counts keeps that
+calibration on the phone, where you can change it without a firmware
+flash. If you want the firmware's current opinion of the conversion, read
+`gsr_mv` from Status and compare.
+
+### This costs real battery
+
+Enabling the stream holds `GSR_PWR` on continuously, because the front end
+takes **800 ms to settle** and paying that per sample would defeat the
+point. That suspends the analog side's duty cycling entirely for as long
+as the stream runs. Turn it off when the user leaves the screen. It is
+forced off on disconnect, so a phone that walks away cannot leave it
+powered.
+
+The first notification arrives roughly a second after you enable it: 800 ms
+of settle, then seven samples at 20 Hz. That delay is the settle, not a
+fault — and sampling before it completes would return the tail of a
+power-on transient that looks exactly like a large response at the start
+of every recording.
+
+Order does not matter: you may subscribe before or after sending `0x08`.
+Samples taken before you subscribe are simply not sent.
+
+### It is unvalidated, and that is why it exists
+
+**Nobody has confirmed the GSR front end produces a meaningful reading.**
+`STATUS.md` has carried it as "unknown" for the life of the project: the
+analog path had two firmware bugs, one is fixed, the second is a
+hypothesis, and even with the ADC correct, R5 = 91 kΩ against dry skin
+through 2 mm electrodes gives only a 1-10 % swing.
+
+The stream is shipped anyway because **it is the instrument that settles
+the question**. A 1 Hz scalar could never show whether the signal has the
+shape of a real skin conductance response; a 20 Hz trace can. Expect to
+use this for diagnosis before you use it for a feature, and do not build a
+user-facing number on it until a trace off a real finger has been looked
+at.
+
+---
+
+## 10. SpO2 characteristic
+
+4 bytes, little-endian. Off by default; enable with control opcode `0x09`.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u16 | `ratio_x1000` | Ratio of ratios, R, x1000. **0 means not measured** |
+| 2 | u8 | `percent` | SpO2 percentage. **0 means not measured** |
+| 3 | u8 | `flags` | see below |
+
+| Bit | Meaning |
+|---|---|
+| 0 | `UNCALIBRATED` — the percentage comes from an uncalibrated curve |
+| 1 | `VALID` — the window held enough clean pulsatile signal for R to mean anything |
+
+### Read this before you display a percentage
+
+**Bit 0 is always set, in every build this firmware has.** It is not a
+transient condition you can wait out.
+
+`ratio_x1000` is a real measurement. R falls out of the optics and the
+arithmetic — the ratio of each channel's pulsatile component to its steady
+one — and needs no calibration:
+
+```
+R = (AC_red / DC_red) / (AC_ir / DC_ir)
+```
+
+`percent` is not. Turning R into a saturation takes an empirical curve
+that every manufacturer derives by desaturating volunteers under a
+reference oximeter and fitting the result. This firmware uses the
+published default (`SpO2 = 110 − 25R`) which assumes an optical geometry,
+LED wavelengths and photodiode response that **nobody has checked against
+this board**. The number it produces is an illustration of the arithmetic,
+not a measurement of anyone's blood.
+
+So: show R, or show the percentage clearly labelled as uncalibrated, or
+show nothing. Do not put a bare number next to a lung icon. If you only
+have room for one, R is the honest choice and it is the value a future
+calibration would be fitted against — record it alongside a reference
+oximeter reading and you are most of the way to fixing this properly.
+
+Readings outside 70-100 % are withheld entirely (`percent` reads 0, R is
+still reported). A number in the 50s reads as a medical emergency, and
+this firmware has no business generating one.
+
+### What it costs
+
+SpO2 mode lights the red and IR LEDs instead of green, so:
+
+* **Heart rate pauses.** Every HR number this firmware produces comes from
+  the green channel. While SpO2 mode is on, `hr_x10` reads 0, HRS
+  notifications stop, and `ppg_dc`, `ppg_ac` and `perfusion_x10` in Status
+  read 0 as well. RMSSD stops accumulating. Turn SpO2 off to get them
+  back.
+* `flags` bit 0 of Status — finger present — keeps working, because the
+  red/IR DC level answers that question as well as green did.
+* The mode takes effect at the **next measurement window**, not
+  immediately: switching LEDs underneath a half-collected measurement
+  would corrupt both. Sending `0x09` requests a window, so expect a result
+  within about 15 seconds; a window already running finishes first.
+* Two LEDs instead of one costs roughly twice the optical power for the
+  duration of a window. It is forced off on disconnect.
+
+Both LEDs run at the same drive current, which is the conventional
+starting point — the ratio of ratios divides absolute intensity out, so
+the currents only need to put both channels in a sensible part of the ADC
+range.
+
+---
+
+## 11. Behaviour your app has to expect
 
 **The ring is not always measuring.** By default the optical front end is
 off for 45 seconds out of every 60, and completely off when the ring has
@@ -308,7 +671,7 @@ first detected, so the user gets confirmation without opening the app.
 
 ---
 
-## 8. Connection parameters
+## 12. Connection parameters
 
 The firmware does not request specific connection parameters, so you get
 whatever the phone proposes. Recommendations:
@@ -323,7 +686,7 @@ length extension if your stack exposes it.
 
 ---
 
-## 9. Caveats worth knowing
+## 13. Caveats worth knowing
 
 These are real limitations of the current hardware and firmware, not
 things to paper over in the UI.
@@ -385,7 +748,7 @@ and no bond has ever been cleared.
 
 ---
 
-## 10. Quick start
+## 14. Quick start
 
 1. Scan for service `0x180D`, connect
 2. Request MTU 247

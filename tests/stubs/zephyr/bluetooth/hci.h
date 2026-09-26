@@ -1,0 +1,8 @@
+/* Syntax-check stub. */
+#ifndef ZSTUB_BT_HCI_H_
+#define ZSTUB_BT_HCI_H_
+#define BT_HCI_ERR_REMOTE_USER_TERM_CONN	0x13
+#define BT_ATT_ERR_INVALID_OFFSET		0x07
+#define BT_ATT_ERR_INVALID_ATTRIBUTE_LEN	0x0d
+#define BT_ATT_ERR_VALUE_NOT_ALLOWED		0x13
+#endif

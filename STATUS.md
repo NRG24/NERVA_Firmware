@@ -42,28 +42,98 @@ anything newer as a bring-up, not an update.
 | Advertising restart after disconnect | **Compile only** | `recycled()` traced in Zephyr source |
 | GSR reading | **Unknown** | see §5 |
 | Heart-rate accuracy | **Unvalidated** | never against a reference monitor |
+| Step count, sleep sessions, calorie estimate | **Compile only, unvalidated** | new this revision; no board, no reference pedometer or sleep log to compare against |
+| RMSSD arithmetic | **Verified against the definition** | `tests/test_hrv.c` compares the integer pipeline to the textbook formula in floating point |
+| RMSSD against a real heart | **Unvalidated** | never compared to an ECG or a chest strap; rests on a beat detector that is itself unvalidated |
+| SpO2 ratio-of-ratios arithmetic | **Verified against the definition** | `tests/test_spo2.c`, known AC/DC on each channel |
+| SpO2 percentage | **UNCALIBRATED, and flagged as such on the wire** | the R-to-SpO2 curve is a literature default; fitting it needs desaturation against a reference oximeter |
+| Red and IR LEDs ever lit | **Never** | only the green LED has run on hardware; the two-slot sequence is compile-verified only |
+| Activity characteristic (steps/sleep/calories over BLE) | **Never exercised by any phone** | same as the rest of the Ring Service, see row above |
 
 ---
 
 ## 3. Features
 
 **Power model.** Three states. `IDLE`: optics off, 5 V boost off, IMU wake
-armed at 80 mg, CPU asleep. `MEASURING`: 15 s window every 60 s, abandoned
-after 6 s if no finger. `CHARGING`: all optics off. After 3 min without
-motion the ring stops probing on a timer and waits for the interrupt. The
-app can change the duty cycle or force a window.
+armed at 80 mg, CPU asleep, accelerometer polled every 200 ms — or every
+40 ms while recent motion says the wearer may be walking, which is what the
+pedometer needs to see footfalls at all (§5). `MEASURING`: 15 s window every
+60 s, abandoned after 6 s if no finger. `CHARGING`: all optics off, and no
+accelerometer reads at all, so steps and sleep stop with it. After 3 min
+without motion the ring stops probing on a timer and waits for the
+interrupt. The app can change the duty cycle or force a window.
 
 **Sensing.** Green-LED PPG at ~15 mA, 100 sps, FIFO polled every 20 ms.
 Integer-only HR: DC tracker → 4 Hz low-pass → adaptive threshold → median of
 8 intervals with a 60 %-of-median refractory. Battery in millivolts from the
 PMIC monitor. GSR through a transimpedance stage into the SAADC.
 
+**Activity.** Steps, sleep and calories, all derived from the IMU's
+accelerometer magnitude and none of them from any new sensor. Steps:
+peak-detection pedometer (`steps.c`), same technique as the HR detector
+applied to motion, needing roughly a 100 mg swing to fire. Sleep
+(`sleep.c`): one-minute stillness buckets, 10 consecutive still minutes to
+start a session, 3 consecutive active minutes to end one, and a session
+cannot span a gap in accelerometer data such as a charge. Calories
+(`calories.c`): a MET table keyed on steps *per minute* — a count over the
+interval, not a sampled instantaneous cadence, which is what keeps a
+minute from inheriting whatever the wearer was doing at the instant the
+tick fired — times body weight (default 70 kg, settable over BLE). All
+three stop dead in `CHARGING`, which reads no accelerometer: a ring on a
+charger is not a ring being worn, and none of them pretend otherwise.
+
+**All three are new and, like heart rate, unvalidated** (§2, §5). Two
+things to keep in front of you. **Sleep has no wear detection** — a ring
+on a nightstand is perfectly still and logs a full night, which is
+confirmed behaviour and not fixable in firmware while the power model
+stops opening PPG windows, the only wear signal, after three minutes of
+stillness. And **the sleep classifier is closer to binary than its name
+suggests**: simulated over 8 hours, a wearer moving at least every 8
+minutes logs no sleep at all, one moving only every 16 minutes logs the
+entire stretch. The cliff is the ten consecutive still minutes that onset
+requires; `tests/test_activity.c` pins both ends of it so tuning cannot
+move it unnoticed.
+
+**GSR stream.** Raw ADC counts at 20 Hz on its own characteristic, opcode
+`0x08`, off by default. The 1 Hz `gsr_mv` in the status packet cannot
+resolve a skin conductance response at all -- they peak about 1.4 s after
+onset -- so this exists to find out whether the front end produces
+anything real. Counts rather than millivolts, because the conversion
+constants are board-specific and not yet trusted. It holds `GSR_PWR` on
+for as long as it runs, so it suspends the analog duty cycling; forced off
+on disconnect.
+
+**HRV.** RMSSD over a rolling window of the last 64 successive
+differences, on its own characteristic (`hrv.c`). Only intervals that pass
+the beat detector's plausibility range *and* agree with the recent median
+to within 20 % are used -- half the 40 % the heart rate itself tolerates,
+because a metronome rhythm with a motion artifact invents 200 ms of HRV at
+the looser bar, and a difference is never formed across a rejected beat — that
+one rule is worth 144 ms of false HRV in simulation. The hardware sets the
+ceiling: beats land on 100 sps samples, so a metronome heart measures
+about 8.5 ms of HRV that is not there, which inflates low readings
+proportionally more than high ones.
+
+**SpO2.** Ratio of ratios on red and IR, opt-in via opcode `0x09`, on its
+own characteristic (`spo2.c`). The driver gained a two-slot LED sequence
+for it, refactored so the proven green path and the new red/IR path share
+one init table rather than acquiring two that drift. **R is published and
+is a real measurement; the percentage is not.** The R-to-SpO2 curve is the
+published default and has never been fitted against this hardware, so
+every reading carries an UNCALIBRATED flag that no build can clear, and
+anything outside 70-100 % is withheld rather than shown. Heart rate pauses
+while the mode is on, because every HR number here comes from the green
+channel.
+
 **BLE.** Standard HRS (0x180D) and BAS (0x180F), open by default so generic
-apps work. Custom Ring Service (`f0a1…`) with a 20-byte status packet, raw
-PPG and IMU streams, and a control characteristic — all requiring an
-encrypted link. Just Works pairing, one bond, persisted. Device Information
-Service reports firmware `0.4.0`. Control opcode `0x05` clears bonds.
-Full wire contract: [APP_INTEGRATION.md](APP_INTEGRATION.md).
+apps work. Custom Ring Service (`f0a1…`) with a 20-byte status packet, a
+17-byte activity packet, a 3-byte HRV packet, raw PPG and IMU streams, and
+a control
+characteristic — all requiring an encrypted link. Just Works pairing, one
+bond, persisted. Device Information Service reports firmware `0.5.0`.
+Control opcode `0x05` clears bonds; `0x06`/`0x07` set body weight and reset
+the activity counters. Full wire contract:
+[APP_INTEGRATION.md](APP_INTEGRATION.md).
 
 **Survivability.** 10 s hardware watchdog fed only from the main loop;
 fatal errors reboot; reset cause logged at boot. Health flags reflect
@@ -89,8 +159,10 @@ Ordered by how much it would hurt, not how likely it is.
 | R3 | **NVS partition at 0x7c000 has never been written.** A used board has stale bytes there. | Medium on a reused board | `settings_load failed`, no advertising | `pyocd erase --chip` before the first v0.4 flash. `CONFIG_NVS_INIT_BAD_MEMORY_REGION=y` is the safety net, untested. |
 | R4 | **The first phone to pair owns the ring** until opcode `0x05` is sent over the bonded link. | Certain (by design) | owner's phone gets pairing failure | owner sends `0x05`; otherwise SWD erase |
 | R5 | **Heart rate is unvalidated.** Numbers are plausible, not correct. | Certain | none — it looks fine | validate against a chest strap before any clinical or health claim |
+| R5a | **Steps, sleep and calories are unvalidated,** and doubly so for a finger-worn ring, which does not move the way a wrist or waist does. | Certain | none — the numbers look plausible | compare against a reference pedometer/sleep log once hardware exists before showing these without a caveat |
 | R6 | **Resting heart rate leaks over open HRS** to anyone in range. | Certain (chosen) | none | `-DCONFIG_RING_HRS_OPEN=n` — costs generic-app compatibility |
 | R7 | **No MITM protection.** Just Works is encrypted but unauthenticated. | Certain | none | needs a display/keypad or OOB; not fixable in firmware alone |
+| R7a | **An app could show the uncalibrated SpO2 percentage as a reading.** The flag is set on every path and the docs are explicit, but nothing in the firmware can stop a phone ignoring it. | Certain (by design) | a plausible-looking number that means nothing clinically | show `ratio_x1000`, or label the percentage; calibrate before any health claim |
 | R8 | **No OTA.** Field units can only be updated over SWD, which on this board needs series resistors and a fresh APPROTECT unlock. | Certain | — | MCUboot + DFU is the next big item |
 | R9 | **PMIC I2C dies while charging** → ring parks with optics off, then after 30 s guesses "idle" and may run LEDs against a 20 mA charger. | Low | `PMIC unreachable for 30 s` | power question, not a hazard; PMIC health flag tells the app |
 | R10 | **Custom BLE service has never been exercised.** Any of status/stream/control could be wrong on first contact. | Medium | app sees nothing / wrong bytes | it is all logged; fix from RTT |
@@ -101,7 +173,10 @@ Ordered by how much it would hurt, not how likely it is.
 
 ## 5. Known-bad and open
 
-* **GSR does not produce a meaningful reading and nobody knows why.** The
+* **GSR does not produce a meaningful reading and nobody knows why**, and
+  the new 20 Hz stream (opcode `0x08`) is the instrument meant to settle
+  it rather than a feature built on top of it. Look at a trace off a real
+  finger before trusting any of it. The
   ADC path had two firmware bugs; one (`zephyr,vref-mv` missing) is fixed
   and alone explains every 0 mV ever seen. The second (SAADC channel index)
   is a hypothesis; the move to channel 0 is made and harmless, and the
@@ -125,8 +200,55 @@ Ordered by how much it would hurt, not how likely it is.
   registers match; embedded functions do not.
 * **Logging is INF over an 8 kB RTT buffer in production.** Fine for
   bring-up, wasteful for a shipped image.
-* **No unit tests, no CI.** Verification is the five-configuration build
-  sweep run by hand on one Windows machine with NCS installed at `C:\ncs`.
+* **No CI, and the only behavioural tests are for the activity modules.**
+  Verification is still the five-configuration build sweep run by hand on
+  one Windows machine with NCS installed at `C:\ncs`. `cd tests && make`
+  now adds two things to that: it runs `steps.c`/`sleep.c`/`calories.c`
+  against a simulated wearer, which is what caught the defects listed
+  above, and it puts every file in `src/` through
+  `-fsyntax-only -Wall -Wextra -Werror` against stub Zephyr headers, in
+  both the production and bench configurations.
+  The syntax pass is a filter, not a build — the stubs are ours, so it
+  proves the code type-checks against our idea of the API and nothing
+  more. The behavioural tests cover three files out of thirteen and feed
+  them an assumed footfall rather than a recording off this board.
+  Nothing here has ever run on hardware.
+* **The pedometer needs a fast poll, and that changes the idle power
+  model.** 5 Hz — the old idle poll rate — does not undercount gait, it
+  misses it almost entirely: simulated against a 5 min walk it counted
+  nothing below a 250 mg magnitude swing, against 0–1 % error at 25 Hz.
+  So `RING_IDLE` now polls the accelerometer every 40 ms whenever recent
+  motion suggests the wearer may be walking, and drops back to 200 ms once
+  they are still (`STEP_POLL_MS` / `STEP_MOTION_MG` in `main.c`). A still
+  ring — the whole of the night — is unchanged at 5 Hz.
+  Do not read "only while moving" as "almost never", though: the 10 s
+  hold after the last qualifying motion means an ordinary active day
+  spends a lot of the waking hours on the fast poll. Simulated across
+  three days of a plausible routine, 41 % of samples were at 40 ms and
+  the average rate was 7.1 Hz against the old flat 5 Hz. That is still
+  small beside the optical front end's 15 mA duty cycle, but it is a
+  ~40 % increase in accelerometer traffic, not a rounding error. Every
+  figure here is simulation: **nobody has measured what this costs on a
+  real battery.**
+* **The 100 mg detection floor is a guess.** It rejects typing and
+  gesturing in simulation and it rejects gentle walking too. Where that
+  line actually belongs can only be settled on a wrist — sorry, a finger —
+  with a reference count.
+* **Nothing in the activity feature is persisted.** Steps, sleep minutes,
+  calories and the body weight the estimate depends on all live in RAM and
+  start from zero on any reset — watchdog (R2), fatal error, flat battery,
+  or the battery contact bouncing under flex (`HARDWARE_NOTES.md` §13).
+  This is deliberate rather than an oversight: the settings partition has
+  never been successfully written on this board (R3), and putting a step
+  counter on a flash-write path before that is proven would put the bonds
+  at risk alongside it. The app is the system of record and has to
+  accumulate its own totals, watching `uptime_s` in the status packet to
+  spot a reboot — `APP_INTEGRATION.md` §7 spells out how. Revisit once
+  NVS has demonstrably worked on real hardware.
+* **No RTC**, so sleep sessions are durations from `k_uptime_get()`, not
+  clock times — see `APP_INTEGRATION.md` §7. A session spanning a reboot
+  (watchdog reset, battery pull) is lost: `sleep.c` has no persistence and
+  starts back in the awake state.
 
 ---
 
@@ -156,6 +278,62 @@ electrodes can bridge to a rail**.
 If it reboot-loops: erase, flash `ring-fw-v0.1-bench-greenled.hex`, and
 disconnect the **battery**, not just the charger — the watchdog survives a
 soft reset.
+
+### Validating the activity features
+
+These have never touched hardware, and the numbers they produce are
+plausible-looking whether or not they are right — which is the dangerous
+kind of wrong. The `activity:` line over RTT is the only way to see them
+without a working phone app; it prints whenever the step count or the
+sleep state changes. Do these in order, because each one tells you
+something the next assumes:
+
+1. **Does it count at all?** Hold the board and walk 100 steps, counting
+   out loud. Expect an `activity:` line with a step count in the
+   neighbourhood and a plausible `spm`. Anything near zero means the
+   detector is not seeing the motion at all: check `AMPLITUDE_FLOOR_MG`
+   in `steps.c` against what a finger-worn ring actually swings, which is
+   the single biggest unknown in this feature.
+2. **Does it over-count?** Put the board on a desk for ten minutes, then
+   type at a keyboard with it strapped on for another ten. Both should
+   add zero steps. Tremor and typing counting as walking is the classic
+   pedometer failure and is what the floor is defending against.
+3. **Is the poll rate doing its job?** Walk 100 steps again, this time
+   watching whether the count keeps up in real time rather than arriving
+   late. `STEP_POLL_MS` exists because 200 ms polling counted essentially
+   nothing in simulation (§5); if counting is erratic while walking,
+   suspect the fast poll is not engaging — `STEP_MOTION_MG` decides that.
+4. **Sleep.** Leave the board perfectly still for 15 minutes: expect an
+   `asleep` line after about 10. Then pick it up and move it for 3
+   minutes: expect `awake`. Note that a board on a bench passes this test
+   perfectly while telling you nothing about a sleeping human — see the
+   wear-detection caveat in §5.
+5. **GSR, which is the point of the stream.** Enable it with control
+   opcode `0x08` and record a trace with the electrodes on a finger. Take
+   a deep breath, or have someone clap unexpectedly: a skin conductance
+   response should appear as a rise peaking roughly 1.4 s later. If the
+   trace is flat, or is pure noise with no response shape in it, that is
+   the answer the project has been waiting for since August — write it
+   into `BRINGUP_RESULTS.md` either way. Expect the first notification
+   about a second after enabling; that is the 800 ms front-end settle.
+6. **SpO2, and its LEDs.** Send opcode `0x09` and watch for the two
+   `PPG slot` lines at window start — slot 1 IR, slot 2 red. **This is the
+   first time the red and IR drivers will ever have been lit on this
+   board**, so check they come up at all before trusting anything
+   downstream. Then look for `SpO2 R x.xxx -> nn%` once a second with a
+   finger on. Record R against a reference pulse oximeter on the same
+   finger: those pairs are exactly what a calibration needs, and until
+   somebody collects them the percentage is arithmetic, not a reading.
+7. **Calories.** Send control opcode `0x06` with a real body weight
+   before believing any number; the default is 70 kg. At rest the total
+   should climb about 1.2 kcal per minute for a 70 kg wearer, which is a
+   figure you can check against the clock.
+
+Numbers worth recording in `BRINGUP_RESULTS.md` when you do: the step
+count against a hand count, the magnitude swing a real walking finger
+produces, and whether typing generates false steps. All three are
+assumptions in `tests/sim.c` right now, and every accuracy claim in this
+repo rests on them.
 
 ---
 

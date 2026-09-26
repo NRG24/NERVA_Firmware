@@ -10,3 +10,10 @@ build-*/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Host test binaries (tests/Makefile)
+tests/test_activity
+tests/test_mainloop
+tests/test_hrv
+tests/test_spo2
+tests/test_driver

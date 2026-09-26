@@ -80,13 +80,31 @@
 #define PPG_TINT_59US		2
 #define PPG_TINT_117US		3
 
-/* PPG_CONFIG_2: sample rate, bits [7:3] (N = 1 pulse per sample) */
+/*
+ * PPG_CONFIG_2: sample rate, bits [7:3].
+ *
+ * The field encodes BOTH the rate and the number of LED pulses per sample,
+ * and getting the pulse count wrong does not produce an error -- it
+ * produces a sequence the part never fully executes. Codes 0x00-0x05 are
+ * one pulse per sample (P1); 0x06-0x09 are two (P2), which is what an LED
+ * sequence with two populated slots needs. The names below are rounded:
+ * the actual rates are 24, 50, 84, 99, 199 and 399 sps.
+ *
+ * Verified against the register enumeration in Silicon Labs' MAXM86161
+ * driver, which matches the datasheet's PPG_SR table.
+ */
 #define PPG_SR_25HZ		0x00
 #define PPG_SR_50HZ		0x01
 #define PPG_SR_84HZ		0x02
 #define PPG_SR_100HZ		0x03
 #define PPG_SR_200HZ		0x04
 #define PPG_SR_400HZ		0x05
+
+/* Two pulses per sample. Required when the sequence has two slots. */
+#define PPG_SR_P2_25HZ		0x06
+#define PPG_SR_P2_50HZ		0x07
+#define PPG_SR_P2_84HZ		0x08
+#define PPG_SR_P2_100HZ		0x09
 
 /* PPG_CONFIG_2: on-chip averaging, bits [2:0] */
 #define PPG_SMP_AVE_1		0
@@ -160,6 +178,21 @@ int maxm86161_probe(struct maxm86161 *dev, const struct device *i2c);
  * current DAC code in the 31mA range, 0.12mA per LSB.
  */
 int maxm86161_start_ppg(struct maxm86161 *dev, uint8_t ledc, uint8_t pa);
+
+/*
+ * Configure a two-slot sequence for SpO2: IR in slot 1, red in slot 2, at
+ * the same 100 sps. Each frame therefore produces TWO FIFO samples, so the
+ * FIFO fills twice as fast -- 128 entries is 0.64 s of headroom rather
+ * than 1.28 s, still comfortable at the 20 ms poll.
+ *
+ * Demultiplex on the tag: IR is TAG_PPG1_LEDC1 and red is TAG_PPG1_LEDC2,
+ * because the part tags by slot and not by which LED is in it.
+ *
+ * This does NOT drive the green LED, so nothing that depends on the green
+ * channel -- which is every heart-rate number this firmware produces --
+ * works while it is running.
+ */
+int maxm86161_start_spo2(struct maxm86161 *dev, uint8_t ir_pa, uint8_t red_pa);
 
 /*
  * Drive one LED hard enough to see, for ms milliseconds, then stop.

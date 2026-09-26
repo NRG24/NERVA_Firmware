@@ -23,6 +23,10 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
  *   ppg          f0a10002-...   notify
  *   imu          f0a10003-...   notify
  *   control      f0a10004-...   write
+ *   activity     f0a10005-...   read / notify
+ *   hrv          f0a10006-...   read / notify
+ *   gsr stream   f0a10007-...   notify
+ *   spo2         f0a10008-...   read / notify
  */
 #define RING_UUID_BASE(x)	BT_UUID_128_ENCODE(0xf0a10000 | (x), 0x1e5c, \
 						   0x4a2b, 0x8d3f, \
@@ -38,13 +42,27 @@ static const struct bt_uuid_128 uuid_imu =
 	BT_UUID_INIT_128(RING_UUID_BASE(3));
 static const struct bt_uuid_128 uuid_control =
 	BT_UUID_INIT_128(RING_UUID_BASE(4));
+static const struct bt_uuid_128 uuid_activity =
+	BT_UUID_INIT_128(RING_UUID_BASE(5));
+static const struct bt_uuid_128 uuid_hrv =
+	BT_UUID_INIT_128(RING_UUID_BASE(6));
+static const struct bt_uuid_128 uuid_gsr =
+	BT_UUID_INIT_128(RING_UUID_BASE(7));
+static const struct bt_uuid_128 uuid_spo2 =
+	BT_UUID_INIT_128(RING_UUID_BASE(8));
 
 static atomic_t connected_count;
 static atomic_t status_subscribed;
 static atomic_t ppg_subscribed;
 static atomic_t imu_subscribed;
+static atomic_t activity_subscribed;
+static atomic_t hrv_subscribed;
+static atomic_t gsr_subscribed;
+static atomic_t spo2_subscribed;
 static atomic_t ppg_stream_on;
 static atomic_t imu_stream_on;
+static atomic_t gsr_stream_on;
+static atomic_t spo2_mode_on;
 
 /*
  * The one connection we allow (CONFIG_BT_MAX_CONN=1), held with a
@@ -69,8 +87,24 @@ static struct bt_conn *active_conn;
  */
 static struct k_spinlock status_lock;
 static struct ring_status latest_status;
+
+/* Same tear-safety reasoning as latest_status, own lock for the same
+ * reason: status and activity are unrelated and sharing one lock would
+ * only widen both.
+ */
+static struct k_spinlock activity_lock;
+static struct ring_activity latest_activity;
+
+/* Same pattern again: own lock, tear-safe snapshot for the GATT read. */
+static struct k_spinlock hrv_lock;
+static struct ring_hrv latest_hrv;
+
+static struct k_spinlock spo2_lock;
+static struct ring_spo2 latest_spo2;
+
 static const struct ble_control_cbs *control_cbs;
 static uint32_t ppg_seq;
+static uint32_t gsr_seq;
 
 /* --- advertising ------------------------------------------------------- */
 
@@ -134,6 +168,70 @@ static void imu_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	atomic_set(&imu_subscribed, value == BT_GATT_CCC_NOTIFY);
 }
 
+static ssize_t read_activity(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr, void *buf,
+			     uint16_t len, uint16_t offset)
+{
+	struct ring_activity snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&activity_lock);
+	snapshot = latest_activity;
+	k_spin_unlock(&activity_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
+}
+
+static void activity_ccc_changed(const struct bt_gatt_attr *attr,
+				 uint16_t value)
+{
+	atomic_set(&activity_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
+static ssize_t read_hrv(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			void *buf, uint16_t len, uint16_t offset)
+{
+	struct ring_hrv snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&hrv_lock);
+	snapshot = latest_hrv;
+	k_spin_unlock(&hrv_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
+}
+
+static void hrv_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	atomic_set(&hrv_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
+static void gsr_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	atomic_set(&gsr_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
+static ssize_t read_spo2(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			 void *buf, uint16_t len, uint16_t offset)
+{
+	struct ring_spo2 snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&spo2_lock);
+	snapshot = latest_spo2;
+	k_spin_unlock(&spo2_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
+}
+
+static void spo2_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	atomic_set(&spo2_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
 /*
  * Control opcodes, see APP_INTEGRATION.md:
  *   0x01 <u8 on>                     raw PPG streaming
@@ -141,6 +239,10 @@ static void imu_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
  *   0x03                             start a measurement window now
  *   0x04 <u16 window_s> <u16 period_s>  set duty cycle
  *   0x05                             clear every bond
+ *   0x06 <u16 weight_kg_x10>         set body weight for calorie estimate
+ *   0x07                             reset steps/sleep/calories counters
+ *   0x08 <u8 on>                     raw GSR streaming
+ *   0x09 <u8 on>                     SpO2 mode (red+IR instead of green)
  */
 static ssize_t write_control(struct bt_conn *conn,
 			     const struct bt_gatt_attr *attr, const void *buf,
@@ -148,8 +250,17 @@ static ssize_t write_control(struct bt_conn *conn,
 {
 	const uint8_t *p = buf;
 
-	if (offset != 0 || len < 1) {
+	if (offset != 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	/*
+	 * A zero-length write is a length error, not an offset error. Both used
+	 * to come back as ATT 0x07, which sends an app author looking at an
+	 * offset it never set.
+	 */
+	if (len < 1) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 
 	switch (p[0]) {
@@ -229,6 +340,51 @@ static ssize_t write_control(struct bt_conn *conn,
 		break;
 	}
 
+	case 0x06: {
+		if (len < 3) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+
+		uint16_t weight_kg_x10 = p[1] | (p[2] << 8);
+
+		if (control_cbs && control_cbs->set_weight) {
+			control_cbs->set_weight(weight_kg_x10);
+		}
+		LOG_INF("control: body weight %u.%u kg", weight_kg_x10 / 10U,
+			weight_kg_x10 % 10U);
+		break;
+	}
+
+	case 0x07:
+		if (control_cbs && control_cbs->reset_activity) {
+			control_cbs->reset_activity();
+		}
+		LOG_INF("control: activity counters reset");
+		break;
+
+	case 0x08:
+		if (len < 2) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		atomic_set(&gsr_stream_on, p[1] != 0);
+		if (control_cbs && control_cbs->stream_gsr) {
+			control_cbs->stream_gsr(p[1] != 0);
+		}
+		LOG_INF("control: GSR streaming %s", p[1] ? "on" : "off");
+		break;
+
+	case 0x09:
+		if (len < 2) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		atomic_set(&spo2_mode_on, p[1] != 0);
+		if (control_cbs && control_cbs->spo2_mode) {
+			control_cbs->spo2_mode(p[1] != 0);
+		}
+		LOG_INF("control: SpO2 mode %s (heart rate %s)",
+			p[1] ? "on" : "off", p[1] ? "pauses" : "resumes");
+		break;
+
 	default:
 		LOG_WRN("control: unknown opcode 0x%02x", p[0]);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
@@ -269,12 +425,63 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
 			       BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_control,
 			       NULL),
+
+	BT_GATT_CHARACTERISTIC(&uuid_activity.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ_ENCRYPT, read_activity, NULL,
+			       NULL),
+	BT_GATT_CCC(activity_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+
+	BT_GATT_CHARACTERISTIC(&uuid_hrv.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ_ENCRYPT, read_hrv, NULL, NULL),
+	BT_GATT_CCC(hrv_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+
+	BT_GATT_CHARACTERISTIC(&uuid_gsr.uuid, BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
+	BT_GATT_CCC(gsr_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+
+	BT_GATT_CHARACTERISTIC(&uuid_spo2.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ_ENCRYPT, read_spo2, NULL, NULL),
+	BT_GATT_CCC(spo2_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 );
 
-/* Attribute indices: 1 = status value, 4 = ppg value, 7 = imu value. */
+/*
+ * Attribute indices into the table above. BT_GATT_CHARACTERISTIC expands to
+ * TWO attributes -- the Characteristic Declaration and then the Value -- and
+ * BT_GATT_CCC to one more, so each notifiable characteristic occupies three
+ * slots and these constants point at the first of each:
+ *
+ *   0  primary service
+ *   1  status   decl   2 value   3 CCC
+ *   4  ppg      decl   5 value   6 CCC
+ *   7  imu      decl   8 value   9 CCC
+ *  10  control  decl  11 value        (write-only, no CCC)
+ *  12  activity decl  13 value  14 CCC
+ *  15  hrv      decl  16 value  17 CCC
+ *  18  gsr      decl  19 value  20 CCC
+ *  21  spo2     decl  22 value  23 CCC
+ *
+ * Pointing at the declaration rather than the value is deliberate and is
+ * what bt_gatt_notify() documents: "The attribute object on the parameters
+ * can be the so called Characteristic Declaration [...] or the
+ * Characteristic Value Declaration". It detects BT_UUID_GATT_CHRC, checks
+ * the declaration carries BT_GATT_CHRC_NOTIFY, and resolves the value
+ * handle itself. Any characteristic added here without BT_GATT_CHRC_NOTIFY
+ * would therefore fail with -EINVAL rather than notify the wrong handle.
+ */
 #define ATTR_STATUS	(&ring_svc.attrs[1])
 #define ATTR_PPG	(&ring_svc.attrs[4])
 #define ATTR_IMU	(&ring_svc.attrs[7])
+#define ATTR_ACTIVITY	(&ring_svc.attrs[12])
+#define ATTR_HRV	(&ring_svc.attrs[15])
+#define ATTR_GSR	(&ring_svc.attrs[18])
+#define ATTR_SPO2	(&ring_svc.attrs[21])
 
 /* --- connection tracking ----------------------------------------------- */
 
@@ -350,9 +557,21 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		bt_conn_unref(old);
 	}
 
-	/* Streaming is expensive; never leave it running for a gone phone. */
+	/* Streaming is expensive; never leave it running for a gone phone.
+	 * The GSR one also holds the analog front end powered, so leaving it
+	 * on would defeat the idle power model indefinitely.
+	 */
 	atomic_set(&ppg_stream_on, 0);
 	atomic_set(&imu_stream_on, 0);
+	atomic_set(&gsr_stream_on, 0);
+
+	/*
+	 * SpO2 mode too. A phone that enables it and walks away would
+	 * otherwise leave the ring running red and IR with no heart rate,
+	 * no HRS notifications and no RMSSD accumulating, for the rest of
+	 * the boot.
+	 */
+	atomic_set(&spo2_mode_on, 0);
 
 	LOG_INF("disconnected (reason 0x%02x)", reason);
 }
@@ -466,6 +685,21 @@ bool ble_ppg_streaming(void)
 bool ble_imu_streaming(void)
 {
 	return atomic_get(&imu_stream_on) && atomic_get(&imu_subscribed);
+}
+
+bool ble_gsr_streaming(void)
+{
+	return atomic_get(&gsr_stream_on) && atomic_get(&gsr_subscribed);
+}
+
+bool ble_gsr_stream_requested(void)
+{
+	return atomic_get(&gsr_stream_on) != 0;
+}
+
+bool ble_spo2_mode(void)
+{
+	return atomic_get(&spo2_mode_on) != 0;
 }
 
 void ble_set_control_cbs(const struct ble_control_cbs *cbs)
@@ -635,6 +869,111 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 	}
 
 	(void)bt_gatt_notify(NULL, ATTR_PPG, buf, 5 + n * sizeof(uint32_t));
+}
+
+void ble_publish_activity(const struct ring_activity *activity)
+{
+	struct ring_activity snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&activity_lock);
+	latest_activity = *activity;
+	snapshot = latest_activity;
+	k_spin_unlock(&activity_lock, key);
+
+	if (!ble_is_connected() || !atomic_get(&activity_subscribed)) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, ATTR_ACTIVITY, &snapshot, sizeof(snapshot));
+}
+
+void ble_publish_gsr(const int16_t *samples, uint8_t count)
+{
+	/*
+	 * seq (u32) + count (u8) + samples, the same shape as the PPG stream
+	 * so an app can reuse its gap-detection logic. Sized for a 247-byte
+	 * MTU; at the 23-byte default it carries GSR_MAX_SAMPLES_DEFAULT_MTU.
+	 */
+	uint8_t buf[5 + 40 * sizeof(int16_t)];
+	struct bt_conn *conn;
+	uint16_t mtu;
+	uint16_t mtu_payload;
+	uint8_t max_samples;
+	uint8_t n;
+
+	if (!ble_gsr_streaming()) {
+		return;
+	}
+
+	/* bt_gatt_get_mtu(NULL) dereferences conn->state and faults; there
+	 * is no MTU to ask about with nobody connected.
+	 */
+	conn = conn_get();
+	if (!conn) {
+		return;
+	}
+
+	mtu = bt_gatt_get_mtu(conn);
+	bt_conn_unref(conn);
+
+	if (mtu < 3) {
+		return;
+	}
+
+	mtu_payload = mtu - 3;
+	max_samples = (mtu_payload > 5) ? (mtu_payload - 5) / sizeof(int16_t)
+					: 0;
+	if (max_samples > 40) {
+		max_samples = 40;
+	}
+
+	n = MIN(count, max_samples);
+	if (n == 0) {
+		return;
+	}
+
+	sys_put_le32(gsr_seq++, &buf[0]);
+	buf[4] = n;
+	for (uint8_t i = 0; i < n; i++) {
+		sys_put_le16((uint16_t)samples[i], &buf[5 + i * sizeof(int16_t)]);
+	}
+
+	(void)bt_gatt_notify(NULL, ATTR_GSR, buf, 5 + n * sizeof(int16_t));
+}
+
+void ble_publish_spo2(const struct ring_spo2 *spo2)
+{
+	struct ring_spo2 snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&spo2_lock);
+	latest_spo2 = *spo2;
+	snapshot = latest_spo2;
+	k_spin_unlock(&spo2_lock, key);
+
+	if (!ble_is_connected() || !atomic_get(&spo2_subscribed)) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, ATTR_SPO2, &snapshot, sizeof(snapshot));
+}
+
+void ble_publish_hrv(const struct ring_hrv *hrv)
+{
+	struct ring_hrv snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&hrv_lock);
+	latest_hrv = *hrv;
+	snapshot = latest_hrv;
+	k_spin_unlock(&hrv_lock, key);
+
+	if (!ble_is_connected() || !atomic_get(&hrv_subscribed)) {
+		return;
+	}
+
+	(void)bt_gatt_notify(NULL, ATTR_HRV, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_imu(int16_t x, int16_t y, int16_t z)

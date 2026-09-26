@@ -42,6 +42,42 @@ int pmic_service(const struct device *i2c, bool *charging);
 int selftest_gsr_mv(void);
 
 /*
+ * Continuous GSR sampling, for the raw stream over BLE.
+ *
+ * Skin conductance responses peak roughly 1.4 s after onset, so the 1 Hz
+ * gsr_mv in the status packet lands about one sample on the rise and
+ * cannot resolve the shape at all. These exist to sample fast enough that
+ * it can.
+ *
+ * gsr_stream_start() pays the front end's ~800 ms settle ONCE and then
+ * holds GSR_PWR on, so every later sample is already settled. That is the
+ * whole point, and also the cost: the analog stage stays powered for as
+ * long as the stream runs, which defeats the duty cycling the rest of the
+ * firmware is built around. It is opt-in and off by default for that
+ * reason.
+ *
+ * BLOCKING: start() sleeps for the settle. Call it from the main loop,
+ * never from a BLE callback -- those run on the BT RX thread.
+ *
+ * While a stream is running, selftest_gsr_mv() leaves GSR_PWR alone rather
+ * than powering it down when it finishes, so the 30 s status reading does
+ * not punch a hole in the trace.
+ */
+int gsr_stream_start(void);
+void gsr_stream_stop(void);
+
+/*
+ * One conversion, in raw ADC counts -- deliberately not millivolts. The
+ * conversion to volts, and from there to conductance, needs constants
+ * (V_REF, R5) that are board-specific and, on this revision, not yet
+ * trusted. Sending counts keeps that decision on the phone where it can be
+ * changed without a firmware flash.
+ *
+ * Returns 0 and writes *raw, or a negative errno.
+ */
+int gsr_stream_raw(int16_t *raw);
+
+/*
  * Battery via the BQ25120A voltage monitor. Returns millivolts, or a
  * negative errno. *percent_of_vbatreg, when non-NULL, gets the raw monitor
  * result as a percentage of the regulation voltage -- which is NOT state of
