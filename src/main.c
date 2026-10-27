@@ -676,6 +676,19 @@ static void cb_measure_now(void)
 
 static void cb_set_duty(uint16_t window_s, uint16_t period_s)
 {
+	/*
+	 * 0/0 hands the duty cycle back to the build's own. It used to clamp
+	 * to 5 s every 5 s -- the LED on nearly all day -- which is exactly
+	 * what an app reaching for "back to normal" would not want.
+	 */
+	if (window_s == 0U && period_s == 0U) {
+		measure_window_ms = MEASURE_WINDOW_MS;
+		measure_period_ms = MEASURE_PERIOD_MS;
+		LOG_INF("duty restored: %u s window every %u s",
+			MEASURE_WINDOW_MS / 1000U, MEASURE_PERIOD_MS / 1000U);
+		return;
+	}
+
 	/* Clamp to something the hardware and the battery can survive. */
 	if (window_s < 5) {
 		window_s = 5;
@@ -1561,6 +1574,12 @@ static void history_epoch(int64_t now, int64_t *next_epoch,
 	} else if (epoch_spot.kind == SPOT_DAY ||
 		   epoch_spot.kind == SPOT_MANUAL) {
 		rec.flags |= HIST_FLAG_SPOT_DAY;
+		/* An app can keep a breathing exercise out of its stress
+		 * baseline by this, even after a reinstall lost its own log.
+		 */
+		if (epoch_spot.kind == SPOT_MANUAL) {
+			rec.flags2 |= HIST_FLAG2_SPOT_MANUAL;
+		}
 	}
 
 	*steps_at_epoch = steps_now;

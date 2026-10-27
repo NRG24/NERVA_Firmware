@@ -55,7 +55,8 @@ AT(battery_20mv, 23);
 AT(flags, 24);
 AT(hot_flashes, 25);
 AT(boot_id, 26);
-AT(reserved, 27);
+AT(flags2, 27);
+AT(reserved, 28);
 AT(crc, 31);
 _Static_assert(sizeof(struct hist_record) == 32, "record is not 32 bytes");
 

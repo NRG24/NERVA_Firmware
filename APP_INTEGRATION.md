@@ -276,7 +276,7 @@ Write (with or without response). First byte is the opcode.
 | `0x01` | `u8 on` | Raw PPG streaming on/off. Turning it on forces a measurement window. |
 | `0x02` | `u8 on` | IMU streaming on/off |
 | `0x03` | none | Start a measurement window immediately, skipping the duty cycle |
-| `0x04` | `u16 window_s`, `u16 period_s` | Set duty cycle, little-endian |
+| `0x04` | `u16 window_s`, `u16 period_s` | Set duty cycle, little-endian. The next window opens `period_s` after the last one *ends*, so 60/60 is 60 s on, 60 s off, not continuous. Window is clamped to 5-300 s and period to window..3600 s. RAM only. **v0.9.0+: `0/0` restores the build's own duty cycle** (production 25 s every 300 s). Before v0.9.0 it clamped to 5/5, nearly continuous, so on older firmware send 25/300 explicitly |
 | `0x05` | none | Clear every bond, then disconnect |
 | `0x06` | `u16 weight_kg_x10` | Set body weight for the calorie estimate, little-endian, kilograms x10 (e.g. `700` = 70.0 kg) |
 | `0x07` | none | Reset steps, sleep and calorie counters to zero |
@@ -1034,7 +1034,8 @@ compile-time assertions in `tests/test_history.c`; `tools/history_sync.py`
 | 24 | u8 | `flags` | See below |
 | 25 | u8 | `hot_flashes` | Hot flashes that **started** in this epoch |
 | 26 | u8 | `boot_id` | Which boot wrote it, +1 per boot that wrote records, wraps at 256 |
-| 27 | 4 bytes | reserved | 0 |
+| 27 | u8 | `flags2` | v0.9.0+, 0 before. Bit 0 `SPOT_MANUAL`: the `SPOT_DAY` reading in this record was asked for with `0x14` (e.g. a breathing exercise), not scheduled. Keep those out of stress baselines. Other bits 0 |
+| 28 | 3 bytes | reserved | 0 |
 | 31 | u8 | `crc` | CRC-8 over bytes 0-30: poly `0x07`, init `0x00`, no reflection, no final XOR (CRC-8/SMBUS; `"123456789"` gives `0xF4`) |
 
 `flags`:

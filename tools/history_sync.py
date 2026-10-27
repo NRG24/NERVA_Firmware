@@ -38,7 +38,7 @@ HISTORY = ring_uuid(0xA)
 FWREV = "00002a26-0000-1000-8000-00805f9b34fb"
 
 REC = struct.Struct("<IIBBHBBBB")   # v1, 16 bytes, packet 0x01 (v0.6-v0.7)
-REC2 = struct.Struct("<IIHhhBBBBBBBBBBBBB4xB")  # v2, 32 bytes, packet 0x03 (v0.8+)
+REC2 = struct.Struct("<IIHhhBBBBBBBBBBBBBB3xB")  # v2, 32 bytes, packet 0x03 (v0.8+)
 END = struct.Struct("<BIIIIBH")     # 20 bytes
 FLAG_NAMES = ["TIME", "WORN", "CHG", "SLEEP", "WORKOUT", "HOTFLASH",
               "SPOT_NIGHT", "SPOT_DAY"]
@@ -79,7 +79,7 @@ def parse_record_v2(raw):
     accelerometer was not read (255 on the wire)."""
     (seq, t, steps, temp, skin, hr, hr_min, hr_max, rmssd, rest_hr,
      rest_rmssd, rest_beats, rise, motion, batt, flags, hot, boot,
-     crc) = REC2.unpack(raw)
+     flags2, crc) = REC2.unpack(raw)
     return {
         "seq": seq, "time_s": t, "steps": steps,
         "temp_c": _temp(temp), "skin_c": _temp(skin),
@@ -89,6 +89,7 @@ def parse_record_v2(raw):
         "temp_rise_c": rise / 10.0,
         "motion_pct": None if motion == 255 else motion,
         "battery_mv": batt * 20, "flags": flags, "hot_flashes": hot,
+        "spot_manual": bool(flags2 & 1),
         "boot_id": boot, "crc_ok": crc8(raw[:31]) == crc,
     }
 

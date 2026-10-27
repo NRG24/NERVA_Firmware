@@ -49,6 +49,13 @@
 #define HIST_FLAG_SPOT_NIGHT	BIT(6)	/* rest_* came from a night spot reading */
 #define HIST_FLAG_SPOT_DAY	BIT(7)	/* rest_* came from a daytime still spot */
 
+/*
+ * Byte 27, flags2. Was reserved and always written 0, so a record from
+ * before v0.9.0 reads as all clear and the layout version did not change.
+ */
+#define HIST_FLAG2_SPOT_MANUAL	BIT(0)	/* the SPOT_DAY reading was asked for
+					 * with opcode 0x14, not scheduled */
+
 /* "No reading" for the two temperature fields. */
 #define HIST_TEMP_NONE		INT16_MIN
 
@@ -75,7 +82,8 @@ struct hist_record {
 	uint8_t flags;		/* HIST_FLAG_* */
 	uint8_t hot_flashes;	/* hot flashes that started in this epoch */
 	uint8_t boot_id;	/* +1 per boot, wraps at 256 */
-	uint8_t reserved[4];	/* 0 */
+	uint8_t flags2;		/* HIST_FLAG2_*, v0.9.0+ */
+	uint8_t reserved[3];	/* 0 */
 	uint8_t crc;		/* CRC-8 (poly 0x07, init 0) of bytes 0-30 */
 } __packed;
 
