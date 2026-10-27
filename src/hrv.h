@@ -17,20 +17,25 @@
  * value is manufactured across a gap -- but the span is longer than the
  * literature's, and a reading is an average over it.
  *
- * ACCURACY CEILING, which is a property of the hardware and not of this
- * code: beats are located to the nearest PPG sample, and the PPG runs at
- * 100 sps, so every interval is an exact multiple of 10 ms. That
- * quantisation alone puts a noise floor under RMSSD -- a metronome-steady
- * heart with no HRV at all measures about 8.5 ms of it, which
- * tests/test_hrv.c checks rather than assumes.
+ * ACCURACY. The PPG runs at 100 sps, so a beat found on whole samples
+ * is only known to 10 ms, and up to v0.8 that put a floor of ~8.5 ms
+ * under RMSSD: a metronome heart with no HRV at all read that much
+ * (test_quantisation_noise_floor in tests/test_hrv.c still shows it, for
+ * intervals handed over in whole samples). It added in quadrature, so it
+ * inflated exactly the low readings -- stress, exertion, illness -- that
+ * matter most.
  *
- * It adds in quadrature, so a true 40 ms reads about 41 and a true 20
- * reads about 22: readings from a relaxed subject are barely affected,
- * and low-HRV readings -- stress, exertion, illness, the ones a user
- * would most want to trust -- are inflated the most, and proportionally
- * the most. Sampling the PPG faster (the part supports 400 sps) or
- * interpolating the peak is the only way to do better, and both are out
- * of scope here.
+ * Since v0.9.0 hr.c places each peak between samples with a five-point
+ * least-squares parabola (peak_offset_q8()), and intervals arrive to the
+ * millisecond. On synthetic hearts (test_subsample_timing), RMSSD of a
+ * true 3.6 ms, by sensor noise as a share of the pulse swing:
+ *
+ *   noise                    0     0.5 %   1 %    2 %    3 %
+ *   whole samples (<= 0.8)   8.7   7.6     9.8   15.1   17.8
+ *   between samples (0.9+)   3.5   3.8     4.1    8.8   12.1
+ *
+ * So the floor now comes from the sensor's noise, not from the timing.
+ * What that noise is on a real finger is not measured yet.
  */
 
 #ifndef HRV_H_

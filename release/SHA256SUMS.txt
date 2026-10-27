@@ -8,5 +8,5 @@
 7644455297997ad4a6cb52d18e1f13778ffeeb2b5f7198f037d20a50c52dc87d *release/ring-fw-v0.4-bench.hex
 60500d40a3ddcaa6b6be57b2dd00ff48df60ae299d06597788ad8f74a847c5bf *release/ring-fw-v0.4-production.hex
 005b824c0de91920909472cd17c8b734916b8e7a186dc4a0edd588876532b4db *release/ring-fw-v0.8.0-prod.hex
-6aa9e6089234299f151364aca3575d0689396ef3a7c47d19cfdc19cf2d1c2330 *release/ring-fw-v0.9.0-prod.hex
-aebffc82010ffff3362f614bc6a5515e007ae32a6acf6c6b41e3a89d47016e33 *release/ring-fw-v0.9.0-prod-update.bin
+e17274b5ac0deca5e3ac2f9dea694f47f494f9fa11644319a79a61d16535aff7 *release/ring-fw-v0.9.0-prod.hex
+61eb1c9265aa1bf3ff193049f69d748afe83978074294ccafb8e2e5cd2fd34ca *release/ring-fw-v0.9.0-prod-update.bin

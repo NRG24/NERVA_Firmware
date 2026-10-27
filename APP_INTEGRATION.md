@@ -573,15 +573,21 @@ whole interval wide, and it enters the sum squared. Simulated, disabling
 that one rule took a steady pulse train from 0 ms to 144 ms of apparent
 HRV.
 
-### The 10 ms floor, which you should surface
+### The floor under low readings, which you should surface
 
-Beats are located to the nearest PPG sample and the PPG runs at 100 sps,
-so **every interval is a multiple of 10 ms**. That quantisation alone puts
-a floor under RMSSD: a metronome-steady heart with no variability at all
-measures about **8.5 ms**, which is measured in `tests/test_hrv.c` rather
-than estimated.
+**v0.9.0 and later** place each beat between PPG samples, so intervals
+are accurate to about a millisecond on a clean signal. A metronome heart
+reads 0.1 ms and a true 3.6 ms reads 3.5 (`tests/test_hrv.c`). The floor
+that remains comes from sensor noise. In the same tests, noise at 1 % of
+the pulse swing makes the 3.6 ms read 4.1, and 2 % makes it read 8.8.
+The real sensor's noise has not been measured yet, so keep treating
+readings under ~10 ms as "low" rather than ranking them.
 
-It adds in quadrature, so the error is not uniform:
+**Up to v0.8**, beats were located to the nearest PPG sample at 100 sps,
+so **every interval was a multiple of 10 ms**. That alone put a floor
+under RMSSD: a metronome-steady heart read about **8.5 ms**. Records
+synced from those rings still carry it. The error adds in quadrature, so
+it is not uniform:
 
 | True RMSSD | Reads about |
 |---|---|

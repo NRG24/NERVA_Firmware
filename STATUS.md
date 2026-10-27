@@ -154,10 +154,11 @@ the beat detector's plausibility range *and* agree with the recent median
 to within 20 % are used -- half the 40 % the heart rate itself tolerates,
 because a metronome rhythm with a motion artifact invents 200 ms of HRV at
 the looser bar, and a difference is never formed across a rejected beat — that
-one rule is worth 144 ms of false HRV in simulation. The hardware sets the
-ceiling: beats land on 100 sps samples, so a metronome heart measures
-about 8.5 ms of HRV that is not there, which inflates low readings
-proportionally more than high ones.
+one rule is worth 144 ms of false HRV in simulation. Up to v0.8, beats
+landed on 100 sps samples, so a metronome heart measured about 8.5 ms of
+HRV that was not there. Since v0.9.0, a five-point parabola places each
+peak between samples, and the same heart reads 0.1 ms. Sensor noise sets
+the floor now: 4 ms at 1 % noise in simulation; unmeasured on a finger.
 
 **SpO2.** Ratio of ratios on red and IR, opt-in via opcode `0x09`, on its
 own characteristic (`spo2.c`). The driver gained a two-slot LED sequence

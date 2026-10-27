@@ -154,16 +154,19 @@ int32_t hr_amplitude(const struct hr *hr)
 
 uint16_t hr_last_ibi_ms(const struct hr *hr)
 {
-	if (hr->sample_rate_hz == 0 || hr->last_ibi == 0) {
+	uint32_t per_s_q8 = hr->sample_rate_hz * 256U;
+
+	if (hr->sample_rate_hz == 0 || hr->last_ibi_q8 == 0) {
 		return 0;
 	}
 
 	/*
-	 * Intervals are counted in samples, so at 100 sps this is exact to
-	 * 10 ms and no better. That quantisation is the dominant error in
-	 * RMSSD -- see the note in hrv.h.
+	 * Each end of the interval is placed between samples by
+	 * peak_offset_q8(), so this is not limited to the 10 ms sample
+	 * spacing at 100 sps. Rounded to the nearest millisecond.
 	 */
-	return (uint16_t)((hr->last_ibi * 1000U) / hr->sample_rate_hz);
+	return (uint16_t)((hr->last_ibi_q8 * 1000U + per_s_q8 / 2U) /
+			  per_s_q8);
 }
 
 bool hr_last_ibi_trusted(const struct hr *hr)
@@ -447,6 +450,53 @@ static uint16_t combine_estimates(const struct hr *hr)
 	return (agree >= HR_MIN_AGREE) ? med : 0;
 }
 
+/*
+ * Where between samples a peak really was.
+ *
+ * The beat detector finds a peak as the sample y0 that beats both its
+ * neighbours, so a beat's time is only known to the nearest sample: 10 ms
+ * at 100 sps. Successive intervals then wander by a sample even when the
+ * heart does not, which put a floor of ~8 ms under RMSSD -- larger than a
+ * stressed or unwell wearer's whole real HRV.
+ *
+ * So the peak is placed between samples: the vertex of the least-squares
+ * parabola through the five samples ym2..yp2 centred on it,
+ *
+ *     d = -7 * (-2 ym2 - ym1 + yp1 + 2 yp2)
+ *         / (10 * (2 ym2 - ym1 - 2 y0 - yp1 + 2 yp2))
+ *
+ * samples from y0. Five points rather than the three that just fit a
+ * parabola exactly: sensor noise moves a three-point vertex a lot, and on
+ * test_hrv's synthetic hearts with noise at 1 % of the pulse swing the
+ * five-point fit read 4.1 ms of a true 3.6 where three points read 6.0
+ * (whole samples: 9.8). The cost is that the beat is reported one sample
+ * after its peak, when yp2 exists.
+ *
+ * Returned in 1/256 sample, clamped to +-1/2. A fit that is not concave
+ * -- noise around a shallow peak -- returns 0, the whole-sample answer.
+ */
+static int16_t peak_offset_q8(int32_t ym2, int32_t ym1, int32_t y0,
+			      int32_t yp1, int32_t yp2)
+{
+	int64_t num = -7 * (-2 * (int64_t)ym2 - ym1 + yp1 + 2 * (int64_t)yp2);
+	int64_t den = 10 * (2 * (int64_t)ym2 - ym1 - 2 * (int64_t)y0 - yp1 +
+			    2 * (int64_t)yp2);
+	int64_t off;
+
+	if (den >= 0) {
+		return 0;
+	}
+
+	off = num * 256 / den;
+
+	return (int16_t)CLAMP(off, -128, 128);
+}
+
+/* hr->pend: a peak found on the last sample, awaiting its fraction. */
+#define PEND_NONE		0
+#define PEND_TIME_ONLY		1	/* first beat, or one outside 30-220 bpm */
+#define PEND_INTERVAL		2	/* an interval to report */
+
 /* Nothing on the sensor: forget the rate, keep the filters running. */
 static void forget_rate(struct hr *hr)
 {
@@ -458,6 +508,7 @@ static void forget_rate(struct hr *hr)
 	hr->last_beat_tick = 0;
 	hr->prev_ibi_trusted = false;
 	hr->peak_level = 0;
+	hr->pend = PEND_NONE;
 }
 
 bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
@@ -508,6 +559,26 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 
 	hr->b_lp += (h2 - hr->b_lp) >> 2;
 	int32_t y = hr->b_lp;
+
+	/*
+	 * Last sample's peak, now that the sample two after it exists: place
+	 * it between samples (peak_offset_q8()) and report the beat.
+	 */
+	if (hr->pend != PEND_NONE) {
+		int16_t frac = peak_offset_q8(hr->y4, hr->y3, hr->y2, hr->y1, y);
+
+		if (hr->pend == PEND_INTERVAL) {
+			hr->last_ibi = hr->pend_since;
+			hr->last_ibi_q8 = (uint32_t)(
+				(int32_t)(hr->pend_since * 256U) + frac -
+				hr->last_beat_frac_q8);
+			hr->last_ibi_trusted = hr->pend_trusted;
+			hr->last_ibi_successive = hr->pend_successive;
+			beat = true;
+		}
+		hr->last_beat_frac_q8 = frac;
+		hr->pend = PEND_NONE;
+	}
 
 	hr->pp_max = MAX(hr->pp_max, y);
 	hr->pp_min = MIN(hr->pp_min, y);
@@ -561,6 +632,8 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 	 */
 	if (hr->baseline < FINGER_DC_MIN) {
 		forget_rate(hr);
+		hr->y4 = hr->y3;
+		hr->y3 = hr->y2;
 		hr->y2 = hr->y1;
 		hr->y1 = y;
 		if (bpm_x10) {
@@ -601,10 +674,11 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 						       period * HRV_SPREAD_MAX_PCT;
 
 					hr->beats++;
-					beat = true;
-					hr->last_ibi = since;
-					hr->last_ibi_trusted = trusted;
-					hr->last_ibi_successive =
+					/* Reported on the next sample. */
+					hr->pend = PEND_INTERVAL;
+					hr->pend_since = since;
+					hr->pend_trusted = trusted;
+					hr->pend_successive =
 						trusted && hr->prev_ibi_trusted;
 					hr->prev_ibi_trusted = trusted;
 				} else {
@@ -613,9 +687,15 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10)
 				}
 			}
 			hr->last_beat_tick = peak_tick;
+			/* Its fraction is still wanted, as the next one's start. */
+			if (hr->pend == PEND_NONE) {
+				hr->pend = PEND_TIME_ONLY;
+			}
 		}
 	}
 
+	hr->y4 = hr->y3;
+	hr->y3 = hr->y2;
 	hr->y2 = hr->y1;
 	hr->y1 = y;
 

@@ -56,6 +56,7 @@ struct hr {
 	int32_t b_hp2;
 	int32_t b_lp;
 	int32_t y1, y2;			/* the last two outputs, for peak picking */
+	int32_t y3, y4;			/* and the two before, for its fraction */
 	int32_t pp_min, pp_max;		/* this second's swing */
 	int32_t amplitude;		/* EMA of that swing, raw counts */
 	int32_t peak_level;		/* EMA of accepted beat heights */
@@ -80,6 +81,14 @@ struct hr {
 
 	/* beat timing, in samples */
 	uint32_t last_beat_tick;
+	/* where between samples that beat's peak was, 1/256 sample, +-128 */
+	int16_t last_beat_frac_q8;
+
+	/* A peak found one sample ago; see PEND_* in hr.c. */
+	uint8_t pend;
+	uint32_t pend_since;
+	bool pend_trusted;
+	bool pend_successive;
 
 	/*
 	 * The interval accepted on the most recent beat, for HRV. Only
@@ -87,6 +96,7 @@ struct hr {
 	 * flags are cleared on every other sample.
 	 */
 	uint32_t last_ibi;		/* samples */
+	uint32_t last_ibi_q8;		/* the same, to 1/256 sample */
 	bool last_ibi_trusted;
 	bool last_ibi_successive;
 	bool prev_ibi_trusted;		/* internal, drives last_ibi_successive */
@@ -97,8 +107,8 @@ struct hr {
 void hr_init(struct hr *hr, uint32_t sample_rate_hz);
 
 /*
- * Feed one raw sample. Returns true when a beat was detected on this
- * sample. *bpm_x10 is updated with the current estimate in tenths of a BPM
+ * Feed one raw sample. Returns true when a beat was detected -- one sample
+ * after its peak, which is when its position between samples is known. *bpm_x10 is updated with the current estimate in tenths of a BPM
  * (0 when there is no confident estimate).
  *
  * Built for 100 sps. Once a second this runs the spectrum: ~26,000

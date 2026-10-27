@@ -182,9 +182,11 @@ static void test_window_rolls(void)
 }
 
 /*
- * The quantisation claim in hrv.h, checked rather than asserted. Beats land
- * on 100 sps samples, so intervals are multiples of 10 ms; that alone puts
- * a floor under RMSSD even for a metronome-steady heart.
+ * What whole-sample beat timing does, checked rather than asserted: at
+ * 100 sps intervals are multiples of 10 ms, and that alone puts a floor
+ * under RMSSD even for a metronome-steady heart. hr.c no longer hands over
+ * whole samples (test_subsample_timing below); this pins the number the
+ * docs compare against.
  */
 static void test_quantisation_noise_floor(void)
 {
@@ -449,6 +451,177 @@ static void test_artifact_does_not_invent_hrv(void)
 	      hrv_rmssd_x10() / 10, hrv_rmssd_x10() % 10);
 }
 
+/* --- sub-sample beat timing ---------------------------------------------- */
+
+/*
+ * A PPG whose beats fall at arbitrary times, not on samples: beat k starts
+ * at beat_t[k] ms and the pulse shape is stretched over that beat's own
+ * interval. Sampled at 100 sps exactly as the sensor would.
+ */
+#define RR_MAX	200
+
+static double beat_t[RR_MAX + 1];
+
+/* +- this many counts of white noise on every sample; 0 = clean. */
+static int ppg_noise;
+static uint32_t noise_seed = 12345;
+
+static int noise(void)
+{
+	if (ppg_noise == 0) {
+		return 0;
+	}
+	noise_seed = noise_seed * 1103515245U + 12345U;
+	return (int)((noise_seed >> 16) % (2U * ppg_noise + 1U)) - ppg_noise;
+}
+
+static uint32_t ppg_at(double t_ms, int nbeats)
+{
+	int k = 0;
+
+	while (k + 1 < nbeats && beat_t[k + 1] <= t_ms) {
+		k++;
+	}
+	double ph = 2.0 * M_PI * (t_ms - beat_t[k]) /
+		    (beat_t[k + 1] - beat_t[k]);
+	double v = 0.8 * sin(ph) + 0.25 * sin(2 * ph + 0.9);
+
+	return (uint32_t)(PPG_DC + PPG_AC * v + noise());
+}
+
+/*
+ * Run `n` intervals from rr[] through the real detector and return the
+ * RMSSD, in ms, of every trusted, successive interval it reported. The
+ * true RMSSD of rr[] is returned through *truth.
+ */
+static double measure_rmssd(const double *rr, int n, double *truth,
+			    int *diffs)
+{
+	struct hr h;
+	struct hrv_session ses;
+	double sum = 0;
+
+	beat_t[0] = 0;
+	for (int i = 0; i < n; i++) {
+		beat_t[i + 1] = beat_t[i] + rr[i];
+	}
+	for (int i = 1; i < n; i++) {
+		double d = rr[i] - rr[i - 1];
+
+		sum += d * d;
+	}
+	*truth = sqrt(sum / (n - 1));
+
+	hr_init(&h, PPG_RATE_HZ);
+	hrv_session_begin(&ses);
+	for (int k = 0; k * 10.0 < beat_t[n - 1]; k++) {
+		uint16_t bpm;
+
+		if (hr_update(&h, ppg_at(k * 10.0, n + 1), &bpm) &&
+		    hr_last_ibi_trusted(&h)) {
+			hrv_session_add(&ses, hr_last_ibi_ms(&h),
+					hr_last_ibi_successive(&h));
+		}
+	}
+
+	*diffs = hrv_session_diffs(&ses);
+	return hrv_session_rmssd_x10(&ses) / 10.0;
+}
+
+static void test_subsample_timing(void)
+{
+	double rr[RR_MAX];
+	double truth, got;
+	int diffs;
+
+	sim_section("sub-sample beat timing: RMSSD close to the truth");
+
+	/*
+	 * A metronome at 1003.7 ms: no HRV at all, so everything measured
+	 * is error. Whole-sample timing reads ~8 ms here (the floor
+	 * test_quantisation_noise_floor documents).
+	 */
+	for (int i = 0; i < 120; i++) {
+		rr[i] = 1003.7;
+	}
+	got = measure_rmssd(rr, 120, &truth, &diffs);
+	printf("    metronome:     true %5.1f ms, measured %5.1f ms (%d diffs)\n",
+	       truth, got, diffs);
+	CHECK(diffs > 60, "only %d differences from 120 clean beats", diffs);
+	CHECK(got <= 2.0, "a metronome read %.1f ms of HRV", got);
+
+	/*
+	 * Low HRV, ~4 ms -- the stressed, exhausted or unwell reading that
+	 * whole-sample timing buries under its own 8 ms.
+	 */
+	for (int i = 0; i < 120; i++) {
+		rr[i] = 1001.3 + 3.0 * sin(2 * M_PI * i / 3.1);
+	}
+	got = measure_rmssd(rr, 120, &truth, &diffs);
+	printf("    low HRV:       true %5.1f ms, measured %5.1f ms\n", truth,
+	       got);
+	CHECK(fabs(got - truth) <= 1.5, "low HRV: %.1f ms against a true %.1f",
+	      got, truth);
+
+	/* Relaxed, ~28 ms: should be right to within a few percent. */
+	for (int i = 0; i < 120; i++) {
+		rr[i] = (i % 2) ? 1003.4 + 14.1 : 1003.4 - 14.1;
+	}
+	got = measure_rmssd(rr, 120, &truth, &diffs);
+	printf("    moderate HRV:  true %5.1f ms, measured %5.1f ms\n", truth,
+	       got);
+	CHECK(fabs(got - truth) <= 0.05 * truth + 1.0,
+	      "moderate HRV: %.1f ms against a true %.1f", got, truth);
+
+	/* And at a resting 52 bpm, a longer beat than everything above. */
+	for (int i = 0; i < 120; i++) {
+		rr[i] = 1153.9 + 6.0 * sin(2 * M_PI * i / 4.7);
+	}
+	got = measure_rmssd(rr, 120, &truth, &diffs);
+	printf("    52 bpm:        true %5.1f ms, measured %5.1f ms\n", truth,
+	       got);
+	CHECK(fabs(got - truth) <= 1.5, "52 bpm: %.1f ms against a true %.1f",
+	      got, truth);
+
+	/*
+	 * The same low-HRV heart under sensor noise, independent on every
+	 * sample. Noise moves a fitted vertex, so this is where placing
+	 * peaks between samples could have made things worse. Measured
+	 * 2026-10-27, RMSSD of a true 3.6 ms:
+	 *
+	 *   noise (of pulse swing)   0     0.5 %   1 %    2 %    3 %
+	 *   whole samples            8.7   7.6     9.8   15.1   17.8
+	 *   3-point parabola         3.5   4.5     6.0   10.8   13.8
+	 *   5-point fit (hr.c)       3.5   3.8     4.1    8.8   12.1
+	 *
+	 * Better than whole samples at every level; past ~1 % the noise
+	 * itself, not the timing, is what RMSSD measures. The real sensor's
+	 * level is not known yet (no recordings on hand). These pin the two
+	 * middle columns.
+	 */
+	for (int i = 0; i < 120; i++) {
+		rr[i] = 1001.3 + 3.0 * sin(2 * M_PI * i / 3.1);
+	}
+	ppg_noise = PPG_AC / 100;
+	noise_seed = 12345;	/* the table above was made from this seed */
+	got = measure_rmssd(rr, 120, &truth, &diffs);
+	printf("    low HRV, 1 %% noise: true %5.1f ms, measured %5.1f ms (%d "
+	       "diffs)\n", truth, got, diffs);
+	CHECK(diffs > 60, "noise cost the detector its beats (%d diffs)", diffs);
+	CHECK(fabs(got - truth) <= 1.5,
+	      "low HRV, 1 %% noise: %.1f ms against a true %.1f", got, truth);
+
+	ppg_noise = PPG_AC * 2 / 100;
+	noise_seed = 12345;	/* the table above was made from this seed */
+	got = measure_rmssd(rr, 120, &truth, &diffs);
+	printf("    low HRV, 2 %% noise: true %5.1f ms, measured %5.1f ms\n",
+	       truth, got);
+	CHECK(got <= 10.0,
+	      "low HRV, 2 %% noise: %.1f ms, worse than the 8.8 the 5-point "
+	      "fit gave (whole samples: 15.1)", got);
+	ppg_noise = 0;
+}
+
 static void test_session(void)
 {
 	struct hrv_session s;
@@ -505,6 +678,7 @@ int main(void)
 	test_detector_feeds_hrv();
 	test_outlier_interval_is_not_trusted();
 	test_artifact_does_not_invent_hrv();
+	test_subsample_timing();
 
 	return sim_report("test_hrv");
 }

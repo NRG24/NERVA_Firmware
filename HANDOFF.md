@@ -412,6 +412,12 @@ stuck SDA was the same bad joint.
     jig. Every release runs on an unsealed board first.
   * `tools/ota_update.py` uploads from the PC (no extra packages);
     `prod_check.py` now expects 0.9.x and checks the SMP service.
+  * **HRV beat timing between samples.** `hr.c` places each peak with a
+    five-point least-squares parabola, so intervals reach `hrv.c` to the
+    millisecond instead of in 10 ms steps. On synthetic hearts the 8.5 ms
+    false-HRV floor drops to 0.1 ms; with 1 % sensor noise a true 3.6 ms
+    reads 4.1 (was 9.8). Beats are reported one sample (10 ms) after the
+    peak. `test_hrv` `test_subsample_timing`; table in `hrv.h`.
 
 ---
 
