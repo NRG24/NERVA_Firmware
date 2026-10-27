@@ -40,6 +40,15 @@ byte then an 8-bit BPM.
 Notifications stop when no finger is present. **Absence of a notification
 means "no reading", not "zero BPM".**
 
+**RR intervals, v0.9.0+.** When beats were found since the last
+notification, flags is `0x16` and the rate is followed by up to 8
+RR-Interval values: u16 LE each, in units of 1/1024 s, oldest first (SIG
+format, flag bit 4). Only intervals the beat detector trusts, the same ones
+HRV uses, are sent. A second with none is sent as before, flags `0x06` and
+2 bytes. Since v0.9.0 they are accurate to about a millisecond. Expect
+gaps: the sensor runs in windows, not continuously, unless the app keeps
+it on (opcode `0x04`) or a workout is running.
+
 ### Battery Service — `0x180F`
 
 Standard, 0-100 percent, updated every 30 s.
@@ -282,7 +291,7 @@ Write (with or without response). First byte is the opcode.
 | `0x0E` | `u32 from_seq` | Sync history: the ring notifies every stored record with `seq >= from_seq` on the History characteristic, oldest first, then an end-of-sync summary. Subscribe to History first, or the write fails with ATT `0xFD`; from v0.8.0 an MTU under 37 fails it with ATT `0x11`. See section 16 |
 | `0x12` | `u16 night_min, u16 day_min, u16 window_s` | v0.8.0+, every build. Spot reading schedule (section 17): minutes between night readings and between daytime still readings (0 = off, else 10-720), and the length of each (60-600 s). RAM only: send on every connection if you want something other than the build's defaults. Production defaults `60, 60, 180`; test builds `0, 0, 180`. Out of range: ATT `0x13` |
 | `0x13` | `u8 mode, u8 rise_c10` | v0.8.0+, every build. Hot-flash detection (section 17): mode 0 off, 1 while asleep only, 2 always; onset threshold in tenths of a degree, 3-50. RAM only. Production default `1, 10`; test builds `0, 10`. Out of range: ATT `0x13` |
-| `0x14` | none | v0.8.0+. Take a spot reading now (section 17): the "check my stress" button. A 3-minute green window, judged like a daytime reading; the result arrives on Wellness (`spot_kind` 4) and in the history as a `SPOT_DAY` reading. Needs the ring on a finger and the hand still |
+| `0x14` | none | v0.8.0+. Take a spot reading now (section 17): the "check my stress" button. Never refused at the ATT level: on the charger, in a workout or in ship mode it is dropped (from v0.9.0 also on the charger; before, it waited there); behind another spot reading or an app-forced window it waits. Treat it as started only when Wellness bit 2 turns on. A 3-minute green window, judged like a daytime reading; the result arrives on Wellness (`spot_kind` 4) and in the history as a `SPOT_DAY` reading. Needs the ring on a finger and the hand still |
 
 Duty cycle values are clamped in firmware: window 5-300 s, period
 window-3600 s. Defaults are a **25 s window every 60 s**, i.e. ~42% duty (15 s before v0.6.2; the new heart-rate detector needs ~12 s before its first reading). The daily build runs 25 s every 600 s, ~4%.
@@ -755,8 +764,9 @@ range.
 
 ## 11. Workout characteristic
 
-16 bytes, little-endian. The figures for the workout the app started with
-opcode `0x0B`, or the last one after it stops. Notified at least once a
+17 bytes from v0.9.0 (16 before), little-endian. The figures for the
+workout the app started with opcode `0x0B`, or the last one after it
+stops. Notified at least once a
 minute during a workout, and on start and stop.
 
 | Offset | Type | Field | Notes |
@@ -769,6 +779,7 @@ minute during a workout, and on start and stop.
 | 8 | u16 | `fallback_minutes` | Minutes with no usable heart rate, priced from the activity type |
 | 10 | u16 | `avg_hr_x10` | Mean heart rate over `hr_minutes`, bpm x10. 0 if none |
 | 12 | u32 | `kcal_x1000` | Kilocalories x1000 for this workout |
+| 16 | u8 | `end_reason` | v0.9.0+. Why the last workout ended: 0 still running or none this boot, 1 app stop (`0x0B` type 0), 2 the four-hour limit, 3 the charger. A reboot also ends a workout; that shows as `uptime_s` going back, with this byte 0. Read the length: 16 bytes means older firmware |
 
 The three minute counts always add up to `minutes`.
 

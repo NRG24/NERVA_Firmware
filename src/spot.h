@@ -96,6 +96,14 @@ void spot_request_hot_flash(void);
 /* The app asked for a reading now. */
 void spot_request_now(void);
 
+/*
+ * Forget any manual or hot-flash request not yet started. For the
+ * charger: spot_due() only runs while the ring is idle, so without this a
+ * request made on the charger would wait there and start -- unasked, maybe
+ * hours later -- the moment the ring came off it.
+ */
+void spot_drop_pending(void);
+
 /* What, if anything, should start now. Main loop, idle state only. */
 enum spot_kind spot_due(const struct spot_inputs *in);
 

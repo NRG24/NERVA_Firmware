@@ -297,6 +297,17 @@ static void test_manual(void)
 	i.blocked = false;
 	i.still_ms = 0;
 	CHECK(spot_due(&i) == SPOT_NONE, "a blocked manual request survived");
+
+	/* So does spot_drop_pending(), which main.c calls on the charger,
+	 * where spot_due() never runs.
+	 */
+	spot_request_now();
+	spot_request_hot_flash();
+	spot_drop_pending();
+	i = in(200 * MIN_MS, false, true, 3 * MIN_MS);
+	i.worn = false;		/* nothing else may be due either */
+	CHECK(spot_due(&i) == SPOT_NONE,
+	      "a request survived spot_drop_pending()");
 }
 
 static void test_resleep(void)

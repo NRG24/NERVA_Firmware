@@ -93,6 +93,12 @@ void spot_request_now(void)
 	sp.manual_pending = true;
 }
 
+void spot_drop_pending(void)
+{
+	sp.manual_pending = false;
+	sp.hot_flash_pending = false;
+}
+
 enum spot_kind spot_due(const struct spot_inputs *in)
 {
 	/*

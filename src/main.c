@@ -572,6 +572,7 @@ static atomic_t workout_request = ATOMIC_INIT(-1);
 #define WORKOUT_HR_MIN_SECONDS	30
 
 static int64_t workout_started_ms;
+static uint8_t workout_end_reason;	/* WORKOUT_END_*, for the packet */
 
 /* Heart rate collected by report() once a second, drained every minute. */
 static uint32_t minute_hr_sum_x10;
@@ -1034,6 +1035,7 @@ static void publish_workout(void)
 		.fallback_minutes = w.fallback_minutes,
 		.avg_hr_x10 = w.avg_hr_x10,
 		.kcal_x1000 = w.kcal_x1000,
+		.end_reason = w.active ? WORKOUT_END_NONE : workout_end_reason,
 	};
 
 	ble_publish_workout(&out);
@@ -1156,6 +1158,17 @@ static void report_spo2(uint8_t tag, uint32_t value)
 	publish_all();
 }
 
+/*
+ * Beat-to-beat intervals since the last Heart Rate Measurement, for its
+ * RR-Interval field. Only the ones hr.c trusts -- the same ones HRV gets
+ * -- so an app drawing them (a breathing exercise) sees the rhythm, not
+ * the detector's misses. Oldest dropped first if a second ever holds more
+ * than fit; discarded when a second ends with no rate to send them with,
+ * and when a window opens, so none is carried across a gap.
+ */
+static uint16_t hrm_rr_ms[BLE_HRM_RR_MAX];
+static uint8_t hrm_rr_n;
+
 static void report(uint32_t raw)
 {
 	static uint32_t win_count;
@@ -1185,6 +1198,13 @@ static void report(uint32_t raw)
 	 * than silently letting the next difference span the gap it left.
 	 */
 	if (beat && hr_last_ibi_trusted(&hr_state)) {
+		if (hrm_rr_n == BLE_HRM_RR_MAX) {
+			memmove(&hrm_rr_ms[0], &hrm_rr_ms[1],
+				sizeof(hrm_rr_ms) - sizeof(hrm_rr_ms[0]));
+			hrm_rr_n--;
+		}
+		hrm_rr_ms[hrm_rr_n++] = hr_last_ibi_ms(&hr_state);
+
 		hrv_add_interval(hr_last_ibi_ms(&hr_state),
 				 hr_last_ibi_successive(&hr_state));
 		if (spot_active() != SPOT_NONE) {
@@ -1228,12 +1248,15 @@ static void report(uint32_t raw)
 				}
 			}
 			spot_feed_hr(bpm_x10);
-			ble_notify_hr((uint16_t)((bpm_x10 + 5U) / 10U));
+			ble_notify_hr((uint16_t)((bpm_x10 + 5U) / 10U),
+				      hrm_rr_ms, hrm_rr_n);
+			hrm_rr_n = 0;
 			LOG_INF("dc %d  ac %d  PI %d.%d%%  HR %u.%u bpm %s",
 				dc, amp, pi / 10, pi % 10,
 				bpm_x10 / 10U, bpm_x10 % 10U,
 				ble_is_connected() ? "[BLE]" : "");
 		} else {
+			hrm_rr_n = 0;
 			LOG_INF("dc %d  ac %d  PI %d.%d%%  (%s)", dc, amp,
 				pi / 10, pi % 10,
 				hr_finger_present(&hr_state)
@@ -1339,6 +1362,7 @@ static int ppg_on(bool green_only)
 
 	hr_init(&hr_state, SAMPLE_RATE_HZ);
 	spo2_reset();
+	hrm_rr_n = 0;
 
 	return 0;
 }
@@ -2003,6 +2027,7 @@ int main(void)
 
 			if (req == WORKOUT_NONE && calories_workout_active()) {
 				calories_workout_stop();
+				workout_end_reason = WORKOUT_END_APP;
 				LOG_INF("workout stopped (app request)");
 				publish_all();
 			} else if (req > WORKOUT_NONE && state == RING_CHARGING) {
@@ -2011,6 +2036,7 @@ int main(void)
 			} else if (req > WORKOUT_NONE) {
 				if (!calories_workout_active()) {
 					workout_started_ms = now;
+					workout_end_reason = WORKOUT_END_NONE;
 				}
 				calories_workout_start((uint8_t)req);
 				LOG_INF("workout started, type %d (app request)",
@@ -2021,6 +2047,7 @@ int main(void)
 			if (calories_workout_active() &&
 			    (now - workout_started_ms) > WORKOUT_MAX_MS) {
 				calories_workout_stop();
+				workout_end_reason = WORKOUT_END_TIME_LIMIT;
 				LOG_WRN("workout stopped: four hours with no stop "
 					"from the app");
 				publish_all();
@@ -2131,7 +2158,14 @@ int main(void)
 			}
 
 			if (atomic_cas(&spot_now_request, 1, 0)) {
-				spot_request_now();
+				if (state == RING_CHARGING) {
+					/* Nothing to measure on a charger; the
+					 * app sees no Wellness "running" bit.
+					 */
+					LOG_WRN("spot reading refused: charging");
+				} else {
+					spot_request_now();
+				}
 			}
 		}
 
@@ -2225,8 +2259,11 @@ int main(void)
 					if (state == RING_MEASURING) {
 						ppg_off();
 					}
+					spot_drop_pending();
 					if (calories_workout_active()) {
 						calories_workout_stop();
+						workout_end_reason =
+							WORKOUT_END_CHARGER;
 						LOG_INF("workout stopped: charger "
 							"attached");
 					}

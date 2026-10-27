@@ -1532,16 +1532,28 @@ int ble_set_tx_power(int8_t dbm, int8_t *selected)
 	return 0;
 }
 
-void ble_notify_hr(uint16_t bpm)
+void ble_notify_hr(uint16_t bpm, const uint16_t *rr_ms, uint8_t n)
 {
 	/*
-	 * Byte for byte what bt_hrs_notify() sends -- flags 0x06 (8-bit rate,
-	 * sensor contact supported and detected), then the rate -- but through
-	 * notify_nowait(). bt_hrs_notify() calls bt_gatt_notify(), which can
+	 * What bt_hrs_notify() sends -- flags 0x06 (8-bit rate, sensor
+	 * contact supported and detected), then the rate -- plus RR
+	 * intervals when there are any (flag 0x10), and through
+	 * notify_nowait(): bt_hrs_notify() calls bt_gatt_notify(), which can
 	 * block the main loop like any other notification.
 	 */
 	static const struct bt_gatt_attr *hrm_attr;
-	uint8_t hrm[2] = { 0x06, (uint8_t)MIN(bpm, UINT8_MAX) };
+	uint8_t hrm[2 + 2 * BLE_HRM_RR_MAX];
+	size_t len = 2;
+
+	n = MIN(n, BLE_HRM_RR_MAX);
+	hrm[0] = n ? 0x16 : 0x06;
+	hrm[1] = (uint8_t)MIN(bpm, UINT8_MAX);
+	for (uint8_t i = 0; i < n; i++) {
+		/* The SIG unit is 1/1024 s. */
+		sys_put_le16((uint16_t)(((uint32_t)rr_ms[i] * 1024U + 500U) /
+					1000U), &hrm[len]);
+		len += 2;
+	}
 
 	if (!ble_is_connected()) {
 		return;
@@ -1555,7 +1567,7 @@ void ble_notify_hr(uint16_t bpm)
 		}
 	}
 
-	(void)notify_nowait(hrm_attr, hrm, sizeof(hrm));
+	(void)notify_nowait(hrm_attr, hrm, len);
 }
 
 void ble_notify_battery(uint8_t percent)

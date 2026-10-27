@@ -148,7 +148,18 @@ struct ring_workout {
 	uint16_t fallback_minutes;
 	uint16_t avg_hr_x10;		/* over hr_minutes; 0 = none */
 	uint32_t kcal_x1000;		/* this workout only */
+	uint8_t end_reason;		/* WORKOUT_END_*, v0.9.0+ */
 } __packed;
+
+/*
+ * Why the last workout ended. Appended in v0.9.0 as byte 16, so a parser
+ * that reads 16 bytes is unaffected. NONE while one runs, and after a
+ * reboot -- which ends a workout too, and shows as uptime going back.
+ */
+#define WORKOUT_END_NONE	0
+#define WORKOUT_END_APP		1	/* opcode 0x0B with type 0 */
+#define WORKOUT_END_TIME_LIMIT	2	/* four hours with no stop */
+#define WORKOUT_END_CHARGER	3	/* the charger was attached */
 
 /* Bits in ring_wellness.flags */
 #define WELLNESS_FLAG_THERMO_READY	BIT(0)	/* baseline settled, see thermo.h */
@@ -227,7 +238,14 @@ void ble_set_control_cbs(const struct ble_control_cbs *cbs);
 bool ble_is_connected(void);
 
 /* Standard services. */
-void ble_notify_hr(uint16_t bpm);
+/*
+ * Heart Rate Measurement, SIG format: 8-bit rate, sensor contact, and --
+ * when n > 0 -- the beat-to-beat intervals since the last one, oldest
+ * first (flag bit 4, units of 1/1024 s). At most BLE_HRM_RR_MAX, which
+ * keeps the packet inside the 20 bytes of a default MTU.
+ */
+#define BLE_HRM_RR_MAX		8
+void ble_notify_hr(uint16_t bpm, const uint16_t *rr_ms, uint8_t n);
 void ble_notify_battery(uint8_t percent);
 
 /* Custom service. All are no-ops when nobody has subscribed. */

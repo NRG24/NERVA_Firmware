@@ -114,9 +114,11 @@ static void test_wire_format(void)
 	      "wear_confirmed offset");
 
 	/* APP_INTEGRATION.md section 11, the Workout characteristic. */
-	CHECK(sizeof(struct ring_workout) == 16,
-	      "ring_workout is %zu bytes, documented as 16",
+	CHECK(sizeof(struct ring_workout) == 17,
+	      "ring_workout is %zu bytes, documented as 17",
 	      sizeof(struct ring_workout));
+	CHECK(offsetof(struct ring_workout, end_reason) == 16,
+	      "end_reason offset");
 	CHECK(offsetof(struct ring_workout, type) == 1, "workout type offset");
 	CHECK(offsetof(struct ring_workout, minutes) == 2, "minutes offset");
 	CHECK(offsetof(struct ring_workout, hr_minutes) == 4,
