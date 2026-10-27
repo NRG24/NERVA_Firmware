@@ -116,6 +116,22 @@ app side: `../mac-handoff/WELLNESS_ANALYTICS.md`.
 6. **Hand ring 2 to the phone:** dashboard, **Unpair ring**, then pair from
    the app.
 
+7. **Check the HRV timing change on real data** (PC Claude, once there
+   is a finger on a working sensor). v0.9.0 places beats between samples
+   (`hr.c`, `peak_offset_q8()`). On synthetic data heart rate is
+   unchanged and low HRV reads 4.0 ms of a true 3.7 instead of 8.5. Record
+   a few minutes still, with the reference strap, using `hr_compare.py`,
+   then:
+
+   ```bash
+   python tools/replay_ab.py --base b3763f5 hrcmp_*_ppg.csv
+   ```
+
+   Base is the last commit before the change. Heart-rate columns should
+   match; head's RMSSD should sit at or below base's. The same recording
+   also says how much sensor noise there is, which is what now sets the
+   HRV floor (table in `src/hrv.h`).
+
 ## Then: live with it (You, a few days)
 
 * **Battery rundown.** Charge full, wear it, don't connect, and sync the

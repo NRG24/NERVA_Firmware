@@ -418,6 +418,11 @@ stuck SDA was the same bad joint.
     false-HRV floor drops to 0.1 ms; with 1 % sensor noise a true 3.6 ms
     reads 4.1 (was 9.8). Beats are reported one sample (10 ms) after the
     peak. `test_hrv` `test_subsample_timing`; table in `hrv.h`.
+  * New PC tools, no ring needed: `tools/replay_ab.py` replays PPG
+    recordings through two git revisions of `hr.c` and compares heart
+    rate and RMSSD (`--synthetic DIR` makes test recordings);
+    `tools/wellness_ref.py` is the reference for the app's wellness
+    analytics and writes `../mac-handoff/wellness_vectors.json`.
 
 ---
 
