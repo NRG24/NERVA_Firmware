@@ -120,23 +120,28 @@
  *
  * 16 kB of storage is four erase pages; settings_nvs caps its sector count
  * at what the partition actually holds, so this gives NVS four sectors --
- * ample for a single bond's keys and CCC state. The image and the history
- * log split the 496 kB below it; see the two partitions themselves.
+ * ample for a single bond's keys and CCC state.
+ *
+ * Since v0.9.0 the bottom of flash is MCUboot, and over-the-air updates
+ * need somewhere to land. Two full image slots do not fit: the image is
+ * ~245 kB with the SMP server, and 2 x 245 + bootloader + bonds leaves
+ * nothing for the history log. So the update is LZMA2-compressed
+ * (MCUboot overwrite-only mode, SB_CONFIG_MCUBOOT_COMPRESSED_IMAGE_SUPPORT)
+ * and lands in the history partition, which doubles as slot 1. An update
+ * therefore costs the history -- the app syncs first, src/ota.c stops the
+ * log writing for the duration, and history_init() formats the region
+ * again on the next boot. See OTA.md.
  *
  * zephyr,code-partition above is what makes this binding rather than
  * decorative: with CONFIG_USE_DT_CODE_PARTITION the linker is told the
  * image ends at 0x50000, so an image that grew into the history log or
  * the bonds would fail to link instead of quietly eating them at run time.
  *
- * NOT YET RUN ON HARDWARE. There is no bootloader and nothing else claims
- * flash on this board, so nothing should collide, but a board that has been
- * flashed with an older image will have stale bytes at 0x7c000.
- *
- * NVS does NOT recover from that by itself, whatever an earlier version of
- * this comment claimed. nvs_init() returns -EDEADLK when every sector looks
- * closed, and only rebuilds the region if CONFIG_NVS_INIT_BAD_MEMORY_REGION
- * is set -- which prj.conf now does, with the reasoning. Erase the part
- * before the first flash anyway; see release/README.md.
+ * NVS does NOT recover from stale bytes at 0x7c000 by itself. nvs_init()
+ * returns -EDEADLK when every sector looks closed, and only rebuilds the
+ * region if CONFIG_NVS_INIT_BAD_MEMORY_REGION is set -- which prj.conf
+ * does, with the reasoning. Erase the part before the first flash anyway;
+ * see release/README.md.
  */
 &flash0 {
 	partitions {
@@ -144,25 +149,36 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 
+		/* MCUboot, overwrite-only, with the LZMA2 decompressor. */
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x0000c000>;
+		};
+
 		/*
-		 * 320 kB for the image, which is ~210 kB as of v0.6. Was
-		 * 496 kB until the history log below took the top of it.
+		 * 272 kB for the running image, ~245 kB as of v0.9.0. It
+		 * starts with MCUboot's 512-byte image header.
 		 */
-		slot0_partition: partition@0 {
+		slot0_partition: partition@c000 {
 			label = "image-0";
-			reg = <0x00000000 0x00050000>;
+			reg = <0x0000c000 0x00044000>;
 		};
 
 		/*
 		 * On-ring history (src/history.c): one 4 kB header page and
-		 * 43 pages of 16-byte records, ~38 days at a 5-minute epoch.
-		 * Its own partition, never shared with the settings below, so
-		 * nothing the log does can touch a bond. It used to be code
-		 * space and may hold stale image bytes; history_init() checks
-		 * for its header and formats the region if it is missing.
+		 * 43 pages of 32-byte records, ~19 days at a 5-minute epoch.
+		 * Also MCUboot's secondary slot: a compressed update is staged
+		 * here, so it must stay at least as big as the compressed
+		 * image (~150 kB). Unmoved since v0.6, so a v0.8 ring keeps
+		 * its log across the reflash that adds the bootloader.
+		 *
+		 * MCUboot only looks inside this slot when the trailer at its
+		 * end says an upgrade is pending (boot_validated_swap_type()),
+		 * so the log is never mistaken for, or erased as, a bad image
+		 * in a normal boot.
 		 */
-		history_partition: partition@50000 {
-			label = "history";
+		slot1_partition: history_partition: partition@50000 {
+			label = "image-1";
 			reg = <0x00050000 0x0002c000>;
 		};
 

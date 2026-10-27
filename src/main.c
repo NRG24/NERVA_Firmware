@@ -42,6 +42,7 @@
 #include "hrv.h"
 #include "imu.h"
 #include "maxm86161.h"
+#include "ota.h"
 #include "profile.h"
 #include "selftest.h"
 #include "sleep.h"
@@ -1378,6 +1379,7 @@ static void slow_sense(void)
 
 	if (mv > 0) {
 		battery_mv = (uint16_t)mv;
+		ota_set_battery_mv(battery_mv);
 		/* BAS can only carry a percentage; the millivolts are the
 		 * real number. See the note in selftest.h.
 		 */
@@ -1705,6 +1707,12 @@ int main(void)
 	ble_set_control_cbs(&control_cbs);
 
 	/*
+	 * Before the radio comes up, so no firmware-update command can
+	 * arrive before the hooks that keep it out of the history log.
+	 */
+	ota_init();
+
+	/*
 	 * ble_start()'s return used to be discarded, which made the one
 	 * failure that matters completely silent: settings_load() failing
 	 * leaves the stack unfinalised, advertising never starts, and the
@@ -2021,6 +2029,14 @@ int main(void)
 
 		/* Rate-limited; a no-op unless a new profile value is waiting. */
 		profile_service(now);
+
+		/*
+		 * A no-op unless a firmware upload owns the history partition.
+		 * Handing it back formats it: ~4 s of page erases, fed inside
+		 * format(), once per abandoned upload.
+		 */
+		ota_service(now);
+		ring_wdt_feed();
 
 		/* --- raw GSR stream, checked in every state --- */
 		service_gsr_stream(now, &next_gsr_sample);

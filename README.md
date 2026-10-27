@@ -214,8 +214,11 @@ enumerates as CMSIS-DAP. nRF52833 is a builtin pyOCD target, so no CMSIS
 pack install is needed.
 
 ```bash
-pyocd flash -t nrf52833 -f 1000000 build/ring-fw/zephyr/zephyr.hex
+pyocd flash -t nrf52833 -f 1000000 build/ring-fw-merged.hex
 ```
+
+(v0.9.0+: bootloader and signed app together; see `OTA.md` for updates
+over BLE.)
 
 ```bash
 pyocd rtt -t nrf52833 -f 1000000

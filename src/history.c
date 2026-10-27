@@ -6,6 +6,9 @@
 #include <zephyr/linker/section_tags.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/storage/flash_map.h>
+#if defined(CONFIG_SETTINGS)
+#include <zephyr/settings/settings.h>
+#endif
 
 #include <string.h>
 
@@ -77,6 +80,22 @@ static uint32_t nslots;		/* record slots in the partition */
 static uint32_t head;		/* next slot to write */
 static uint32_t next_seq;	/* seq the next record gets */
 static uint8_t boot_id;
+
+/*
+ * The partition is also MCUboot's slot 1 (see the board DTS), and while
+ * this is set an upload owns it: nothing here reads or writes it until
+ * history_resume() formats it back.
+ */
+static bool suspended;
+
+/*
+ * Lowest seq the next record may take, from settings. A format starts the
+ * log empty, and without this its seq would start again at 1 -- and an app
+ * syncing "everything after seq N" would skip every new record until the
+ * count passed N again. history_suspend() stores next_seq here before an
+ * upload wipes the log, so the numbering carries on across the update.
+ */
+static uint32_t seq_floor;
 
 /* Read cache for the scan at boot and for the one sync reader. */
 static struct hist_record cache[CACHE_RECORDS];
@@ -168,6 +187,53 @@ static void clock_restore(void)
 		retained.unix_s);
 }
 
+/* --- seq floor, in settings ------------------------------------------- */
+
+#define FLOOR_KEY		"hist/seq"
+
+#if defined(CONFIG_SETTINGS)
+
+/*
+ * Called from settings_load(), which ble_start() runs before
+ * history_init(). Anything unexpected is ignored rather than failed, for
+ * the reason profile.c gives: an error here would cost the radio.
+ */
+static int hist_set(const char *name, size_t len, settings_read_cb read_cb,
+		    void *cb_arg)
+{
+	const char *next;
+	uint32_t v;
+
+	if (!settings_name_steq(name, "seq", &next) || next ||
+	    len != sizeof(v)) {
+		return 0;
+	}
+	if (read_cb(cb_arg, &v, sizeof(v)) == (ssize_t)sizeof(v) &&
+	    v > seq_floor) {
+		seq_floor = v;
+	}
+
+	return 0;
+}
+
+SETTINGS_STATIC_HANDLER_DEFINE(ring_history, "hist", NULL, hist_set, NULL,
+			       NULL);
+
+static int save_floor(uint32_t seq)
+{
+	return settings_save_one(FLOOR_KEY, &seq, sizeof(seq));
+}
+
+#else
+
+static int save_floor(uint32_t seq)
+{
+	(void)seq;
+	return -ENOTSUP;
+}
+
+#endif /* CONFIG_SETTINGS */
+
 /* --- records ----------------------------------------------------------- */
 
 uint8_t history_crc8(const uint8_t *data, uint32_t len)
@@ -227,8 +293,9 @@ static bool cache_get(uint32_t slot, struct hist_record *out)
 
 	if (base != cache_base) {
 		k_mutex_lock(&hist_lock, K_FOREVER);
-		int err = flash_area_read(fa, slot_off(base), cache,
-					  sizeof(cache));
+		int err = suspended ? -EBUSY
+				    : flash_area_read(fa, slot_off(base), cache,
+						      sizeof(cache));
 		k_mutex_unlock(&hist_lock);
 
 		if (err) {
@@ -253,7 +320,8 @@ static bool header_ok(const struct hist_header *h)
 /*
  * Erase the whole partition and write a fresh header. Runs on the first
  * boot of this layout -- the partition used to be code space, so it holds
- * whatever an older, larger image left there -- and after a layout change.
+ * whatever an older, larger image left there -- after a layout change, and
+ * after an upload has used the partition as slot 1. Caller holds hist_lock.
  */
 static int format(void)
 {
@@ -267,8 +335,7 @@ static int format(void)
 	uint32_t words[sizeof(h) / sizeof(uint32_t)];
 	int err;
 
-	LOG_WRN("history: no log in this layout, formatting %u kB",
-		(unsigned int)(fa->fa_size / 1024U));
+	LOG_WRN("history: formatting %u kB", (unsigned int)(fa->fa_size / 1024U));
 
 	for (off_t off = 0; off < (off_t)fa->fa_size; off += HIST_PAGE_SIZE) {
 		err = flash_area_erase(fa, off, HIST_PAGE_SIZE);
@@ -317,15 +384,33 @@ int history_init(void)
 
 	nslots = (uint32_t)((fa->fa_size - HIST_PAGE_SIZE) / HIST_REC_SIZE);
 
+	/*
+	 * Held throughout, scan included (k_mutex nests, and cache_get()
+	 * takes it again): BLE is already up, and an upload that starts now
+	 * must wait for history_suspend() rather than land mid-format.
+	 */
+	k_mutex_lock(&hist_lock, K_FOREVER);
+
+	if (suspended) {
+		/* An upload got here first. history_resume() formats. */
+		k_mutex_unlock(&hist_lock);
+		LOG_WRN("history: slot 1 taken by an upload before init");
+		return 0;
+	}
+
 	err = flash_area_read(fa, 0, &h, sizeof(h));
 	if (err) {
+		k_mutex_unlock(&hist_lock);
 		LOG_ERR("history: header read failed (%d)", err);
 		return err;
 	}
 
 	if (!header_ok(&h)) {
+		/* First boot of this layout, or the first after an update. */
+		LOG_WRN("history: no log in this layout");
 		err = format();
 		if (err) {
+			k_mutex_unlock(&hist_lock);
 			return err;
 		}
 	}
@@ -361,13 +446,100 @@ int history_init(void)
 		next_seq = 1;
 		boot_id = 0;
 	}
+	if (next_seq < seq_floor) {
+		next_seq = seq_floor;
+	}
 
 	ready = true;
+
+	k_mutex_unlock(&hist_lock);
 
 	LOG_INF("history: %u records, next seq %u at slot %u of %u, boot %u",
 		count, next_seq, head, nslots, boot_id);
 
 	return 0;
+}
+
+void history_suspend(void)
+{
+	k_mutex_lock(&hist_lock, K_FOREVER);
+
+	if (!suspended) {
+		suspended = true;
+		cache_base = UINT32_MAX;
+
+		/*
+		 * Before init there is no next_seq yet, and the log cannot
+		 * be scanned for one: the upload writes as soon as this
+		 * returns. The stored floor then stands, and any records
+		 * written since it was saved would be numbered again. Not
+		 * reachable in practice -- history_init() runs microseconds
+		 * after ble_start(), long before a phone can connect, pair
+		 * and send a chunk -- so this only has to be safe, and it
+		 * is: nothing is written into the upload.
+		 */
+		if (ready && next_seq > seq_floor) {
+			int err;
+
+			seq_floor = next_seq;
+			err = save_floor(seq_floor);
+			if (err) {
+				LOG_ERR("history: seq floor %u not saved (%d) -- "
+					"seq restarts at 1 after the update",
+					seq_floor, err);
+			}
+		}
+		ready = false;
+
+		LOG_WRN("history: suspended, slot 1 belongs to an upload");
+	}
+
+	k_mutex_unlock(&hist_lock);
+}
+
+bool history_suspended(void)
+{
+	k_mutex_lock(&hist_lock, K_FOREVER);
+	bool s = suspended;
+	k_mutex_unlock(&hist_lock);
+
+	return s;
+}
+
+int history_resume(void)
+{
+	int err = 0;
+
+	k_mutex_lock(&hist_lock, K_FOREVER);
+
+	if (suspended) {
+		/*
+		 * Whatever the upload left is not a log. Records carry on
+		 * from where they stopped; boot_id is unchanged, since the
+		 * ring did not reboot.
+		 */
+		err = (fa == NULL) ? -ENODEV : format();
+		if (!err) {
+			head = 0;
+			if (next_seq < seq_floor) {
+				next_seq = seq_floor;
+			}
+			if (next_seq == 0U) {
+				next_seq = 1U;
+			}
+			ready = true;
+			LOG_INF("history: resumed, next seq %u", next_seq);
+		} else {
+			LOG_ERR("history: format after upload failed (%d)",
+				err);
+		}
+		suspended = false;
+		cache_base = UINT32_MAX;
+	}
+
+	k_mutex_unlock(&hist_lock);
+
+	return err;
 }
 
 int history_append(struct hist_record *rec)
@@ -378,7 +550,8 @@ int history_append(struct hist_record *rec)
 	int err = -EIO;
 
 	if (!ready) {
-		return -ENODEV;
+		/* Unlocked peek; rechecked under the lock below. */
+		return suspended ? -EBUSY : -ENODEV;
 	}
 
 	if (history_unix_now(&unix_s)) {
@@ -391,6 +564,12 @@ int history_append(struct hist_record *rec)
 	rec->boot_id = boot_id;
 
 	k_mutex_lock(&hist_lock, K_FOREVER);
+
+	if (!ready) {
+		/* Suspended since the peek above. */
+		k_mutex_unlock(&hist_lock);
+		return -EBUSY;
+	}
 
 	/*
 	 * At most one try per page. A page that will not erase, or a slot
@@ -480,6 +659,11 @@ void history_iter_begin(struct hist_iter *it, uint32_t from_seq)
 			it->remaining = nslots;
 		}
 		it->last_seq = next_seq - 1U;
+	} else if (suspended && next_seq > 0U) {
+		/* Nothing to walk, but the summary still says how far the
+		 * numbering has got.
+		 */
+		it->last_seq = next_seq - 1U;
 	}
 
 	/* Records may have been written since this cache was filled. */
@@ -491,6 +675,12 @@ void history_iter_begin(struct hist_iter *it, uint32_t from_seq)
 bool history_iter_next(struct hist_iter *it, struct hist_record *out)
 {
 	while (it->remaining > 0U) {
+		if (suspended) {
+			/* An upload took the partition mid-walk. */
+			it->remaining = 0U;
+			break;
+		}
+
 		uint32_t slot = it->slot;
 
 		it->slot = (slot + 1U) % nslots;
@@ -519,3 +709,16 @@ bool history_iter_next(struct hist_iter *it, struct hist_record *out)
 
 	return false;
 }
+
+#if defined(HISTORY_TESTING)
+/* Host tests only: what a power cycle does to this module's RAM. */
+void history_test_power_cycle(void)
+{
+	ready = false;
+	suspended = false;
+	seq_floor = 0;
+	next_seq = 0;
+	head = 0;
+	cache_base = UINT32_MAX;
+}
+#endif

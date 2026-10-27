@@ -27,7 +27,8 @@ Advertising runs continuously, including while charging.
 
 ## 2. Services
 
-Three standard services plus one custom.
+Three standard services plus one custom, and from v0.9.0 MCUmgr's SMP
+service for firmware updates (`8d53dc1d-...`, section 18).
 
 ### Heart Rate Service — `0x180D`
 
@@ -57,7 +58,7 @@ which firmware you are talking to before you decide what to trust.
 
 | Characteristic | UUID | Value |
 |---|---|---|
-| Firmware Revision | `0x2A26` | `0.8.0` (production; see `prj.conf`) |
+| Firmware Revision | `0x2A26` | `0.9.0` (production; see `prj.conf`) |
 | Manufacturer Name | `0x2A29` | `Ring project` |
 | Model Number | `0x2A24` | `Ring ANNA-B402` |
 
@@ -1220,3 +1221,53 @@ and a minute or so late, at 0.25 C resolution, and nobody has worn this
 board through a hot flash. A hand around a hot mug or out from under a
 duvet looks the same. Ask the wearer to confirm or dismiss each event;
 that is the data that would tune `rise_c10`.
+
+---
+
+## 18. Firmware updates over BLE
+
+New in v0.9.0. **Compile-verified and host-tested only.** Full design:
+`OTA.md`.
+
+The ring runs MCUboot and exposes MCUmgr's standard SMP service:
+
+| | UUID | Properties |
+|---|---|---|
+| SMP service | `8d53dc1d-1db7-4cd3-868b-8a527460aa84` | |
+| SMP characteristic | `da2e7828-fbce-4e01-ae9e-261174997c48` | Write Without Response, Notify; encrypted link required |
+
+Do not implement SMP by hand in the app. Use Nordic's nRF Connect Device
+Manager library: `iOSMcuManagerLibrary` on iOS,
+`Android-nRF-Connect-Device-Manager` on Android, or the `mcumgr_flutter`
+plugin, which wraps both. Give it the signed update `.bin` (or the build's
+`dfu_application.zip`). "Test and confirm" and "confirm only" both work;
+the ring's bootloader treats them the same.
+
+**The update erases the on-ring history.** The upload lands in the
+partition the log lives in. The app has to:
+
+1. **Sync history to the end first** (`0x0E`), and only then start the
+   DFU. Records the ring stores during the upload are lost.
+2. Run the DFU: upload (about a minute), mark, reset. The ring is off the
+   air for roughly 10-20 s while the bootloader installs the image.
+3. Reconnect, read the Firmware Revision, set the clock (`0x0D`), resend
+   the profile and the `0x12`/`0x13` settings, and **carry on syncing
+   from the same `from_seq`**. The ring keeps its record numbering across
+   the update: the first record after it continues from the last seq
+   before it, not from 1. `boot_id` restarts at 0, since the log is new.
+
+Refusals the library will surface as an SMP error code:
+
+| rc | Meaning | What to do |
+|---|---|---|
+| 10 (`EBUSY`) | Battery below 3.6 V; no upload may start | ask the wearer to charge first |
+| 6 (`EBADSTATE`) | The upload was left for more than 10 min, and the ring took the partition back for its log | start the DFU again from the beginning |
+
+A finished upload that is marked but never followed by a reset is
+installed by the ring itself after 60 s.
+
+Only images signed with the project's key are accepted. A damaged upload
+is rejected by the bootloader and the old firmware keeps running. There
+is **no revert**: an image that is correctly signed but broken stays
+installed. Ship only releases that have run on a bench ring.
+

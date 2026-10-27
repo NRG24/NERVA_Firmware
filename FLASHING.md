@@ -14,7 +14,12 @@ pyocd erase -t nrf52833 -f 1000000 --chip
 ```
 
 ```bash
-pyocd flash -t nrf52833 -f 1000000 zephyr.hex
+pyocd flash -t nrf52833 -f 1000000 build/ring-fw-merged.hex
 ```
+
+From v0.9.0 flash the merged hex (MCUboot + signed app), never the bare
+`zephyr.hex`, which has no MCUboot header and will not boot. After the
+first flash, updates can go over BLE instead: see `OTA.md`. A full chip
+erase also wipes the history log and the bonds; a plain flash keeps both.
 
 `No ACK` means SWD wiring or power, not firmware.

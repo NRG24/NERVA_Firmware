@@ -1,5 +1,6 @@
 #include "ble.h"
 #include "history.h"
+#include "ota.h"	/* an upload wants the fast interval too */
 #include "maxm86161.h"	/* PPG_TUNE_* limits for opcode 0x10 */
 #include "spot.h"	/* spot_config_valid() for opcode 0x12 */
 #include "thermo.h"	/* THERMO_* limits for opcode 0x13 */
@@ -1094,8 +1095,9 @@ static void history_work_fn(struct k_work *work)
  *         with nothing to send, so it wakes about every half second. Live
  *         Status and heart rate (one notification a second) still go out
  *         at the next event, latency is skipped whenever data is queued.
- *   FAST  15-30 ms, no latency: while PPG, IMU or GSR streams, or a
- *         history sync runs, which need the throughput.
+ *   FAST  15-30 ms, no latency: while PPG, IMU or GSR streams, a
+ *         history sync runs, or a firmware upload is under way (ota.h),
+ *         which need the throughput.
  *
  * Both fit Apple's accessory rules: interval max at least 15 ms above min,
  * latency at most 30, max x (latency + 1) at most 2 s, and the 4 s
@@ -1448,7 +1450,7 @@ void ble_service(int64_t now_ms)
 	bool want_fast = ble_ppg_streaming() || ble_imu_streaming() ||
 			 ble_gsr_streaming() ||
 			 atomic_get(&history_running) ||
-			 atomic_get(&history_request);
+			 atomic_get(&history_request) || ota_active();
 	atomic_val_t want = want_fast ? CONN_MODE_FAST : CONN_MODE_IDLE;
 
 	if (want == atomic_get(&conn_mode)) {

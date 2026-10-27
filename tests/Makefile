@@ -18,7 +18,7 @@ SRC     := ../src/steps.c ../src/sleep.c ../src/calories.c ../src/hrv.c ../src/h
 COMMON  := sim.c $(SRC)
 
 TESTS   := test_activity test_mainloop test_hrv test_spo2 test_driver \
-	   test_profile test_history test_hr test_thermo test_spot
+	   test_profile test_history test_hr test_thermo test_spot test_ota
 
 # Every .c in src/, plus the GATT layout assertions.
 #
@@ -78,9 +78,10 @@ test_profile: test_profile.c sim.c ../src/profile.c ../src/calories.c
 
 # The history log against a fake NOR flash that counts any write landing on
 # unerased bytes. history.c is built as-is; the flash and kernel calls it
-# makes are supplied by test_history.c.
+# makes are supplied by test_history.c, and so are the settings calls that
+# keep the seq going across a firmware update.
 test_history: test_history.c sim.c ../src/history.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) -DCONFIG_SETTINGS -DHISTORY_TESTING -o $@ $^ $(LDLIBS)
 
 # The heart-rate detector against synthetic PPG: range, glitches, drift,
 # no finger, noise without a pulse, strong harmonic, rate change.
@@ -97,6 +98,12 @@ test_spot: test_spot.c sim.c ../src/spot.c
 	$(CC) $(CFLAGS) -DCONFIG_RING_SPOT_NIGHT_MIN=60 \
 		-DCONFIG_RING_SPOT_DAY_MIN=60 -DCONFIG_RING_SPOT_WINDOW_S=180 \
 		-o $@ $^ $(LDLIBS)
+
+# Firmware-update decisions: when an upload may write slot 1, when the
+# history takes it back, when the ring reboots to install. ota.c without
+# CONFIG_MCUMGR is just the decisions.
+test_ota: test_ota.c sim.c ../src/ota.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 run: $(TESTS)
 	@fail=0; \

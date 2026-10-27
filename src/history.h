@@ -112,6 +112,25 @@ void history_clock_save(void);
 uint8_t history_boot_id(void);
 
 /*
+ * The partition doubles as MCUboot's slot 1, so an over-the-air update
+ * overwrites the log (OTA.md). src/ota.c calls this as an upload starts:
+ * it saves the next seq to settings, so numbering carries on after the
+ * update, then stops every read and write of the partition. Appends
+ * return -EBUSY and a sync walks nothing until history_resume() or a
+ * reboot. Any thread; blocks behind an append or a format in progress.
+ */
+void history_suspend(void);
+
+bool history_suspended(void);
+
+/*
+ * Give the partition back to the log after an upload that was abandoned:
+ * format it (~4 s, feeding the watchdog) and carry on with the same seq.
+ * No-op unless suspended. Main loop only.
+ */
+int history_resume(void);
+
+/*
  * Reading the log back for a sync. One reader at a time -- the BLE sync
  * work item is the only caller.
  */

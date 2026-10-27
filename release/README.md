@@ -10,6 +10,20 @@ python -m pyocd flash -t nrf52833 -f 1000000 release/<file>.hex
 
 ---
 
+## v0.9.0-prod -- NOT YET RUN ON HARDWARE
+
+The first release with a bootloader (`../OTA.md`).
+
+| File | Use |
+|---|---|
+| `ring-fw-v0.9.0-prod.hex` | MCUboot + signed app, for SWD. Flash it like any other; a plain flash keeps the history log and the bonds |
+| `ring-fw-v0.9.0-prod-update.bin` | signed, LZMA2-compressed update for a ring that already runs v0.9.0+: `python tools/ota_update.py release/ring-fw-v0.9.0-prod-update.bin --yes`, or the nRF Connect Device Manager library |
+
+Signed with `keys/ring-mcuboot-ecdsa-p256.pem` (not in git). A ring with
+this bootloader accepts only images signed with that key.
+
+---
+
 ## v0.1-bench -- proven on hardware
 
 Built from the tagged `v0.1-bench` tree. These are the images that actually

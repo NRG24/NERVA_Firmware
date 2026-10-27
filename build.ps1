@@ -8,6 +8,20 @@
 #   .\build.ps1 -Flash     # build, then flash over the Debug Probe
 #   .\build.ps1 -Rtt       # build, flash, then attach the RTT viewer
 #
+# Since v0.9.0 every variant builds MCUboot in front of the app
+# (sysbuild.conf). Two outputs matter:
+#
+#   <build>\ring-fw-merged.hex           bootloader + signed app, for SWD
+#   <build>\ring-fw\zephyr\zephyr.signed.bin
+#                                        signed, LZMA2-compressed update for
+#                                        over the air (tools/ota_update.py,
+#                                        or dfu_application.zip for nRF
+#                                        Connect Device Manager)
+#
+# The plain zephyr.hex is the app WITHOUT its MCUboot header: flashed on
+# its own it does not boot. Signing needs keys\ring-mcuboot-ecdsa-p256.pem,
+# which is not in git; see OTA.md.
+#
 # Bench and production differ only by Kconfig, never by edited source. They
 # used to be two hand-edited copies of main.c kept in step by hand, and the
 # duplicate rotted immediately. See Kconfig and bench.conf.
@@ -64,13 +78,30 @@ if ($Bench) {
 	Write-Output "=== PRODUCTION build (prod.conf) ==="
 }
 
-$hex = Join-Path $build "ring-fw\zephyr\zephyr.hex"
+$boot   = Join-Path $build "mcuboot\zephyr\zephyr.hex"
+$signed = Join-Path $build "ring-fw\zephyr\zephyr.signed.hex"
+$hex    = Join-Path $build "ring-fw-merged.hex"
+$key    = Join-Path $app "keys\ring-mcuboot-ecdsa-p256.pem"
+
+if (-not (Test-Path $key)) {
+	Write-Output "MISSING SIGNING KEY: $key -- see OTA.md"
+	exit 1
+}
 
 & $nrfutil sdk-manager toolchain launch --ncs-version $NcsVersion --chdir $workspace -- `
 	west build -b ring_anna/nrf52833 -p always -d $build $app -- @extra
 
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $hex)) {
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $boot) -or -not (Test-Path $signed)) {
 	Write-Output "BUILD FAILED"
+	exit 1
+}
+
+# No Partition Manager, so sysbuild writes no merged hex of its own.
+& $nrfutil sdk-manager toolchain launch --ncs-version $NcsVersion --chdir $workspace -- `
+	python zephyr\scripts\build\mergehex.py -o $hex $boot $signed
+
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $hex)) {
+	Write-Output "MERGE FAILED"
 	exit 1
 }
 

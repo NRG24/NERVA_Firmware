@@ -35,7 +35,8 @@ SUITES = {
     "test_profile": (["test_profile.c", "sim.c", os.path.join(SRC, "profile.c"),
                       os.path.join(SRC, "calories.c")],
                      ["-DCONFIG_SETTINGS", "-DPROFILE_TESTING"]),
-    "test_history": (["test_history.c", "sim.c", os.path.join(SRC, "history.c")], []),
+    "test_history": (["test_history.c", "sim.c", os.path.join(SRC, "history.c")],
+                     ["-DCONFIG_SETTINGS", "-DHISTORY_TESTING"]),
     "test_hr": (["test_hr.c", "sim.c", os.path.join(SRC, "hr.c")], []),
     "test_thermo": (["test_thermo.c", "sim.c", os.path.join(SRC, "thermo.c")],
                     ["-DCONFIG_RING_HOT_FLASH_MODE=1",
@@ -43,6 +44,7 @@ SUITES = {
     "test_spot": (["test_spot.c", "sim.c", os.path.join(SRC, "spot.c")],
                   ["-DCONFIG_RING_SPOT_NIGHT_MIN=60", "-DCONFIG_RING_SPOT_DAY_MIN=60",
                    "-DCONFIG_RING_SPOT_WINDOW_S=180"]),
+    "test_ota": (["test_ota.c", "sim.c", os.path.join(SRC, "ota.c")], []),
 }
 
 

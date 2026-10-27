@@ -45,8 +45,13 @@ west build -b ring_anna/nrf52833 -d build . -- -DBOARD_ROOT=<app dir>
 Flash and log with pyOCD (Raspberry Pi Debug Probe, CMSIS-DAP):
 
 ```bash
-python -m pyocd flash -t nrf52833 -f 1000000 build/ring-fw/zephyr/zephyr.hex
+python -m pyocd flash -t nrf52833 -f 1000000 build/ring-fw-merged.hex
 ```
+
+Since v0.9.0 that is MCUboot plus the signed app; the plain
+`build/ring-fw/zephyr/zephyr.hex` has no MCUboot header and does not boot
+on its own. The build needs `keys/ring-mcuboot-ecdsa-p256.pem`, which is
+not in git. Updates after the first flash can go over the air: `OTA.md`.
 
 ```bash
 python -m pyocd rtt -t nrf52833 -f 1000000
@@ -387,6 +392,26 @@ stuck SDA was the same bad joint.
     turns them on. A history sync below MTU 37 is refused with ATT `0x11`.
   * Wear verdicts for both come from PPG windows, so **with a dead MAXM
     neither feature ever runs** (the temperature is still logged).
+* **v0.9.0 over-the-air updates (2026-10-27): built, not flashed.**
+  `release/ring-fw-v0.9.0-prod.hex` (SWD, with bootloader) and
+  `release/ring-fw-v0.9.0-prod-update.bin` (OTA). Everything is in
+  `OTA.md`; the short version:
+  * MCUboot overwrite-only in a 48 kB partition at 0x0, app slot 272 kB
+    at 0xC000. The update is LZMA2-compressed (~144 kB) and lands in the
+    **history partition, which doubles as slot 1** -- two full slots do
+    not fit 512 kB beside the log. Sync before updating.
+  * `src/ota.c` hooks MCUmgr: an upload suspends the history and saves
+    its seq to settings, so numbering carries on after the update; an
+    abandoned upload hands the partition back after 10 min; a marked
+    image with no reset installs itself after 60 s; below 3.6 V an upload
+    will not start. `test_ota` (35 checks), `test_history` grows the
+    suspend/resume/floor cases.
+  * Signing key `keys/ring-mcuboot-ecdsa-p256.pem` is gitignored. **Back
+    it up**; without it no ring can be updated over the air again.
+  * No revert: a signed image that is broken in itself stays until the
+    jig. Every release runs on an unsealed board first.
+  * `tools/ota_update.py` uploads from the PC (no extra packages);
+    `prod_check.py` now expects 0.9.x and checks the SMP service.
 
 ---
 

@@ -20,4 +20,12 @@ target_sources(app PRIVATE
 	src/history.c
 	src/thermo.c
 	src/spot.c
+	src/ota.c
 )
+
+# ota.c includes img_mgmt.h, which pulls in MCUboot's bootutil headers.
+# img_mgmt gets their include paths by linking this interface library;
+# so does the app.
+if(CONFIG_MCUBOOT_IMG_MANAGER)
+	target_link_libraries(app PRIVATE MCUBOOT_BOOTUTIL)
+endif()

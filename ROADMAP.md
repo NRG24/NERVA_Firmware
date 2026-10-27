@@ -12,12 +12,12 @@ agent working from `mac-handoff/`.
 | Area | State |
 |---|---|
 | Test firmware | **Frozen**: `../ring-fw-test-v0.6.2/`. It is on ring 2. History works; heart rate measured 4.3 bpm mean error, 68 % within 5 bpm against a WHOOP |
-| Production firmware | **v0.8.0 built, not flashed**: `release/ring-fw-v0.8.0-prod.hex` (v0.7.0 plus temperature, hot flashes, spot readings, history v2) |
-| Host tests | Syntax pass plus 10 suites, all passing on the PC (`python tests/run_tests.py`) |
+| Production firmware | **v0.9.0 built, not flashed**: `release/ring-fw-v0.9.0-prod.hex` (v0.8.0 plus MCUboot and over-the-air updates, `OTA.md`). v0.8.0 added temperature, hot flashes, spot readings, history v2 |
+| Host tests | Syntax pass plus 11 suites, all passing on the PC (`python tests/run_tests.py`) |
 | Phone app | Flutter, built by Mac Claude from `mac-handoff.zip` |
 | PPG modules | **All MAXM86161s on hand are dead** (2026-10-24); replacements ordered. The boards themselves work (boost gives 5 V, green LED test lit). Nothing below that needs a heart rate can happen until they arrive |
 | Hardware | Rev 2026-09-23. Next spin list in `HARDWARE_NOTES.md` (items 13, 1, 11, 10, 6, 4, 2, 14, 15) |
-| Commits | **None since `d119f04`.** Everything since 2026-10-07 is uncommitted |
+| Commits | v0.8.0 committed as `fdda8a1` (2026-10-27); later work on top of it |
 
 ## What v0.8.0 adds (host-tested and compile-verified, not on a ring)
 
@@ -92,12 +92,16 @@ app side: `../mac-handoff/WELLNESS_ANALYTICS.md`.
 
    This scores the new counter against the frozen one, on your hand. It
    settles the arm-swing question that `test_arm_swing` can only guess at.
-4. **Sync ring 2's history first** (`python tools/history_sync.py`): v0.8.0 reformats the log.
-   Then **flash prod** on ring 2:
+4. **Sync ring 2's history first** (`python tools/history_sync.py`): v0.8.0+ reformats a v1 log.
+   Then **flash prod** on ring 2. v0.9.0 brings the bootloader, so this
+   is the last flash that has to go over SWD:
 
    ```bash
-   python tools/flash_on_contact.py release/ring-fw-v0.8.0-prod.hex --no-verify --rtt 40 -f 1000000 500000 250000
+   python tools/flash_on_contact.py release/ring-fw-v0.9.0-prod.hex --no-verify --rtt 40 -f 1000000 500000 250000
    ```
+
+   Then run the first-update checklist at the end of `OTA.md` while it is
+   still on the jig: one update over the air, with RTT watching.
 
 5. **Accept it** (*You* + PC Claude):
 

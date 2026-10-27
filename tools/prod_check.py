@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Acceptance check for a freshly flashed production ring (v0.8.0+).
+Acceptance check for a freshly flashed production ring (v0.9.0+).
 
     python tools/prod_check.py
 
@@ -12,7 +12,7 @@ Checks, in order, everything that can be checked over BLE:
 
   1. advertising has slowed: ~1 packet a second, not ~20 (prod.conf
      CONFIG_RING_ADV_SLOW_AFTER_S)
-  2. firmware revision reads 0.8.x
+  2. firmware revision reads 0.9.x
   3. a diagnostic opcode (0x10) is refused with ATT 0x13 (CONFIG_RING_DIAG_
      OPCODES off)
   4. Status reads, gsr_mv is -1 (CONFIG_RING_GSR_STATUS off), the PPG, IMU
@@ -22,6 +22,8 @@ Checks, in order, everything that can be checked over BLE:
   6. Wellness reads a plausible ring temperature; the spot schedule (0x12)
      and hot-flash settings (0x13) take the prod defaults and refuse a bad
      value
+  7. the firmware-update (SMP) service answers, and lists the running
+     image in slot 0 as active and confirmed (OTA.md)
 
 It prints PASS/FAIL per check. Things it cannot see over BLE -- the
 connection interval the ring asked for, wake-on-motion and step counting
@@ -38,6 +40,7 @@ from bleak.exc import BleakError
 
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 import history_sync as hs  # noqa: E402
+import ota_update as ou  # noqa: E402
 
 
 def ring_uuid(n):
@@ -87,7 +90,7 @@ async def main(address=None):
 
         # 2. Firmware revision.
         fw = (await c.read_gatt_char(FWREV)).decode(errors="replace")
-        check("firmware is 0.8.x", fw.startswith("0.8"), fw)
+        check("firmware is 0.9.x", fw.startswith("0.9"), fw)
 
         # 3. Diagnostic opcode refused.
         try:
@@ -155,6 +158,24 @@ async def main(address=None):
             check("bad spot interval refused", False, "5 min was accepted")
         except BleakError as e:
             check("bad spot interval refused", True, str(e)[:60])
+
+        # 7. Firmware update service.
+        if c.services.get_characteristic(ou.SMP_CHAR) is None:
+            check("firmware update (SMP) service present", False, "missing")
+        else:
+            smp = ou.Smp(c)
+            await smp.start()
+            try:
+                st = await smp.call(ou.OP_READ, ou.GROUP_IMAGE, ou.IMG_STATE, {})
+                s0 = [i for i in st.get("images", []) if i.get("slot") == 0]
+                im = s0[0] if s0 else {}
+                check("slot 0 active, confirmed, 0.9.x",
+                      bool(im.get("active")) and bool(im.get("confirmed")) and
+                      str(im.get("version", "")).startswith("0.9"),
+                      "version %s, active %s, confirmed %s" % (
+                          im.get("version"), im.get("active"), im.get("confirmed")))
+            except asyncio.TimeoutError:
+                check("slot 0 active, confirmed, 0.9.x", False, "no SMP reply")
 
     print("\n%d/%d checks passed" % (sum(ok for _, ok in results), len(results)))
     print("""

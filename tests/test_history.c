@@ -10,7 +10,9 @@
  * What this proves: records come back in order with no gaps across
  * reboots, wrap-around and a torn write; a partition full of stale code
  * bytes is formatted rather than misread; nothing is ever written on top
- * of unerased flash; and the wall clock survives a soft reset.
+ * of unerased flash; the wall clock survives a soft reset; and a firmware
+ * upload that takes the partition as MCUboot's slot 1 neither writes into
+ * the log nor restarts its numbering.
  * What it does not: that the real flash driver, the MPSL timeslots or the
  * real noinit section behave -- only the board can say that.
  */
@@ -19,6 +21,7 @@
 #include "sim.h"
 
 #include <zephyr/kernel.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/storage/flash_map.h>
 
 #include <stdarg.h>
@@ -168,6 +171,78 @@ int flash_area_erase(const struct flash_area *fa, off_t off, size_t len)
 	memset(&flash[off], 0xff, len);
 	erases++;
 	return 0;
+}
+
+/* --- fake settings ----------------------------------------------------- */
+
+void history_test_power_cycle(void);
+
+/* history.c's handler, left where the stub macro puts it. */
+extern int (*const settings_stub_set_ring_history)(const char *, size_t,
+						   settings_read_cb, void *);
+
+static uint32_t stored_floor;
+static bool have_floor;
+static int floor_saves;
+
+int settings_save_one(const char *name, const void *value, size_t val_len)
+{
+	if (strcmp(name, "hist/seq") != 0 || val_len != sizeof(stored_floor)) {
+		return -22;
+	}
+	memcpy(&stored_floor, value, sizeof(stored_floor));
+	have_floor = true;
+	floor_saves++;
+	return 0;
+}
+
+int settings_name_steq(const char *name, const char *key, const char **next)
+{
+	size_t n = strlen(key);
+
+	*next = NULL;
+	if (strncmp(name, key, n) != 0) {
+		return 0;
+	}
+	if (name[n] == '\0') {
+		return 1;
+	}
+	if (name[n] == '/') {
+		*next = &name[n + 1];
+		return 1;
+	}
+	return 0;
+}
+
+static ssize_t read_floor(void *cb_arg, void *data, size_t len)
+{
+	memcpy(data, cb_arg, len);
+	return (ssize_t)len;
+}
+
+/*
+ * A real power cycle: RAM forgets, settings_load() (inside ble_start())
+ * hands back what was saved, then history_init().
+ */
+static void power_cycle(void)
+{
+	history_test_power_cycle();
+	if (have_floor) {
+		(void)settings_stub_set_ring_history("seq", sizeof(stored_floor),
+						     read_floor, &stored_floor);
+	}
+	fake_ms = 500;
+}
+
+/* What an upload leaves in slot 1: image bytes, over the whole thing. */
+static void upload_scribbles(uint32_t bytes)
+{
+	uint32_t x = 777;
+
+	for (uint32_t i = 0; i < bytes && i < PART_SIZE; i++) {
+		x = x * 1103515245U + 12345U;
+		flash[i] = (uint8_t)(x >> 16);
+	}
 }
 
 /* --- helpers ----------------------------------------------------------- */
@@ -470,6 +545,117 @@ static void test_layout_change(void)
 	      "fresh log starts at seq 1");
 }
 
+static void test_upload_installed(void)
+{
+	sim_section("an installed update keeps the seq going");
+
+	uint32_t last = walk_from(0).last;
+
+	CHECK(append_n(3, 70) == 3, "three records before the upload");
+	last += 3;
+
+	history_suspend();
+	CHECK(history_suspended(), "suspended");
+	CHECK(floor_saves == 1 && stored_floor == last + 1,
+	      "next seq saved as the floor (%u, want %u)", stored_floor,
+	      last + 1);
+	CHECK(append_n(1, 70) == 0, "appends refused while suspended");
+
+	struct walk w = walk_from(0);
+
+	CHECK(w.count == 0 && w.newest == last,
+	      "a sync walks nothing but still reports seq %u (got %u)", last,
+	      w.newest);
+
+	/* The upload fills slot 1, MCUboot installs it, the ring reboots. */
+	upload_scribbles(150000U);
+	power_cycle();
+	erases = 0;
+	CHECK(history_init() == 0, "init after the update");
+	CHECK(erases == (int)(PART_SIZE / PAGE),
+	      "slot 1's leftovers formatted (%d erases)", erases);
+	CHECK(append_n(2, 70) == 2, "appends work again");
+
+	w = walk_from(0);
+	CHECK(w.count == 2 && w.first == last + 1 && w.gaps == 0,
+	      "numbering carries on at %u (got %u..%u)", last + 1, w.first,
+	      w.last);
+	CHECK(overwrites == 0, "nothing written over unerased flash (%d)",
+	      overwrites);
+
+	/* And a later ordinary reboot does not drag it back to the floor. */
+	reboot();
+	CHECK(append_n(1, 70) == 1 && walk_from(0).last == last + 3,
+	      "an ordinary reboot continues from the log, not the floor");
+}
+
+static void test_upload_abandoned(void)
+{
+	sim_section("an abandoned upload gives the partition back");
+
+	struct hist_iter it;
+	struct hist_record r;
+	uint32_t last;
+
+	CHECK(append_n(20, 66) == 20, "twenty records");
+	last = walk_from(0).last;
+
+	/* A sync is mid-walk when the upload starts. */
+	history_iter_begin(&it, 0);
+	CHECK(history_iter_next(&it, &r), "walk started");
+	history_suspend();
+	CHECK(!history_iter_next(&it, &r), "the walk stops at the suspend");
+
+	upload_scribbles(40000U);	/* a third of the way, then gone */
+
+	erases = 0;
+	CHECK(history_resume() == 0, "resume");
+	CHECK(!history_suspended(), "no longer suspended");
+	CHECK(erases == (int)(PART_SIZE / PAGE), "formatted on resume (%d)",
+	      erases);
+	CHECK(append_n(2, 66) == 2, "appends work again");
+
+	struct walk w = walk_from(0);
+
+	CHECK(w.count == 2 && w.first == last + 1,
+	      "same boot, seq carries on at %u (got %u)", last + 1, w.first);
+	CHECK(overwrites == 0, "nothing written over the upload's bytes (%d)",
+	      overwrites);
+	int before = erases;
+
+	CHECK(history_resume() == 0 && erases == before,
+	      "resume when not suspended does nothing");
+}
+
+static void test_upload_before_init(void)
+{
+	sim_section("an upload that starts before history_init()");
+
+	uint32_t last = walk_from(0).last;
+	int saves = floor_saves;
+
+	power_cycle();
+	history_suspend();	/* BLE is up first; the phone was quick */
+	CHECK(floor_saves == saves,
+	      "no floor saved: nothing is known yet, the stored one stands");
+
+	erases = 0;
+	CHECK(history_init() == 0, "init returns cleanly");
+	CHECK(erases == 0, "and does not format under the upload");
+	CHECK(append_n(1, 60) == 0, "appends refused");
+
+	upload_scribbles(PART_SIZE);
+	CHECK(history_resume() == 0, "resume formats");
+	CHECK(append_n(1, 60) == 1, "append after resume");
+
+	uint32_t first = walk_from(0).first;
+
+	CHECK(first == stored_floor && first > 1U && first <= last + 1U,
+	      "seq resumes from the stored floor, not 1 (got %u, floor %u)",
+	      first, stored_floor);
+	CHECK(overwrites == 0, "no overwrites (%d)", overwrites);
+}
+
 int main(int argc, char **argv)
 {
 	verbose = argc > 1 && strcmp(argv[1], "-v") == 0;
@@ -482,6 +668,9 @@ int main(int argc, char **argv)
 	test_wrap();
 	test_iter_snapshot();
 	test_layout_change();
+	test_upload_installed();
+	test_upload_abandoned();
+	test_upload_before_init();
 
 	return sim_report("history");
 }

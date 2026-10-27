@@ -22,3 +22,7 @@ tests/test_profile
 # Host test build output (tests/run_tests.py)
 tests/bin/
 __pycache__/
+
+# MCUboot signing key (sysbuild.conf). Never commit it; back it up instead:
+# without it no sealed ring can be updated over the air again. OTA.md.
+keys/*.pem
