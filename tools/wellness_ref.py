@@ -41,7 +41,7 @@ F_TIME, F_WORN, F_CHG, F_SLEEP, F_WORKOUT, F_HOT, F_SPOT_N, F_SPOT_D = (
 FLAG_NAMES = ["TIME", "WORN", "CHG", "SLEEP", "WORKOUT", "HOTFLASH",
               "SPOT_NIGHT", "SPOT_DAY"]
 
-REC2 = struct.Struct("<IIHhhBBBBBBBBBBBBB4xB")
+REC2 = struct.Struct("<IIHhhBBBBBBBBBBBBBB3xB")
 TEMP_NONE = -32768
 
 # Section 4.
@@ -77,7 +77,7 @@ def parse_hex(h):
     raw = bytes.fromhex(h)
     (seq, t, steps, temp, skin, hr, hr_min, hr_max, rmssd, rest_hr,
      rest_rmssd, rest_beats, rise, motion, batt, flags, hot, boot,
-     crc) = REC2.unpack(raw)
+     flags2, crc) = REC2.unpack(raw)
     return {"seq": seq, "time_s": t, "steps": steps,
             "temp_c100": None if temp == TEMP_NONE else temp,
             "hr_bpm": hr, "hr_min_bpm": hr_min, "hr_max_bpm": hr_max,
@@ -85,6 +85,7 @@ def parse_hex(h):
             "rest_beats": rest_beats, "temp_rise_c10": rise,
             "motion_pct": None if motion == 255 else motion,
             "flags": flags, "hot_flashes": hot,
+            "spot_manual": bool(flags2 & 1),
             "crc_ok": crc8(raw[:31]) == crc}
 
 
@@ -95,7 +96,8 @@ def encode_hex(r):
                     0, r["rest_hr_bpm"], r["rest_rmssd_ms"], r["rest_beats"],
                     r["temp_rise_c10"],
                     255 if r["motion_pct"] is None else r["motion_pct"],
-                    190, r["flags"], r["hot_flashes"], 0, 0)
+                    190, r["flags"], r["hot_flashes"], 0,
+                    1 if r.get("spot_manual") else 0, 0)
     return (raw[:31] + bytes([crc8(raw[:31])])).hex()
 
 
@@ -417,8 +419,9 @@ def band(score):
 def stress(recs, all_nights):
     """
     Every SPOT_DAY reading. DECIDED: excluded when its own record has
-    WORKOUT, or the records in the 30 min before it hold more than 200
-    steps. The night RHR baseline is the median rhr of the last 28
+    WORKOUT or SPOT_MANUAL (flags2 bit 0, v0.9.0+: a breathing exercise or
+    similar, not a resting state), or the records in the 30 min before it
+    hold more than 200 steps. The night RHR baseline is the median rhr of the last 28
     qualifying nights that ended before the reading (at least 7). The day
     baseline is the last 28 days of non-excluded readings with an RMSSD
     (at least 10); hr_up for each of those is taken against the same night
@@ -428,7 +431,8 @@ def stress(recs, all_nights):
     for r in readings:
         before = sum(x["steps"] for x in recs
                      if r["t"] - STRESS_STEPS_WINDOW_S <= x["t"] < r["t"])
-        r["_excluded"] = bool(r["flags"] & F_WORKOUT) or before > STRESS_STEPS_BEFORE
+        r["_excluded"] = (bool(r["flags"] & F_WORKOUT) or r.get("spot_manual", False)
+                          or before > STRESS_STEPS_BEFORE)
 
     out = []
     for r in readings:
