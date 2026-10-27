@@ -75,4 +75,23 @@ uint8_t hrv_diffs(void);
 /* Drop the window. Nothing calls this in normal operation. */
 void hrv_reset(void);
 
+/*
+ * RMSSD over every successive difference since hrv_session_begin(), not a
+ * rolling window: the textbook ultra-short-term figure for one spot
+ * reading (spot.h). Independent of the rolling window above, which a
+ * reading neither resets nor depends on -- feed both from the same place.
+ * Same floor as hrv_rmssd_x10(): 0 under HRV_MIN_DIFFS differences.
+ */
+struct hrv_session {
+	uint64_t sum;		/* squared successive differences, ms^2 */
+	uint16_t count;
+	uint16_t prev_ibi_ms;
+	bool prev_valid;
+};
+
+void hrv_session_begin(struct hrv_session *s);
+void hrv_session_add(struct hrv_session *s, uint16_t ibi_ms, bool successive);
+uint16_t hrv_session_rmssd_x10(const struct hrv_session *s);
+uint16_t hrv_session_diffs(const struct hrv_session *s);
+
 #endif /* HRV_H_ */

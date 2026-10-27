@@ -182,11 +182,56 @@ static uint8_t slot_pa(const struct ppg_slot *slots, size_t n, uint8_t ledc)
  * rather than two that drift apart -- the green path is proven on hardware
  * and must not acquire a second, subtly different copy.
  */
+/*
+ * Heart-rate path settings, see maxm86161_ppg_tune. Averaging comes from
+ * CONFIG_RING_PPG_AVG_LOG2: 4x in the test builds, where the 2026-10-08
+ * sweep found it cut single-sample glitches from ~22 % to ~3 % at 31 mA,
+ * and 2x in production, which pays for it in LED energy. Ranges are
+ * unchanged from v0.6.1.
+ */
+static struct maxm86161_ppg_tune ppg_tune = {
+	.led_rge = LED_RGE_31MA,
+	.adc_rge = PPG_ADC_RGE_16uA,
+	.avg_log2 = CONFIG_RING_PPG_AVG_LOG2,
+};
+
+int maxm86161_set_ppg_tune(const struct maxm86161_ppg_tune *tune)
+{
+	if (tune->led_rge > PPG_TUNE_LED_RGE_MAX ||
+	    tune->adc_rge > PPG_TUNE_ADC_RGE_MAX ||
+	    tune->avg_log2 > PPG_TUNE_AVG_LOG2_MAX) {
+		return -EINVAL;
+	}
+
+	ppg_tune = *tune;
+	return 0;
+}
+
+void maxm86161_get_ppg_tune(struct maxm86161_ppg_tune *tune)
+{
+	*tune = ppg_tune;
+}
+
 static int start_ppg_slots(struct maxm86161 *dev, const struct ppg_slot *slots,
 			   size_t n_slots)
 {
 	uint8_t status;
 	int err;
+
+	/*
+	 * The tune applies to the one-LED heart-rate path only. SpO2 keeps
+	 * the settings its ratio was written against, and two slots at 2^n
+	 * pulses each would not fit the P2 rate codes anyway.
+	 */
+	const bool tuned = (n_slots == 1);
+	const uint8_t adc_rge = tuned ? ppg_tune.adc_rge : PPG_ADC_RGE_16uA;
+	const uint8_t led_rge = tuned ? ppg_tune.led_rge : LED_RGE_31MA;
+	const uint8_t avg_log2 = tuned ? ppg_tune.avg_log2 : 0;
+	/* 100, 200 or 400 sps at the converter; SMP_AVE brings it back to 100. */
+	const uint8_t sr = (n_slots >= 2) ? PPG_SR_P2_100HZ
+			 : (avg_log2 == 2) ? PPG_SR_400HZ
+			 : (avg_log2 == 1) ? PPG_SR_200HZ
+			 : PPG_SR_100HZ;
 
 	/*
 	 * LDO_EN (U3.3) is strapped to 1V8 on this board, so the part is
@@ -218,11 +263,15 @@ static int start_ppg_slots(struct maxm86161 *dev, const struct ppg_slot *slots,
 		{ REG_INT_ENABLE_1, 0x00 },
 		{ REG_INT_ENABLE_2, 0x00 },
 
-		/* ALC on, 16 uA full scale, 117.3 us integration time. */
-		{ REG_PPG_CONFIG_1, (PPG_ADC_RGE_16uA << 2) | PPG_TINT_117US },
+		/* ALC on, ADC full scale from the tune (16 uA by default),
+		 * 117.3 us integration time.
+		 */
+		{ REG_PPG_CONFIG_1, (uint8_t)((adc_rge << 2) | PPG_TINT_117US) },
 
 		/*
-		 * ~100 sps, no on-chip averaging.
+		 * 100 sps out of the FIFO, averaging 2^avg_log2 conversions
+		 * per sample (none by default). SMP_AVE's code is log2 of the
+		 * count, so avg_log2 goes in as is.
 		 *
 		 * The sample-rate code carries the pulses-per-sample count as
 		 * well as the rate, so a two-slot sequence needs the P2 code.
@@ -231,9 +280,7 @@ static int start_ppg_slots(struct maxm86161 *dev, const struct ppg_slot *slots,
 		 * red channel produces no samples at all and every downstream
 		 * consumer waits forever for data that is not coming.
 		 */
-		{ REG_PPG_CONFIG_2, (uint8_t)(((n_slots >= 2) ? PPG_SR_P2_100HZ
-							      : PPG_SR_100HZ) << 3) |
-				    PPG_SMP_AVE_1 },
+		{ REG_PPG_CONFIG_2, (uint8_t)((sr << 3) | avg_log2) },
 
 		/* 6 us LED settling, burst mode off. */
 		{ REG_PPG_CONFIG_3, (LED_SETLNG_6US << 6) },
@@ -250,9 +297,11 @@ static int start_ppg_slots(struct maxm86161 *dev, const struct ppg_slot *slots,
 		{ REG_LED_SEQ_2, 0x00 },
 		{ REG_LED_SEQ_3, 0x00 },
 
-		/* 31 mA full-scale range, 0.12 mA per LSB. */
-		{ REG_LED_RANGE_1, (LED_RGE_31MA << 4) | (LED_RGE_31MA << 2) |
-				   LED_RGE_31MA },
+		/* Full-scale range from the tune: 31 mA (0.12 mA per LSB) by
+		 * default, 62 mA (0.24 mA per LSB) at most.
+		 */
+		{ REG_LED_RANGE_1, (uint8_t)((led_rge << 4) | (led_rge << 2) |
+					     led_rge) },
 		{ REG_LED1_PA, slot_pa(slots, n_slots, LEDC_LED1) },
 		{ REG_LED2_PA, slot_pa(slots, n_slots, LEDC_LED2) },
 		{ REG_LED3_PA, slot_pa(slots, n_slots, LEDC_LED3) },
@@ -303,9 +352,17 @@ static int start_ppg_slots(struct maxm86161 *dev, const struct ppg_slot *slots,
 		const char *name = (ledc < ARRAY_SIZE(names) && names[ledc])
 				   ? names[ledc] : "unknown";
 
+		/* 0.12 mA per LSB per 31 mA of range. */
+		unsigned int ua = slots[i].pa * 120U * (led_rge + 1U);
+
 		LOG_INF("PPG slot %u: %s, PA 0x%02x (~%u.%02u mA), 100 sps",
 			(unsigned)(i + 1), name, slots[i].pa,
-			(slots[i].pa * 12U) / 100U, (slots[i].pa * 12U) % 100U);
+			ua / 1000U, (ua % 1000U) / 10U);
+	}
+
+	if (tuned) {
+		LOG_INF("PPG tune: LED range %u mA, ADC %u uA, average %u",
+			31U * (led_rge + 1U), 4U << adc_rge, 1U << avg_log2);
 	}
 
 	return 0;
@@ -482,4 +539,38 @@ int maxm86161_fifo_read(struct maxm86161 *dev, uint32_t *out, uint8_t max_sample
 	}
 
 	return count;
+}
+
+int maxm86161_temp_start(struct maxm86161 *dev)
+{
+	return maxm86161_write_reg(dev, REG_DIE_TEMP_CONFIG, DIE_TEMP_EN);
+}
+
+int maxm86161_temp_read(struct maxm86161 *dev, int16_t *c100)
+{
+	uint8_t cfg;
+	uint8_t reg = REG_DIE_TEMP_INT;
+	uint8_t buf[2];
+	int err;
+
+	err = maxm86161_read_reg(dev, REG_DIE_TEMP_CONFIG, &cfg);
+	if (err) {
+		return err;
+	}
+	if (cfg & DIE_TEMP_EN) {
+		return -EBUSY;
+	}
+
+	/* One burst, so the integer and the fraction are the same sample
+	 * (datasheet, TEMP_INT).
+	 */
+	err = i2c_write_read(dev->i2c, dev->addr, &reg, 1, buf, sizeof(buf));
+	if (err) {
+		return err;
+	}
+
+	/* Integer in two's complement, fraction in 1/16 C. */
+	*c100 = (int16_t)((int8_t)buf[0] * 100 + (buf[1] & 0x0FU) * 25 / 4);
+
+	return 0;
 }

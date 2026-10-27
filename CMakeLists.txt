@@ -17,4 +17,7 @@ target_sources(app PRIVATE
 	src/profile.c
 	src/hrv.c
 	src/spo2.c
+	src/history.c
+	src/thermo.c
+	src/spot.c
 )

@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ring Live</title>
+<style>
+:root {
+  --bg: #f4f5f7; --card: #ffffff; --ink: #14171c; --mute: #6b7280;
+  --line: #e3e6ea; --grid: #eef0f3;
+  --hr: #e5384f; --gsr: #d48a00; --x: #1f8fd6; --y: #2f9e5b; --z: #8b5cf6;
+  --ok: #2f9e5b; --warn: #d48a00; --bad: #e5384f;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1014; --card: #171a20; --ink: #e9ecf1; --mute: #8a93a3;
+    --line: #262b33; --grid: #1f242b;
+    --hr: #ff5d73; --gsr: #f4b740; --x: #4cc9f0; --y: #6ee7a0; --z: #b794f6;
+    --ok: #6ee7a0; --warn: #f4b740; --bad: #ff5d73;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
+  padding: 14px 20px; border-bottom: 1px solid var(--line);
+}
+h1 { font-size: 17px; margin: 0 8px 0 0; letter-spacing: .2px; }
+.pill {
+  display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px;
+  border-radius: 999px; background: var(--card); border: 1px solid var(--line);
+  font-size: 13px; white-space: nowrap;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mute); }
+.meta { color: var(--mute); font-size: 13px; white-space: nowrap; }
+.meta b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+main {
+  display: grid; gap: 16px; padding: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+}
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: 16px 16px 12px; min-width: 0;
+}
+.card.wide { grid-column: 1 / -1; }
+.top { display: flex; align-items: flex-end; justify-content: space-between;
+       gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+.label { color: var(--mute); font-size: 12px; text-transform: uppercase;
+         letter-spacing: .6px; }
+.big { font-size: 46px; font-weight: 650; line-height: 1;
+       font-variant-numeric: tabular-nums; }
+.big small { font-size: 16px; font-weight: 500; color: var(--mute); margin-left: 4px; }
+.stats { display: flex; gap: 18px; flex-wrap: wrap; }
+.stat .v { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+canvas { width: 100%; height: 190px; display: block; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--mute); margin-top: 6px; }
+.legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px;
+            vertical-align: middle; margin-right: 5px; }
+.note { font-size: 12px; color: var(--warn); min-height: 16px; margin-top: 4px; }
+footer { display: flex; justify-content: space-between; align-items: center;
+         gap: 12px; flex-wrap: wrap; padding: 0 20px 20px; color: var(--mute);
+         font-size: 12px; }
+button {
+  font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--card); color: var(--ink);
+  cursor: pointer;
+}
+#unpair:hover, #ship:hover { border-color: var(--bad); color: var(--bad); }
+button.ppg { font-weight: 600; }
+button.ppg.on { background: var(--y); border-color: var(--y); color: #0b1a10; }
+button.ppg:hover { border-color: var(--y); }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Ring Live</h1>
+  <span class="pill"><span class="dot" id="linkdot"></span><span id="link">starting</span></span>
+  <button id="ppgbtn" class="ppg" title="Switch the green PPG LED and heart rate on or off">Green PPG: off</button>
+  <span class="meta">state <b id="state">-</b></span>
+  <span class="meta">battery <b id="bat">-</b></span>
+  <span class="meta">fw <b id="fw">-</b></span>
+  <span class="meta">up <b id="up">-</b></span>
+  <span class="meta">sensors <b id="health">-</b></span>
+</header>
+
+<main>
+  <section class="card wide">
+    <div class="top">
+      <div>
+        <div class="label">Heart rate</div>
+        <div class="big" style="color:var(--hr)"><span id="bpm">--</span><small>bpm</small></div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="label">Finger</div><div class="v" id="finger">-</div></div>
+        <div class="stat"><div class="label">Perfusion</div><div class="v" id="pi">-</div></div>
+        <div class="stat"><div class="label">HRV RMSSD</div><div class="v" id="rmssd">-</div></div>
+        <div class="stat"><div class="label">PPG DC</div><div class="v" id="dc">-</div></div>
+      </div>
+    </div>
+    <canvas id="ppg"></canvas>
+    <div class="legend"><span><i style="background:var(--hr)"></i>PPG pulse wave, green LED, 100 Hz (DC removed, inverted), last 8 s</span></div>
+    <div class="note" id="ppgnote"></div>
+  </section>
+
+  <section class="card">
+    <div class="top">
+      <div>
+        <div class="label">GSR</div>
+        <div class="big" style="color:var(--gsr)"><span id="gsr">--</span><small>mV</small></div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="label">Change 10 s</div><div class="v" id="gsrd">-</div></div>
+        <div class="stat"><div class="label">Range 60 s</div><div class="v" id="gsrr">-</div></div>
+      </div>
+    </div>
+    <canvas id="gsrc"></canvas>
+    <div class="legend"><span><i style="background:var(--gsr)"></i>Electrode voltage, 20 Hz, last 60 s (uncalibrated: mV, not µS)</span></div>
+    <div class="note" id="gsrnote"></div>
+  </section>
+
+  <section class="card">
+    <div class="top">
+      <div>
+        <div class="label">Motion</div>
+        <div class="big"><span id="mag">--</span><small>mg</small></div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="label">Steps</div><div class="v" id="steps">-</div></div>
+        <div class="stat"><div class="label">Cadence</div><div class="v" id="cad">-</div></div>
+        <div class="stat"><div class="label">x / y / z</div><div class="v" id="xyz">-</div></div>
+      </div>
+    </div>
+    <canvas id="imuc"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--x)"></i>x</span>
+      <span><i style="background:var(--y)"></i>y</span>
+      <span><i style="background:var(--z)"></i>z</span>
+      <span>accelerometer, mg, ~50 Hz, last 10 s</span>
+    </div>
+    <div class="note" id="imunote"></div>
+  </section>
+</main>
+
+<footer>
+  <span id="rates">rates -</span>
+  <span>
+    <button id="ship" title="Opcode 0x0C: PMIC ship mode. The ring is off until a charger is plugged in.">Power off (ship mode)</button>
+    <button id="unpair" title="Send opcode 0x05: the ring forgets this PC so a phone can pair">Unpair ring</button>
+  </span>
+</footer>
+
+<script>
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+class Ring {
+  constructor(n) { this.a = new Float64Array(n); this.n = n; this.i = 0; this.len = 0; }
+  push(v) { this.a[this.i] = v; this.i = (this.i + 1) % this.n; if (this.len < this.n) this.len++; }
+  at(k) { return this.a[(this.i - this.len + k + this.n) % this.n]; }      // oldest first
+  last() { return this.len ? this.at(this.len - 1) : NaN; }
+}
+
+class Chart {
+  constructor(id, cap, colors, minSpan) {
+    this.c = document.getElementById(id); this.ctx = this.c.getContext('2d');
+    this.cap = cap; this.colors = colors; this.minSpan = minSpan;
+    this.series = colors.map(() => new Ring(cap));
+    this.lo = null; this.hi = null; this.overlay = '';
+    new ResizeObserver(() => this.fit()).observe(this.c); this.fit();
+  }
+  fit() {
+    const r = this.c.getBoundingClientRect(), d = devicePixelRatio || 1;
+    this.c.width = Math.max(1, r.width * d); this.c.height = Math.max(1, r.height * d);
+    this.ctx.setTransform(d, 0, 0, d, 0, 0); this.w = r.width; this.h = r.height;
+  }
+  draw() {
+    const { ctx, w, h } = this; ctx.clearRect(0, 0, w, h);
+    let lo = Infinity, hi = -Infinity;
+    for (const s of this.series) for (let k = 0; k < s.len; k++) {
+      const v = s.at(k); if (v < lo) lo = v; if (v > hi) hi = v;
+    }
+    const grid = css('--grid'), mute = css('--mute');
+    ctx.strokeStyle = grid; ctx.lineWidth = 1;
+    for (let g = 0; g <= 4; g++) {
+      const y = Math.round(8 + (h - 16) * g / 4) + .5;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+    if (!isFinite(lo)) { this.text('waiting for data', mute); return; }
+    if (hi - lo < this.minSpan) { const m = (hi + lo) / 2; lo = m - this.minSpan / 2; hi = m + this.minSpan / 2; }
+    const pad = (hi - lo) * .12; lo -= pad; hi += pad;
+    // Ease the scale so it does not jump on every frame.
+    this.lo = this.lo === null ? lo : this.lo + (lo - this.lo) * .15;
+    this.hi = this.hi === null ? hi : this.hi + (hi - this.hi) * .15;
+    const yOf = v => 8 + (h - 16) * (1 - (v - this.lo) / (this.hi - this.lo));
+    this.series.forEach((s, si) => {
+      if (s.len < 2) return;
+      ctx.strokeStyle = css(this.colors[si]); ctx.lineWidth = 1.6; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      for (let k = 0; k < s.len; k++) {
+        const x = w * (k + this.cap - s.len) / (this.cap - 1), y = yOf(s.at(k));
+        k ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+    });
+    ctx.fillStyle = mute; ctx.font = '11px system-ui, sans-serif';
+    ctx.fillText(fmt(this.hi), 4, 18); ctx.fillText(fmt(this.lo), 4, h - 4);
+    if (this.overlay) this.text(this.overlay, mute);
+  }
+  text(t, color) {
+    const { ctx, w, h } = this; ctx.fillStyle = color; ctx.font = '13px system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.fillText(t, w / 2, h / 2); ctx.textAlign = 'left';
+  }
+}
+const fmt = v => Math.abs(v) >= 1000 ? v.toFixed(0) : v.toFixed(1);
+
+const ppg = new Chart('ppg', 800, ['--hr'], 20);
+const gsr = new Chart('gsrc', 1200, ['--gsr'], 4);
+const imu = new Chart('imuc', 500, ['--x', '--y', '--z'], 150);
+let dc = null, lp = 0, ppgOn = false;
+const $ = id => document.getElementById(id);
+const set = (id, v) => { $(id).textContent = v; };
+
+function onFrame(f) {
+  for (const v of f.ppg) {
+    if (dc === null || Math.abs(v - dc) > 20000) dc = v;   // re-seed on a step
+    dc += (v - dc) / 60;
+    lp += (-(v - dc) - lp) * .35;
+    ppg.series[0].push(lp);
+  }
+  for (const v of f.gsr) gsr.series[0].push(v);
+  for (const [x, y, z] of f.imu) { imu.series[0].push(x); imu.series[1].push(y); imu.series[2].push(z); }
+
+  const s = f.s;
+  if (s.label && $('title').textContent !== s.label) {
+    set('title', s.label); document.title = s.label + ' Live';
+  }
+  ppgOn = !!s.ppg_wanted;
+  $('ppgbtn').textContent = 'Green PPG: ' + (ppgOn ? 'on' : 'off');
+  $('ppgbtn').classList.toggle('on', ppgOn);
+  set('link', s.link); $('linkdot').style.background =
+    css(s.link === 'connected' ? '--ok' : s.link === 'disconnected' ? '--bad' : '--warn');
+  set('state', s.state ? s.state + (s.charger ? ' (charger)' : '') : '-');
+  set('bat', s.battery_mv ? (s.battery_mv / 1000).toFixed(2) + ' V'
+           : s.battery_pct != null ? s.battery_pct + ' %' : '-');
+  for (const id of ['ppgbtn', 'ship', 'unpair'])
+    $(id).style.display = s.hr_only ? 'none' : '';
+  set('fw', s.fw || '-');
+  set('up', s.uptime != null ? hms(s.uptime) : '-');
+  if (s.ppg_ok != null) set('health',
+    ['PPG ' + (s.ppg_ok ? 'ok' : 'FAIL'), 'IMU ' + (s.imu_ok ? 'ok' : 'FAIL'),
+     'PMIC ' + (s.pmic_ok ? 'ok' : 'FAIL')].join(' · '));
+
+  set('bpm', s.bpm != null ? s.bpm : '--');
+  set('finger', s.finger == null ? '-' : s.finger ? 'on' : 'off');
+  set('pi', s.pi != null ? s.pi.toFixed(1) + ' %' : '-');
+  set('rmssd', s.rmssd ? s.rmssd.toFixed(1) + ' ms' : '-');
+  set('dc', s.ppg_dc != null ? s.ppg_dc.toLocaleString() : '-');
+  ppg.overlay = s.hr_only ? 'heart-rate-only mode: the waveform needs pairing'
+              : s.charger ? 'on charger: optics off, red LED shows charging'
+              : s.state === 'idle' ? 'green PPG off - press "Green PPG" to start'
+              : s.finger === false ? 'no finger on the sensor' : '';
+  $('ppgnote').textContent = '';
+
+  const g = gsr.series[0];
+  if (g.len) {
+    set('gsr', g.last().toFixed(0));
+    if (g.len > 200) set('gsrd', signed(g.last() - g.at(g.len - 201)) + ' mV');
+    let lo = Infinity, hi = -Infinity;
+    for (let k = 0; k < g.len; k++) { const v = g.at(k); lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    set('gsrr', (hi - lo).toFixed(1) + ' mV');
+  }
+  $('gsrnote').textContent = s.hr_only ? 'Heart-rate-only mode: GSR needs the ring to be paired with this computer.'
+    : s.link === 'connected' && !g.len ? 'Waiting for the GSR stream (about 1 s to settle after it starts).' : '';
+
+  const ix = imu.series;
+  if (ix[0].len) {
+    const x = ix[0].last(), y = ix[1].last(), z = ix[2].last();
+    set('mag', Math.round(Math.hypot(x, y, z)));
+    set('xyz', `${x} / ${y} / ${z}`);
+  }
+  set('steps', s.steps != null ? s.steps.toLocaleString() : '-');
+  set('cad', s.cadence ? s.cadence + ' spm' : '-');
+  $('imunote').textContent = s.hr_only ? 'Heart-rate-only mode: motion needs the ring to be paired with this computer.'
+    : s.imu_ok === false
+    ? 'IMU not detected by the firmware. Power-cycle the ring after fitting it; if it stays FAIL, check U4.' : '';
+
+  const r = f.rates, l = f.lost;
+  set('rates', `PPG ${r.ppg} sps · IMU ${r.imu} Hz · GSR ${r.gsr} Hz · lost packets PPG ${l.ppg} / GSR ${l.gsr}`);
+}
+const hms = t => `${Math.floor(t / 3600)}:${String(Math.floor(t / 60) % 60).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+const signed = v => (v >= 0 ? '+' : '') + v.toFixed(1);
+
+function loop() { ppg.draw(); gsr.draw(); imu.draw(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+
+function connect() {
+  const es = new EventSource('/events');
+  es.onmessage = e => onFrame(JSON.parse(e.data));
+  es.onerror = () => { set('link', 'dashboard server not running'); $('linkdot').style.background = css('--bad'); };
+}
+connect();
+
+$('ppgbtn').onclick = async () => {
+  await fetch('/ppg?on=' + (ppgOn ? 0 : 1), { method: 'POST' }).catch(() => {});
+};
+
+$('ship').onclick = async () => {
+  if (!confirm('Power the ring off (ship mode)?\n\nOn battery it turns off now. If the charger is plugged in, it turns off when you unplug it.\n\nTo wake it: plug the charger in. There is no button.')) return;
+  const r = await fetch('/ship', { method: 'POST' }).then(r => r.json()).catch(() => ({}));
+  alert(r.ok ? 'Ship mode sent. Plug the charger in to wake the ring - this page reconnects by itself.' : 'Not connected - nothing sent.');
+};
+
+$('unpair').onclick = async () => {
+  if (!confirm('Unpair? The ring forgets this PC (opcode 0x05) so a phone can pair, and the dashboard stops connecting. Restarting the dashboard pairs it again.')) return;
+  const r = await fetch('/unpair', { method: 'POST' }).then(r => r.json()).catch(() => ({}));
+  alert(r.ok ? 'Bond cleared on the ring and on this PC. The dashboard will stay disconnected.' : 'Not connected - nothing to unpair.');
+};
+</script>
+</body>
+</html>

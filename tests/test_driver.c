@@ -138,11 +138,14 @@ static void test_green_path_is_byte_identical(void)
 
 	/*
 	 * The one the refactor could most easily have broken: the sample
-	 * rate code now depends on how many slots are populated, and the
-	 * single-slot case must still be the one-pulse 100 sps code.
+	 * rate code now depends on how many slots are populated AND on the
+	 * averaging. The single-slot default (v0.6.2) averages 4 pulses, so
+	 * the converter must run at 400 sps (code 0x05) with SMP_AVE 4
+	 * (code 2) -- which is 100 sps out of the FIFO, what hr.c is built
+	 * for. 100 sps with averaging on would hand hr.c 25 sps.
 	 */
-	check_reg(REG_PPG_CONFIG_2, (0x03 << 3) | PPG_SMP_AVE_1,
-		  "PPG_CONFIG_2 (one pulse per sample)");
+	check_reg(REG_PPG_CONFIG_2, (PPG_SR_400HZ << 3) | 2,
+		  "PPG_CONFIG_2 (400 sps, average 4 -> 100 sps out)");
 
 	check_reg(REG_PPG_CONFIG_3, LED_SETLNG_6US << 6, "PPG_CONFIG_3");
 	check_reg(REG_PHOTO_DIODE_BIAS, PDBIAS1_0_65PF, "PHOTO_DIODE_BIAS");

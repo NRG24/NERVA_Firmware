@@ -165,6 +165,182 @@ config RING_SLEEP_WEAR_CHECK_WINDOW_MS
 	  has been tried on hardware, because there is no hardware -- do not
 	  lower the floor on the strength of the filter time constant alone.
 
+config RING_HR_CONTINUOUS
+	bool "Keep the PPG running continuously (heart-rate test builds only)"
+	default n
+	help
+	  Opens a measurement window at boot and never closes it, so heart
+	  rate is computed and notified over the standard Heart Rate Service
+	  once a second for as long as the board is up. Nothing has to pair
+	  or send an opcode: any HRS client that connects sees live BPM.
+
+	  Exists to test the optical path and the beat detector against a
+	  reference on a bench. It ignores the duty cycle, the no-finger
+	  timeout and the stillness timeout, so green LED1 and the 5 V boost
+	  run the whole time -- never ship it. Built with hr-test.conf into
+	  build-hrtest, so it cannot be left where a production image is
+	  expected.
+
+config RING_PPG_ON_DEMAND
+	bool "Measure only when the app asks -- no automatic windows"
+	default n
+	help
+	  Drops the duty cycle: no scheduled window every minute, no window
+	  on a motion wake. Green LED1 and the 5 V boost come on only when
+	  the app asks -- PPG streaming (opcode 0x01), which holds a window
+	  open for as long as it runs, or measure-now (opcode 0x03), which
+	  opens one 25 s window. A connected app can do everything it could
+	  before; the ring just never decides to measure on its own.
+
+	  For demos and bench sessions where the ring is carried around all
+	  day and should only light up when someone is watching. It also
+	  means no heart rate unless an app is connected and asking, so it
+	  is not a shipping configuration. Built by .\build.ps1 -Demo with
+	  demo.conf, which also turns the sleep wear check off.
+
+config RING_CHARGE_LED
+	bool "Hold the red LED on for as long as the charger is attached"
+	default n
+	help
+	  Without this, attaching a charger flashes LED3 red for 3 s and then
+	  leaves the optics dark. With it, red stays on until the charger is
+	  removed, and the ring then goes back to whatever it was doing --
+	  in an HR test build, green heart-rate measurement.
+
+	  It is not free: the indicator holds the 5 V boost up and averages
+	  roughly 2 mA of LED current (~3 mA at the cell) against a 20 mA
+	  charge current, so a charge takes on the order of 15 % longer.
+	  Off by default for that reason; hr-test.conf turns it on.
+
+config RING_MEASURE_PERIOD_S
+	int "Seconds between automatic measurement windows"
+	default 60
+	range 15 3600
+	help
+	  Each window lights green LED1 for 25 s, and the LED plus the 5 V
+	  boost are the dominant draw on this board. 60 s is 25 % duty;
+	  daily.conf uses 600 s (2.5 %) so a ring worn all day lasts the
+	  day. The app can still change it at runtime with opcode 0x04.
+
+config RING_HISTORY_EPOCH_S
+	int "Seconds summarised by each on-ring history record"
+	default 300
+	range 60 3600
+	help
+	  The ring writes one 32-byte summary to flash every epoch -- heart
+	  rate (mean, min, max), RMSSD, spot readings, steps, temperature,
+	  motion, hot flashes, battery and worn/charging/asleep/workout flags
+	  -- whether or not a phone is connected, and the app downloads them
+	  later (control opcode 0x0E). See src/history.h and
+	  APP_INTEGRATION.md section 16.
+
+	  The partition holds 5,504 records, so capacity is this times
+	  5,504: 19 days at the default 300 s, 3.8 days at 60 s. Shorter
+	  epochs also wear the flash faster, though even 60 s cycles each
+	  page only about twice a week.
+
+config RING_PPG_LED_PA
+	int "Green LED drive code for heart-rate windows (0.12 mA per LSB)"
+	default 255
+	range 1 255
+	help
+	  0xFF (255) is ~30.6 mA, 0x80 (128) ~15.4 mA, in the 31 mA range.
+	  Together with RING_PPG_AVG_LOG2 this sets the LED energy per
+	  sample, which dominates the ring's power budget while it measures
+	  (POWER.md): the MAXM86161 draws ~600 uA from VLED at 100 sps with
+	  0xFF and one pulse a sample, and scales with both settings.
+
+	  255 is what every test build ran since v0.6.2. prod.conf sets 128.
+	  Opcode 0x10 overrides it at run time in test builds.
+
+config RING_PPG_AVG_LOG2
+	int "On-chip averaging for heart-rate windows: 2^n pulses a sample"
+	default 2
+	range 0 2
+	help
+	  0, 1, 2 = average 1, 2, 4 pulses; output stays 100 sps. Each step
+	  doubles the LED energy. 2 (4x) is what every test build ran since
+	  v0.6.2; prod.conf sets 1 (2x).
+
+	  Why production is not at 4x: on 2026-10-08's 30 s recordings, the
+	  cheapest setting (15 mA, no averaging) scored as well as 31 mA with
+	  4x once the detector despikes -- at an eighth of the LED energy --
+	  but 30 s per setting cannot separate them. Settle it with
+	  tools/ppg_sweep.py --ab against a WHOOP.
+
+config RING_IMU_LOW_POWER
+	bool "Run the accelerometer in low-power mode at 60 Hz"
+	default n
+	help
+	  The accelerometer runs all day -- wake-on-motion and the step
+	  counter need it -- and every build so far ran it in high-performance
+	  mode at 120 Hz: ~190 uA by the LSM6DSV datasheet, several mAh a day
+	  on its own. Low-power mode with 4-sample averaging at 60 Hz is ~20
+	  uA, with somewhat more noise -- a few mg, against the ~80-100 mg
+	  swings that wake the ring and count a step.
+
+	  NOT YET VERIFIED ON HARDWARE. The register value comes from ST's
+	  LSM6DSV16BX driver, but nobody has checked that wake-on-motion still
+	  fires and steps still count in this mode on the ring. Off in the test
+	  builds; prod.conf turns it on, and the first prod flash must confirm
+	  both (ROADMAP.md).
+
+config RING_DIAG_OPCODES
+	bool "Accept diagnostic control opcodes 0x10 (PPG tune) and 0x11 (TX power)"
+	default y
+	help
+	  Lets tools/ppg_sweep.py change the PPG front end and the radio's
+	  transmit power over BLE without a reflash. On for every test build,
+	  as it was in v0.6.2.
+
+	  Off in production (prod.conf): they are tuning instruments, not
+	  settings, and 0x11 is suspected of one reboot (2026-10-08) that was
+	  never cleared. With this off both opcodes are refused with ATT 0x13
+	  like any unknown opcode.
+
+config RING_GSR_STATUS
+	bool "Sample GSR every 30 s for the status packet"
+	default y
+	help
+	  Powers the GSR front end and waits its 800 ms settle every 30 s to
+	  fill gsr_mv in the Status characteristic. On for every test build,
+	  as it was in v0.6.2.
+
+	  Off in production (prod.conf), for two reasons learned in testing:
+	  the front end cannot resolve skin conductance on this board (gain
+	  about 10x too low, noise larger than the signal), and the 800 ms
+	  settle blocks the main loop, so the step counter misses a stride
+	  every 30 s of walking. gsr_mv then reads -1 ("not measured"). The
+	  raw GSR stream (opcode 0x08) still works for diagnostics.
+
+config RING_ADV_SLOW_AFTER_S
+	int "Seconds of fast advertising before slowing to ~1 s (0 = never)"
+	default 0
+	range 0 3600
+	help
+	  The ring advertises every 30-60 ms so a phone finds it at once. Kept
+	  up all day while nothing is connected, that is roughly 20 radio
+	  events a second, likely several mAh a day at +8 dBm -- a large share
+	  of a battery this small. With this set, advertising
+	  drops to 1-1.2 s once it has run fast for this long after boot or
+	  a disconnect. A phone still finds the ring within about a second;
+	  it just stops paying for instant discovery nobody is waiting on.
+
+	  0 (the default) keeps the fast advertising every test build had.
+	  prod.conf sets 30.
+
+config RING_CONN_PARAM_MGMT
+	bool "Ask the central for an idle or fast connection interval"
+	default n
+	help
+	  Without this the ring keeps whatever interval the phone or PC
+	  chose, typically 15-30 ms, for the whole connection. With it the
+	  ring asks for ~100 ms with latency 4 while idle, waking about every
+	  half second, and 15-30 ms while a raw stream or a history sync
+	  needs the throughput. See ble_service() in ble.c.
+
+	  Off by default, as every test build was. prod.conf turns it on.
+
 config RING_HRS_OPEN
 	bool "Leave the standard Heart Rate Service readable without pairing"
 	default y
@@ -188,6 +364,69 @@ config RING_HRS_OPEN
 	  hr_x10, so a first-party app loses nothing either way.
 
 	  This does not touch the Battery Service, which stays open.
+
+config RING_SPOT_NIGHT_MIN
+	int "Minutes between night spot readings (0 = off)"
+	default 0
+	range 0 720
+	help
+	  A spot reading is a long green PPG window -- RING_SPOT_WINDOW_S --
+	  taken for a clean resting heart rate and RMSSD rather than a quick
+	  heart rate. Night readings start 15 min after sleep onset and
+	  repeat at this interval while asleep. They are what the app's
+	  burnout trend is built on. See src/spot.h.
+
+	  Off by default, as every test build was. prod.conf sets 60. The
+	  app can change it at run time (opcode 0x12, RAM only). 1-9 are
+	  refused there, and raised to 10 here (spot_init()): back-to-back
+	  readings would keep the LED on all night.
+
+config RING_SPOT_DAY_MIN
+	int "Minutes between daytime spot readings (0 = off)"
+	default 0
+	range 0 720
+	help
+	  Daytime spot readings: awake, worn, and the accelerometer still
+	  for 3 minutes, at most once per this interval. The app's stress
+	  readings come from these, against the night baseline.
+
+	  Off by default. prod.conf sets 60.
+
+config RING_SPOT_WINDOW_S
+	int "Length of a spot reading, seconds"
+	default 180
+	range 60 600
+	help
+	  Long enough for the beat detector to prime (~10 s) and then
+	  collect well over a hundred consecutive beats at a resting heart
+	  rate; the reading's RMSSD is over all of them (hrv_session). Each reading at the default costs about seven
+	  25 s heart-rate windows' worth of LED.
+
+config RING_HOT_FLASH_MODE
+	int "Hot-flash detection: 0 off, 1 while asleep, 2 always"
+	default 0
+	range 0 2
+	help
+	  Watches the ring temperature for the quick rise of a hot flash --
+	  see src/thermo.h for the algorithm and its caveats. The
+	  temperature itself is logged in every build regardless; this only
+	  decides whether events are detected, counted, flagged in the
+	  history and followed by a spot reading.
+
+	  Off by default. prod.conf sets 1: night sweats are the case the
+	  temperature can see cleanly, a still hand under a duvet. The app
+	  can change it (opcode 0x13).
+
+config RING_HOT_FLASH_RISE_C10
+	int "Hot-flash onset threshold, tenths of a degree C"
+	default 10
+	range 3 50
+	help
+	  How far above its settled baseline the ring temperature has to
+	  climb, three quarters of it within 10 minutes. 1.0 C is a
+	  starting point, not a fit: the nRF die reads the finger through
+	  the ring, attenuated, and nobody has worn this board through a
+	  hot flash yet.
 
 # Selecting a choice entry provokes a Kconfig warning, so steer the choice
 # instead. This file is KCONFIG_ROOT and sources Kconfig.zephyr at the end,

@@ -120,13 +120,13 @@
  *
  * 16 kB of storage is four erase pages; settings_nvs caps its sector count
  * at what the partition actually holds, so this gives NVS four sectors --
- * ample for a single bond's keys and CCC state, and it leaves 496 kB for
- * the image.
+ * ample for a single bond's keys and CCC state. The image and the history
+ * log split the 496 kB below it; see the two partitions themselves.
  *
  * zephyr,code-partition above is what makes this binding rather than
  * decorative: with CONFIG_USE_DT_CODE_PARTITION the linker is told the
- * image ends at 0x7c000, so an image that grew into the bonds would fail
- * to link instead of quietly eating them at run time.
+ * image ends at 0x50000, so an image that grew into the history log or
+ * the bonds would fail to link instead of quietly eating them at run time.
  *
  * NOT YET RUN ON HARDWARE. There is no bootloader and nothing else claims
  * flash on this board, so nothing should collide, but a board that has been
@@ -144,9 +144,26 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 
+		/*
+		 * 320 kB for the image, which is ~210 kB as of v0.6. Was
+		 * 496 kB until the history log below took the top of it.
+		 */
 		slot0_partition: partition@0 {
 			label = "image-0";
-			reg = <0x00000000 0x0007c000>;
+			reg = <0x00000000 0x00050000>;
+		};
+
+		/*
+		 * On-ring history (src/history.c): one 4 kB header page and
+		 * 43 pages of 16-byte records, ~38 days at a 5-minute epoch.
+		 * Its own partition, never shared with the settings below, so
+		 * nothing the log does can touch a bond. It used to be code
+		 * space and may hold stale image bytes; history_init() checks
+		 * for its header and formats the region if it is missing.
+		 */
+		history_partition: partition@50000 {
+			label = "history";
+			reg = <0x00050000 0x0002c000>;
 		};
 
 		storage_partition: partition@7c000 {

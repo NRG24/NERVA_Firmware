@@ -35,6 +35,7 @@ struct bt_uuid_128 { struct bt_uuid uuid; uint8_t val[16]; };
 
 extern const struct bt_uuid *BT_UUID_GATT_CHRC;
 extern const struct bt_uuid *BT_UUID_GATT_CCC;
+extern const struct bt_uuid *BT_UUID_HRS_MEASUREMENT;
 
 int bt_uuid_cmp(const struct bt_uuid *u1, const struct bt_uuid *u2);
 

@@ -27,7 +27,11 @@
  */
 int ring_wdt_start(void);
 
-/* Feeds the watchdog. Safe to call before ring_wdt_start(); does nothing. */
+/*
+ * Feeds the watchdog. Safe to call before ring_wdt_start(): there it
+ * reloads a watchdog left running by the previous image across a soft
+ * reset, and otherwise does nothing.
+ */
 void ring_wdt_feed(void);
 
 #else

@@ -23,7 +23,22 @@ struct bt_conn_cb {
 	void (*security_changed)(struct bt_conn *conn, bt_security_t level,
 				 enum bt_security_err err);
 	void (*recycled)(void);
+	void (*le_param_updated)(struct bt_conn *conn, uint16_t interval,
+				 uint16_t latency, uint16_t timeout);
 };
+
+struct bt_le_conn_param {
+	uint16_t interval_min;
+	uint16_t interval_max;
+	uint16_t latency;
+	uint16_t timeout;
+};
+#define BT_LE_CONN_PARAM(int_min, int_max, lat, to)			\
+	((struct bt_le_conn_param[]) { {				\
+		.interval_min = (int_min), .interval_max = (int_max),	\
+		.latency = (lat), .timeout = (to) } })
+int bt_conn_le_param_update(struct bt_conn *conn,
+			    const struct bt_le_conn_param *param);
 
 struct bt_conn_auth_cb {
 	void (*passkey_display)(struct bt_conn *conn, unsigned int passkey);
@@ -45,6 +60,10 @@ int bt_conn_auth_cb_register(const struct bt_conn_auth_cb *cb);
 int bt_conn_auth_info_cb_register(struct bt_conn_auth_info_cb *cb);
 int bt_conn_auth_pairing_confirm(struct bt_conn *conn);
 
-#define BT_CONN_CB_DEFINE(_name)	static struct bt_conn_cb _name
+/* The real macro places it in an iterable section, so it is never
+ * "unused"; say so, or Clang's -Wunused-variable fires where GCC's did not.
+ */
+#define BT_CONN_CB_DEFINE(_name)	\
+	static struct bt_conn_cb _name __attribute__((used))
 
 #endif

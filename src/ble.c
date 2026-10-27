@@ -1,9 +1,16 @@
 #include "ble.h"
+#include "history.h"
+#include "maxm86161.h"	/* PPG_TUNE_* limits for opcode 0x10 */
+#include "spot.h"	/* spot_config_valid() for opcode 0x12 */
+#include "thermo.h"	/* THERMO_* limits for opcode 0x13 */
+
+#include <string.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/hci_vs.h>
 #include <zephyr/bluetooth/services/bas.h>
 #include <zephyr/bluetooth/services/hrs.h>
 #include <zephyr/bluetooth/uuid.h>
@@ -28,6 +35,8 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
  *   gsr stream   f0a10007-...   notify
  *   spo2         f0a10008-...   read / notify
  *   workout      f0a10009-...   read / notify
+ *   history      f0a1000a-...   notify (sync replies, see opcode 0x0E)
+ *   wellness     f0a1000b-...   read / notify
  */
 #define RING_UUID_BASE(x)	BT_UUID_128_ENCODE(0xf0a10000 | (x), 0x1e5c, \
 						   0x4a2b, 0x8d3f, \
@@ -53,6 +62,10 @@ static const struct bt_uuid_128 uuid_spo2 =
 	BT_UUID_INIT_128(RING_UUID_BASE(8));
 static const struct bt_uuid_128 uuid_workout =
 	BT_UUID_INIT_128(RING_UUID_BASE(9));
+static const struct bt_uuid_128 uuid_history =
+	BT_UUID_INIT_128(RING_UUID_BASE(0xa));
+static const struct bt_uuid_128 uuid_wellness =
+	BT_UUID_INIT_128(RING_UUID_BASE(0xb));
 
 static atomic_t connected_count;
 static atomic_t status_subscribed;
@@ -63,6 +76,8 @@ static atomic_t hrv_subscribed;
 static atomic_t gsr_subscribed;
 static atomic_t spo2_subscribed;
 static atomic_t workout_subscribed;
+static atomic_t history_subscribed;
+static atomic_t wellness_subscribed;
 static atomic_t ppg_stream_on;
 static atomic_t imu_stream_on;
 static atomic_t gsr_stream_on;
@@ -109,6 +124,13 @@ static struct ring_spo2 latest_spo2;
 static struct k_spinlock workout_lock;
 static struct ring_workout latest_workout;
 
+static struct k_spinlock wellness_lock;
+static struct ring_wellness latest_wellness = {
+	.temp_c100 = INT16_MIN,
+	.baseline_c100 = INT16_MIN,
+	.skin_c100 = INT16_MIN,
+};
+
 static const struct ble_control_cbs *control_cbs;
 static uint32_t ppg_seq;
 static uint32_t gsr_seq;
@@ -137,10 +159,28 @@ static const struct bt_data sd[] = {
  * explicit restart the ring advertises exactly once per boot and is
  * invisible for ever after the first phone walks away.
  */
+/*
+ * Advertising power: fast for CONFIG_RING_ADV_SLOW_AFTER_S after a start,
+ * then slow. See ble_service(), which does the switch on the main loop.
+ */
+#define ADV_IDLE	0
+#define ADV_FAST	1
+#define ADV_SLOW	2
+
+static atomic_t adv_mode;
+static atomic_t adv_fast_since_s;	/* uptime, seconds */
+
 static int adv_start(void)
 {
-	return bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd,
-			       ARRAY_SIZE(sd));
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), sd,
+				  ARRAY_SIZE(sd));
+
+	if (!err) {
+		atomic_set(&adv_fast_since_s, (atomic_val_t)(k_uptime_get() / 1000));
+		atomic_set(&adv_mode, ADV_FAST);
+	}
+
+	return err;
 }
 
 /* --- GATT -------------------------------------------------------------- */
@@ -260,6 +300,35 @@ static void workout_ccc_changed(const struct bt_gatt_attr *attr,
 	atomic_set(&workout_subscribed, value == BT_GATT_CCC_NOTIFY);
 }
 
+static void history_ccc_changed(const struct bt_gatt_attr *attr,
+				uint16_t value)
+{
+	atomic_set(&history_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
+static ssize_t read_wellness(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr, void *buf,
+			     uint16_t len, uint16_t offset)
+{
+	struct ring_wellness snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&wellness_lock);
+	snapshot = latest_wellness;
+	k_spin_unlock(&wellness_lock, key);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot,
+				 sizeof(snapshot));
+}
+
+static void wellness_ccc_changed(const struct bt_gatt_attr *attr,
+				 uint16_t value)
+{
+	atomic_set(&wellness_subscribed, value == BT_GATT_CCC_NOTIFY);
+}
+
+static void history_sync_request(uint32_t from_seq);
+
 /*
  * Control opcodes, see APP_INTEGRATION.md:
  *   0x01 <u8 on>                     raw PPG streaming
@@ -273,6 +342,16 @@ static void workout_ccc_changed(const struct bt_gatt_attr *attr,
  *   0x09 <u8 on>                     SpO2 mode (red+IR instead of green)
  *   0x0A <u8 age> <u8 sex>           age and sex for workout calories
  *   0x0B <u8 type>                   start a workout (0 = stop)
+ *   0x0C                             power off (PMIC ship mode)
+ *   0x0D <u32 unix_s>                set the wall clock
+ *   0x0E <u32 from_seq>              sync history from this seq
+ *   0x10 <u8 pa> <u8 led_rge> <u8 adc_rge> <u8 avg_log2>
+ *                                    tune the heart-rate PPG front end
+ *   0x11 <i8 dbm>                    radio TX power on this connection
+ *   0x12 <u16 night_min> <u16 day_min> <u16 window_s>
+ *                                    spot reading schedule
+ *   0x13 <u8 mode> <u8 rise_c10>     hot-flash detection
+ *   0x14                             spot reading now
  */
 static ssize_t write_control(struct bt_conn *conn,
 			     const struct bt_gatt_attr *attr, const void *buf,
@@ -436,6 +515,163 @@ static ssize_t write_control(struct bt_conn *conn,
 			p[1] ? "start" : "stop", p[1]);
 		break;
 
+	case 0x0C:
+		/*
+		 * Ship mode: the PMIC disconnects the battery and the ring is
+		 * off until a charger is plugged in. Deferred to the main loop
+		 * like every other opcode, because the I2C write must not run
+		 * on the BT RX thread.
+		 */
+		if (control_cbs && control_cbs->ship_mode) {
+			control_cbs->ship_mode();
+		}
+		LOG_WRN("control: ship mode requested");
+		break;
+
+	case 0x0D: {
+		if (len < 5) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+
+		uint32_t unix_s = sys_get_le32(&p[1]);
+
+		/* A spinlock and two words; fine on the RX thread. */
+		history_set_time(unix_s);
+		LOG_INF("control: clock set, unix %u", unix_s);
+		break;
+	}
+
+	case 0x0E: {
+		if (len < 5) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+
+		/*
+		 * The reply arrives as notifications on the history
+		 * characteristic, so a request with nobody subscribed would
+		 * be answered into the void. Say so instead.
+		 */
+		if (!atomic_get(&history_subscribed)) {
+			return BT_GATT_ERR(BT_ATT_ERR_CCC_IMPROPER_CONF);
+		}
+
+		/*
+		 * A 32-byte record plus its 2-byte packet header does not fit
+		 * a notification at the default 23-byte MTU. Started anyway,
+		 * the sync would end before its first record and send
+		 * nothing at all; refuse it so the app knows to ask for a
+		 * bigger MTU first.
+		 */
+		if (bt_gatt_get_mtu(conn) <
+		    3U + 2U + sizeof(struct hist_record)) {
+			return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
+		}
+
+		uint32_t from_seq = sys_get_le32(&p[1]);
+
+		history_sync_request(from_seq);
+		LOG_INF("control: history sync from seq %u", from_seq);
+		break;
+	}
+
+	case 0x10:
+		/* Test builds only: see CONFIG_RING_DIAG_OPCODES. */
+		if (!IS_ENABLED(CONFIG_RING_DIAG_OPCODES)) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+		/*
+		 * Tuning, not a user setting: RAM only, so a reboot always
+		 * comes back to the defaults. The range check is here, at
+		 * the edge, so a refused value comes back to the app as an
+		 * ATT error instead of vanishing into a log line. The LED
+		 * range stops at 62 mA: peak current comes off a small cell
+		 * through the boost, and nothing above that has been tried.
+		 */
+		if (len < 5) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		if (p[1] == 0 || p[2] > PPG_TUNE_LED_RGE_MAX ||
+		    p[3] > PPG_TUNE_ADC_RGE_MAX ||
+		    p[4] > PPG_TUNE_AVG_LOG2_MAX) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+		if (control_cbs && control_cbs->ppg_tune) {
+			control_cbs->ppg_tune(p[1], p[2], p[3], p[4]);
+		}
+		LOG_INF("control: PPG tune PA 0x%02x, LED range %u, ADC range "
+			"%u, avg log2 %u", p[1], p[2], p[3], p[4]);
+		break;
+
+	case 0x11:
+		if (!IS_ENABLED(CONFIG_RING_DIAG_OPCODES)) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+		if (len < 2) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		/* The nRF52833 transmits from -40 to +8 dBm. */
+		if ((int8_t)p[1] < -40 || (int8_t)p[1] > 8) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+		if (control_cbs && control_cbs->tx_power) {
+			control_cbs->tx_power((int8_t)p[1]);
+		}
+		LOG_INF("control: TX power %d dBm requested", (int8_t)p[1]);
+		break;
+
+	case 0x12: {
+		/*
+		 * Spot reading schedule. A setting, not a diagnostic, so in
+		 * every build -- but RAM only like the clock: an app that
+		 * wants something other than the build's defaults sends it
+		 * on each connection. Zero turns a kind off.
+		 */
+		if (len < 7) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+
+		struct spot_config cfg = {
+			.night_min = sys_get_le16(&p[1]),
+			.day_min = sys_get_le16(&p[3]),
+			.window_s = sys_get_le16(&p[5]),
+		};
+
+		/* Pure arithmetic; safe on the RX thread. */
+		if (!spot_config_valid(&cfg)) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+		if (control_cbs && control_cbs->spot_config) {
+			control_cbs->spot_config(cfg.night_min, cfg.day_min,
+						 cfg.window_s);
+		}
+		LOG_INF("control: spot readings every %u min asleep, %u min "
+			"awake, %u s each", cfg.night_min, cfg.day_min,
+			cfg.window_s);
+		break;
+	}
+
+	case 0x13:
+		if (len < 3) {
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
+		if (p[1] > THERMO_MODE_ALWAYS || p[2] < THERMO_RISE_MIN_C10 ||
+		    p[2] > THERMO_RISE_MAX_C10) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+		if (control_cbs && control_cbs->hot_flash_config) {
+			control_cbs->hot_flash_config(p[1], p[2]);
+		}
+		LOG_INF("control: hot-flash detection mode %u, rise %u.%u C",
+			p[1], p[2] / 10U, p[2] % 10U);
+		break;
+
+	case 0x14:
+		if (control_cbs && control_cbs->spot_now) {
+			control_cbs->spot_now();
+		}
+		LOG_INF("control: spot reading now");
+		break;
+
 	default:
 		LOG_WRN("control: unknown opcode 0x%02x", p[0]);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
@@ -507,6 +743,18 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 			       NULL),
 	BT_GATT_CCC(workout_ccc_changed,
 		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+
+	BT_GATT_CHARACTERISTIC(&uuid_history.uuid, BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE, NULL, NULL, NULL),
+	BT_GATT_CCC(history_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
+
+	BT_GATT_CHARACTERISTIC(&uuid_wellness.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ_ENCRYPT, read_wellness, NULL,
+			       NULL),
+	BT_GATT_CCC(wellness_ccc_changed,
+		    BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
 );
 
 /*
@@ -525,6 +773,8 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
  *  18  gsr      decl  19 value  20 CCC
  *  21  spo2     decl  22 value  23 CCC
  *  24  workout  decl  25 value  26 CCC
+ *  27  history  decl  28 value  29 CCC
+ *  30  wellness decl  31 value  32 CCC
  *
  * Pointing at the declaration rather than the value is deliberate and is
  * what bt_gatt_notify() documents: "The attribute object on the parameters
@@ -542,6 +792,8 @@ BT_GATT_SERVICE_DEFINE(ring_svc,
 #define ATTR_GSR	(&ring_svc.attrs[18])
 #define ATTR_SPO2	(&ring_svc.attrs[21])
 #define ATTR_WORKOUT	(&ring_svc.attrs[24])
+#define ATTR_HISTORY	(&ring_svc.attrs[27])
+#define ATTR_WELLNESS	(&ring_svc.attrs[30])
 
 /* --- connection tracking ----------------------------------------------- */
 
@@ -580,6 +832,297 @@ static struct bt_conn *conn_get(void)
 	return conn;
 }
 
+/* --- notifications that never block ------------------------------------ */
+
+/*
+ * bt_gatt_notify() called from any thread but the system work queue waits
+ * K_FOREVER for an ATT buffer -- see bt_att_chan_create_pdu() in att.c.
+ * Every publisher in this file runs on the main loop, which is also the
+ * only thing that feeds the watchdog. So a link that stopped draining -- a
+ * weak antenna, a phone walking out of range -- parked the main loop inside
+ * a notification until the watchdog reset the ring. Seen on hardware
+ * 2026-10-02: with a PC streaming, reboots clustered on link drops.
+ *
+ * There are CONFIG_BT_ATT_TX_COUNT ATT buffers. Keep at most one fewer in
+ * flight from here -- counted out before bt_gatt_notify_cb(), back in by its
+ * sent callback -- and drop a notification instead of waiting for a buffer.
+ * The spare is for the senders this file does not count: BAS, and ATT
+ * responses from the RX thread.
+ *
+ * The stack does not call the sent callback for a PDU it discards on
+ * disconnect or after a TX error (att_on_sent_cb()), so the count is reset
+ * on every connect and disconnect rather than trusted to drain to zero.
+ */
+#define NOTIFY_INFLIGHT_MAX	(CONFIG_BT_ATT_TX_COUNT - 1)
+
+static atomic_t notify_inflight;
+
+static void notify_sent(struct bt_conn *conn, void *user_data)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(user_data);
+
+	/* Never below zero: a late callback can land after a reset. */
+	for (;;) {
+		atomic_val_t v = atomic_get(&notify_inflight);
+
+		if (v <= 0 || atomic_cas(&notify_inflight, v, v - 1)) {
+			return;
+		}
+	}
+}
+
+/*
+ * Notify the active connection without ever blocking. -ENOBUFS means the
+ * notification was dropped because the link is not keeping up; the stream
+ * publishers still advance their seq, so a client sees the gap.
+ */
+static int notify_nowait(const struct bt_gatt_attr *attr, const void *data,
+			 uint16_t len)
+{
+	struct bt_gatt_notify_params params = {
+		.attr = attr,
+		.data = data,
+		.len = len,
+		.func = notify_sent,
+	};
+	struct bt_conn *conn;
+	int err;
+
+	if (atomic_inc(&notify_inflight) >= NOTIFY_INFLIGHT_MAX) {
+		notify_sent(NULL, NULL);
+		return -ENOBUFS;
+	}
+
+	conn = conn_get();
+	if (!conn) {
+		notify_sent(NULL, NULL);
+		return -ENOTCONN;
+	}
+
+	/* Not subscribed or not encrypted comes back as an error before any
+	 * buffer is taken, so this releases the slot in every failure case.
+	 */
+	err = bt_gatt_notify_cb(conn, &params);
+	bt_conn_unref(conn);
+
+	if (err) {
+		notify_sent(NULL, NULL);
+	}
+
+	return err;
+}
+
+/* --- history sync ------------------------------------------------------ */
+
+/*
+ * Replies to opcode 0x0E, as notifications on the history characteristic:
+ *
+ *   0x03 <u8 n> <n x 32-byte hist_record>    records, oldest first
+ *   0x02 <20-byte summary>                    end of sync, sent last
+ *
+ * 0x01 carried v1's 16-byte records (v0.6-v0.7). The type changed with
+ * the layout so an app that only knows 0x01 skips v2 records instead of
+ * misreading them.
+ *
+ * Run from a work item rather than the main loop. The main loop sleeps up
+ * to 200 ms a pass while idle, which would cap a full 19-day sync at
+ * minutes; this sends as fast as the ATT buffers drain. notify_nowait()
+ * makes it safe on the system work queue too: a full link reschedules the
+ * work instead of blocking it.
+ *
+ * Unlike the live streams, a batch that finds no free buffer is NOT
+ * dropped. It is kept and sent again, so a sync never has holes; the
+ * records are in flash and nothing is lost by waiting for them.
+ */
+#define HIST_PKT_RECORDS	0x03
+#define HIST_PKT_END		0x02
+#define HIST_PKT_END_LEN	20
+/* 2 + 7 x 32 = 226 bytes, inside the 244 a 247-byte MTU carries. */
+#define HIST_BATCH_MAX		7
+#define HIST_RETRY_MS		10
+/* Packets per work run before yielding the queue to everyone else. */
+#define HIST_BURST		4
+
+static void history_work_fn(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(history_work, history_work_fn);
+
+static atomic_t history_request;	/* a new sync was asked for */
+static atomic_t history_from;		/* its from_seq */
+static atomic_t history_running;
+
+/* Work item only. */
+static struct hist_iter history_it;
+static uint8_t history_pkt[2 + HIST_BATCH_MAX * sizeof(struct hist_record)];
+static uint16_t history_pkt_len;
+
+static void history_sync_request(uint32_t from_seq)
+{
+	atomic_set(&history_from, (atomic_val_t)from_seq);
+	atomic_set(&history_request, 1);
+	(void)k_work_reschedule(&history_work, K_NO_WAIT);
+}
+
+/* Records that fit one notification at the current MTU; 0 = no link. */
+static uint8_t history_batch_max(void)
+{
+	struct bt_conn *conn = conn_get();
+	uint16_t mtu;
+
+	if (!conn) {
+		return 0;
+	}
+
+	mtu = bt_gatt_get_mtu(conn);
+	bt_conn_unref(conn);
+
+	if (mtu < 3U + 2U + sizeof(struct hist_record)) {
+		return 0;
+	}
+
+	return (uint8_t)MIN((mtu - 3U - 2U) / sizeof(struct hist_record),
+			    HIST_BATCH_MAX);
+}
+
+/*
+ * The end-of-sync summary. Everything a phone needs to put a wall-clock
+ * time on records that were stamped with uptime because nobody had set
+ * the clock yet -- see APP_INTEGRATION.md section 16.
+ */
+static void history_pkt_end(void)
+{
+	uint32_t unix_s = 0;
+
+	(void)history_unix_now(&unix_s);	/* left at 0 when unknown */
+
+	history_pkt[0] = HIST_PKT_END;
+	sys_put_le32(history_it.oldest_seq, &history_pkt[1]);
+	sys_put_le32(history_it.last_seq, &history_pkt[5]);
+	sys_put_le32((uint32_t)(k_uptime_get() / 1000), &history_pkt[9]);
+	sys_put_le32(unix_s, &history_pkt[13]);
+	history_pkt[17] = history_boot_id();
+	sys_put_le16(CONFIG_RING_HISTORY_EPOCH_S, &history_pkt[18]);
+	history_pkt_len = HIST_PKT_END_LEN;
+}
+
+static void history_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (atomic_cas(&history_request, 1, 0)) {
+		/* A new request restarts any sync already in progress. */
+		history_iter_begin(&history_it,
+				   (uint32_t)atomic_get(&history_from));
+		history_pkt_len = 0;
+		atomic_set(&history_running, 1);
+	}
+
+	if (!atomic_get(&history_running)) {
+		return;
+	}
+
+	if (!ble_is_connected() || !atomic_get(&history_subscribed)) {
+		atomic_set(&history_running, 0);
+		return;
+	}
+
+	for (int i = 0; i < HIST_BURST; i++) {
+		if (history_pkt_len == 0) {
+			uint8_t max = history_batch_max();
+			uint8_t n = 0;
+			struct hist_record r;
+
+			if (max == 0) {
+				atomic_set(&history_running, 0);
+				return;
+			}
+
+			while (n < max && history_iter_next(&history_it, &r)) {
+				memcpy(&history_pkt[2 + n * sizeof(r)], &r,
+				       sizeof(r));
+				n++;
+			}
+
+			if (n > 0) {
+				history_pkt[0] = HIST_PKT_RECORDS;
+				history_pkt[1] = n;
+				history_pkt_len = 2 + n * sizeof(r);
+			} else {
+				history_pkt_end();
+			}
+		}
+
+		int err = notify_nowait(ATTR_HISTORY, history_pkt,
+					history_pkt_len);
+
+		if (err == -ENOBUFS) {
+			/* Keep the batch; try again once a buffer drains. */
+			(void)k_work_reschedule(&history_work,
+						K_MSEC(HIST_RETRY_MS));
+			return;
+		}
+
+		if (err) {
+			LOG_WRN("history: sync stopped (%d)", err);
+			atomic_set(&history_running, 0);
+			return;
+		}
+
+		if (history_pkt[0] == HIST_PKT_END) {
+			LOG_INF("history: sync done, oldest seq %u newest %u",
+				history_it.oldest_seq, history_it.last_seq);
+			history_pkt_len = 0;
+			atomic_set(&history_running, 0);
+			return;
+		}
+
+		history_pkt_len = 0;
+	}
+
+	(void)k_work_reschedule(&history_work, K_NO_WAIT);
+}
+
+/* --- connection parameters --------------------------------------------- */
+
+/*
+ * The ring used to accept whatever interval the central chose -- 15-30 ms
+ * from a phone or a PC -- and keep it for the whole connection, waking the
+ * radio 30-60 times a second at +8 dBm to exchange empty packets. With
+ * CONFIG_RING_CONN_PARAM_MGMT, ble_service() asks instead for:
+ *
+ *   IDLE  75-105 ms, latency 4: the ring may sleep through four events
+ *         with nothing to send, so it wakes about every half second. Live
+ *         Status and heart rate (one notification a second) still go out
+ *         at the next event, latency is skipped whenever data is queued.
+ *   FAST  15-30 ms, no latency: while PPG, IMU or GSR streams, or a
+ *         history sync runs, which need the throughput.
+ *
+ * Both fit Apple's accessory rules: interval max at least 15 ms above min,
+ * latency at most 30, max x (latency + 1) at most 2 s, and the 4 s
+ * supervision timeout over three times that. The central can refuse;
+ * le_param_updated() logs what it granted.
+ */
+#define CONN_IDLE_PARAM		BT_LE_CONN_PARAM(60, 84, 4, 400)
+#define CONN_FAST_PARAM		BT_LE_CONN_PARAM(12, 24, 0, 400)
+/* Let discovery and pairing run at the central's pace first. */
+#define CONN_SETTLE_S		10
+/* Do not re-ask more often than this, whatever changes. */
+#define CONN_REQUEST_GAP_S	5
+
+#define CONN_MODE_NONE		0
+#define CONN_MODE_IDLE		1
+#define CONN_MODE_FAST		2
+
+static atomic_t conn_since_s;		/* uptime at connect, seconds */
+static atomic_t conn_mode;		/* last mode requested */
+static int64_t conn_last_request_ms;	/* main loop only */
+
+static void conn_params_on_connect(void)
+{
+	atomic_set(&conn_since_s, (atomic_val_t)(k_uptime_get() / 1000));
+	atomic_set(&conn_mode, CONN_MODE_NONE);
+}
+
 /* --- connection callbacks ---------------------------------------------- */
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -594,6 +1137,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	atomic_inc(&connected_count);
+	/* The host stopped the advertiser to make this connection. */
+	atomic_set(&adv_mode, ADV_IDLE);
+	conn_params_on_connect();
+	atomic_set(&notify_inflight, 0);	/* see notify_nowait() */
 
 	old = conn_swap(bt_conn_ref(conn));
 
@@ -612,6 +1159,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	old = conn_swap(NULL);
 	atomic_dec(&connected_count);
+	/* Discarded PDUs never call notify_sent(); see notify_nowait(). */
+	atomic_set(&notify_inflight, 0);
 
 	if (old) {
 		bt_conn_unref(old);
@@ -632,6 +1181,13 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	 * the boot.
 	 */
 	atomic_set(&spo2_mode_on, 0);
+
+	/* A sync in progress dies with the link; the phone resumes it from
+	 * the last seq it stored.
+	 */
+	atomic_set(&history_request, 0);
+	atomic_set(&history_running, 0);
+	(void)k_work_cancel_delayable(&history_work);
 
 	LOG_INF("disconnected (reason 0x%02x)", reason);
 }
@@ -670,11 +1226,24 @@ static void recycled(void)
 	LOG_INF("advertising restarted");
 }
 
+/* What the central actually granted, whichever side asked. */
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+			     uint16_t latency, uint16_t timeout)
+{
+	ARG_UNUSED(conn);
+
+	/* interval is in 1.25 ms units, timeout in 10 ms units */
+	LOG_INF("connection interval %u.%02u ms, latency %u, timeout %u ms",
+		(interval * 125U) / 100U, (interval * 125U) % 100U, latency,
+		timeout * 10U);
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
 	.security_changed = security_changed,
 	.recycled = recycled,
+	.le_param_updated = le_param_updated,
 };
 
 /* --- pairing ----------------------------------------------------------- */
@@ -835,19 +1404,173 @@ int ble_start(void)
 	return 0;
 }
 
+void ble_service(int64_t now_ms)
+{
+	/* --- advertising: fast, then slow --- */
+	if (CONFIG_RING_ADV_SLOW_AFTER_S > 0 && !ble_is_connected() &&
+	    atomic_get(&adv_mode) == ADV_FAST &&
+	    (now_ms / 1000) - atomic_get(&adv_fast_since_s) >=
+	    CONFIG_RING_ADV_SLOW_AFTER_S) {
+		/*
+		 * Stop, then restart slow. A central can connect in the gap;
+		 * then the slow start fails harmlessly and recycled() restarts
+		 * fast when that connection ends.
+		 */
+		int err = bt_le_adv_stop();
+
+		if (!err) {
+			err = bt_le_adv_start(
+				BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN,
+						BT_GAP_ADV_SLOW_INT_MIN,
+						BT_GAP_ADV_SLOW_INT_MAX, NULL),
+				ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+		}
+
+		if (!err) {
+			atomic_set(&adv_mode, ADV_SLOW);
+			LOG_INF("advertising slowed to 1-1.2 s");
+		} else if (!ble_is_connected()) {
+			LOG_WRN("slow advertising failed (%d), staying fast", err);
+			if (adv_start() != 0) {
+				atomic_set(&adv_mode, ADV_IDLE);
+				LOG_ERR("advertising failed to restart");
+			}
+		} else {
+			atomic_set(&adv_mode, ADV_IDLE);
+		}
+	}
+
+	/* --- connection interval: idle or fast --- */
+	if (!IS_ENABLED(CONFIG_RING_CONN_PARAM_MGMT) || !ble_is_connected()) {
+		return;
+	}
+
+	bool want_fast = ble_ppg_streaming() || ble_imu_streaming() ||
+			 ble_gsr_streaming() ||
+			 atomic_get(&history_running) ||
+			 atomic_get(&history_request);
+	atomic_val_t want = want_fast ? CONN_MODE_FAST : CONN_MODE_IDLE;
+
+	if (want == atomic_get(&conn_mode)) {
+		return;
+	}
+	/* Idle waits for discovery to settle; fast never waits. */
+	if (!want_fast &&
+	    (now_ms / 1000) - atomic_get(&conn_since_s) < CONN_SETTLE_S) {
+		return;
+	}
+	if (conn_last_request_ms != 0 &&
+	    now_ms - conn_last_request_ms < CONN_REQUEST_GAP_S * 1000 &&
+	    !want_fast) {
+		return;
+	}
+
+	struct bt_conn *conn = conn_get();
+
+	if (!conn) {
+		return;
+	}
+
+	int err = bt_conn_le_param_update(conn, want_fast ? CONN_FAST_PARAM
+							  : CONN_IDLE_PARAM);
+
+	bt_conn_unref(conn);
+	conn_last_request_ms = now_ms;
+
+	if (err) {
+		LOG_WRN("connection parameter request failed (%d)", err);
+		return;
+	}
+
+	atomic_set(&conn_mode, want);
+	LOG_INF("asked for %s connection parameters",
+		want_fast ? "fast" : "idle");
+}
+
+int ble_set_tx_power(int8_t dbm, int8_t *selected)
+{
+	struct bt_hci_cp_vs_write_tx_power_level *cp;
+	struct bt_hci_rp_vs_write_tx_power_level *rp;
+	struct net_buf *buf;
+	struct net_buf *rsp = NULL;
+	struct bt_conn *conn;
+	uint16_t handle;
+	int err;
+
+	conn = conn_get();
+	if (!conn) {
+		return -ENOTCONN;
+	}
+
+	err = bt_hci_get_conn_handle(conn, &handle);
+	bt_conn_unref(conn);
+	if (err) {
+		return err;
+	}
+
+	buf = bt_hci_cmd_alloc(K_SECONDS(1));
+	if (!buf) {
+		return -ENOBUFS;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle_type = BT_HCI_VS_LL_HANDLE_TYPE_CONN;
+	cp->handle = sys_cpu_to_le16(handle);
+	cp->tx_power_level = dbm;
+
+	err = bt_hci_cmd_send_sync(BT_HCI_OP_VS_WRITE_TX_POWER_LEVEL, buf, &rsp);
+	if (err) {
+		return err;
+	}
+
+	rp = (void *)rsp->data;
+	*selected = rp->selected_tx_power;
+	net_buf_unref(rsp);
+
+	return 0;
+}
+
 void ble_notify_hr(uint16_t bpm)
 {
+	/*
+	 * Byte for byte what bt_hrs_notify() sends -- flags 0x06 (8-bit rate,
+	 * sensor contact supported and detected), then the rate -- but through
+	 * notify_nowait(). bt_hrs_notify() calls bt_gatt_notify(), which can
+	 * block the main loop like any other notification.
+	 */
+	static const struct bt_gatt_attr *hrm_attr;
+	uint8_t hrm[2] = { 0x06, (uint8_t)MIN(bpm, UINT8_MAX) };
+
 	if (!ble_is_connected()) {
 		return;
 	}
 
-	(void)bt_hrs_notify(bpm);
+	if (!hrm_attr) {
+		hrm_attr = bt_gatt_find_by_uuid(NULL, 0,
+						BT_UUID_HRS_MEASUREMENT);
+		if (!hrm_attr) {
+			return;
+		}
+	}
+
+	(void)notify_nowait(hrm_attr, hrm, sizeof(hrm));
 }
 
 void ble_notify_battery(uint8_t percent)
 {
 	if (percent > 100) {
 		percent = 100;
+	}
+
+	/*
+	 * bt_bas_set_battery_level() notifies through bt_gatt_notify(), so it
+	 * can block. It is the one sender notify_nowait() does not count, so
+	 * call it only while a buffer is certainly free; a skipped update is
+	 * retried by the next slow_sense() pass. Off a connection the count
+	 * is 0 and this only stores the value for reads.
+	 */
+	if (atomic_get(&notify_inflight) >= NOTIFY_INFLIGHT_MAX) {
+		return;
 	}
 
 	(void)bt_bas_set_battery_level(percent);
@@ -872,8 +1595,21 @@ void ble_publish_status(const struct ring_status *status)
 	 * released before this call because the BT stack must never be
 	 * entered with a spinlock held.
 	 */
-	(void)bt_gatt_notify(NULL, ATTR_STATUS, &snapshot, sizeof(snapshot));
+	(void)notify_nowait(ATTR_STATUS, &snapshot, sizeof(snapshot));
 }
+
+/*
+ * Samples per PPG notification once the MTU allows it. The main loop drains
+ * the FIFO every 20 ms, two samples at a time, and one notification per
+ * drain is 50 a second -- more than three ATT buffers carry over a marginal
+ * link, so most were dropped (or, before notify_nowait(), waited on). Ten
+ * is 100 ms of latency for a fifth of the packets.
+ */
+#define PPG_BATCH_SAMPLES	10
+
+/* Main loop only, like every caller of ble_publish_ppg(), so no lock. */
+static uint32_t ppg_pending[40];
+static uint8_t ppg_pending_n;
 
 void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 {
@@ -882,7 +1618,7 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 	 * phone should request one or it will be capped at 4 samples per
 	 * notification by the 23-byte default.
 	 */
-	uint8_t buf[5 + 40 * sizeof(uint32_t)];
+	uint8_t buf[5 + ARRAY_SIZE(ppg_pending) * sizeof(uint32_t)];
 	struct bt_conn *conn;
 	uint16_t mtu;
 	uint16_t mtu_payload;
@@ -890,6 +1626,7 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 	uint8_t n;
 
 	if (!ble_ppg_streaming()) {
+		ppg_pending_n = 0;
 		return;
 	}
 
@@ -900,6 +1637,7 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 	 */
 	conn = conn_get();
 	if (!conn) {
+		ppg_pending_n = 0;
 		return;
 	}
 
@@ -913,22 +1651,45 @@ void ble_publish_ppg(const uint32_t *samples, uint8_t count)
 	mtu_payload = mtu - 3;
 	max_samples = (mtu_payload > 5) ? (mtu_payload - 5) / sizeof(uint32_t)
 				        : 0;
-	if (max_samples > 40) {
-		max_samples = 40;
+	if (max_samples > ARRAY_SIZE(ppg_pending)) {
+		max_samples = ARRAY_SIZE(ppg_pending);
 	}
-
-	n = MIN(count, max_samples);
-	if (n == 0) {
+	if (max_samples == 0) {
 		return;
 	}
 
+	/* Queue the new samples, dropping the oldest if a burst overflows. */
+	for (uint8_t i = 0; i < count; i++) {
+		if (ppg_pending_n == ARRAY_SIZE(ppg_pending)) {
+			memmove(&ppg_pending[0], &ppg_pending[1],
+				(ARRAY_SIZE(ppg_pending) - 1) *
+				sizeof(ppg_pending[0]));
+			ppg_pending_n--;
+		}
+		ppg_pending[ppg_pending_n++] = samples[i];
+	}
+
+	if (ppg_pending_n < MIN(PPG_BATCH_SAMPLES, max_samples)) {
+		return;
+	}
+
+	n = MIN(ppg_pending_n, max_samples);
+
+	/*
+	 * seq advances whether or not the notification goes out, so a batch
+	 * notify_nowait() had to drop shows the client a gap in seq.
+	 */
 	sys_put_le32(ppg_seq++, &buf[0]);
 	buf[4] = n;
 	for (uint8_t i = 0; i < n; i++) {
-		sys_put_le32(samples[i], &buf[5 + i * sizeof(uint32_t)]);
+		sys_put_le32(ppg_pending[i], &buf[5 + i * sizeof(uint32_t)]);
 	}
 
-	(void)bt_gatt_notify(NULL, ATTR_PPG, buf, 5 + n * sizeof(uint32_t));
+	ppg_pending_n -= n;
+	memmove(&ppg_pending[0], &ppg_pending[n],
+		ppg_pending_n * sizeof(ppg_pending[0]));
+
+	(void)notify_nowait(ATTR_PPG, buf, 5 + n * sizeof(uint32_t));
 }
 
 void ble_publish_activity(const struct ring_activity *activity)
@@ -945,7 +1706,7 @@ void ble_publish_activity(const struct ring_activity *activity)
 		return;
 	}
 
-	(void)bt_gatt_notify(NULL, ATTR_ACTIVITY, &snapshot, sizeof(snapshot));
+	(void)notify_nowait(ATTR_ACTIVITY, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_gsr(const int16_t *samples, uint8_t count)
@@ -999,7 +1760,7 @@ void ble_publish_gsr(const int16_t *samples, uint8_t count)
 		sys_put_le16((uint16_t)samples[i], &buf[5 + i * sizeof(int16_t)]);
 	}
 
-	(void)bt_gatt_notify(NULL, ATTR_GSR, buf, 5 + n * sizeof(int16_t));
+	(void)notify_nowait(ATTR_GSR, buf, 5 + n * sizeof(int16_t));
 }
 
 void ble_publish_spo2(const struct ring_spo2 *spo2)
@@ -1016,7 +1777,7 @@ void ble_publish_spo2(const struct ring_spo2 *spo2)
 		return;
 	}
 
-	(void)bt_gatt_notify(NULL, ATTR_SPO2, &snapshot, sizeof(snapshot));
+	(void)notify_nowait(ATTR_SPO2, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_workout(const struct ring_workout *workout)
@@ -1033,7 +1794,24 @@ void ble_publish_workout(const struct ring_workout *workout)
 		return;
 	}
 
-	(void)bt_gatt_notify(NULL, ATTR_WORKOUT, &snapshot, sizeof(snapshot));
+	(void)notify_nowait(ATTR_WORKOUT, &snapshot, sizeof(snapshot));
+}
+
+void ble_publish_wellness(const struct ring_wellness *wellness)
+{
+	struct ring_wellness snapshot;
+	k_spinlock_key_t key;
+
+	key = k_spin_lock(&wellness_lock);
+	latest_wellness = *wellness;
+	snapshot = latest_wellness;
+	k_spin_unlock(&wellness_lock, key);
+
+	if (!ble_is_connected() || !atomic_get(&wellness_subscribed)) {
+		return;
+	}
+
+	(void)notify_nowait(ATTR_WELLNESS, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_hrv(const struct ring_hrv *hrv)
@@ -1050,7 +1828,7 @@ void ble_publish_hrv(const struct ring_hrv *hrv)
 		return;
 	}
 
-	(void)bt_gatt_notify(NULL, ATTR_HRV, &snapshot, sizeof(snapshot));
+	(void)notify_nowait(ATTR_HRV, &snapshot, sizeof(snapshot));
 }
 
 void ble_publish_imu(int16_t x, int16_t y, int16_t z)
@@ -1065,5 +1843,5 @@ void ble_publish_imu(int16_t x, int16_t y, int16_t z)
 	sys_put_le16((uint16_t)y, &buf[2]);
 	sys_put_le16((uint16_t)z, &buf[4]);
 
-	(void)bt_gatt_notify(NULL, ATTR_IMU, buf, sizeof(buf));
+	(void)notify_nowait(ATTR_IMU, buf, sizeof(buf));
 }

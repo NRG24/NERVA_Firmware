@@ -190,6 +190,189 @@ static void test_no_false_steps_when_still(void)
 	}
 }
 
+/*
+ * BUG (found 2026-10-12, wearing the ring): steps counted far too many.
+ *
+ * A ring is on the hand, and the hand moves all day without walking --
+ * gestures, reaching, picking things up. The detector counted every swing
+ * that crossed its threshold more than 250 ms after the last one, so
+ * ordinary hand movement read as steps.
+ *
+ * Irregular hand movement, generated deterministically: smooth bumps of
+ * 100-500 mg, 150-400 ms wide, at random gaps of 0.3-2.5 s, for 30
+ * minutes. Nobody takes a step. Pedometers reject this by requiring a
+ * rhythm before counting; a handful of chance-rhythmic runs over half an
+ * hour is tolerable, hundreds of steps is the bug.
+ */
+static uint32_t lcg_state = 12345;
+
+static uint32_t lcg(uint32_t lo, uint32_t hi)
+{
+	lcg_state = lcg_state * 1103515245U + 12345U;
+	return lo + (lcg_state >> 8) % (hi - lo + 1);
+}
+
+static void test_no_steps_from_hand_movement(void)
+{
+	sim_section("hand movement that is not walking counts (almost) no steps");
+
+	reset_all();
+	lcg_state = 12345;
+
+	const int dt = 40;
+	int64_t end = now_ms + 30LL * 60 * 1000;
+	int events = 0;
+
+	while (now_ms < end) {
+		int width = (int)lcg(150, 400);
+		int amp = (int)lcg(100, 500) * (lcg(0, 1) ? 1 : -1);
+		int gap = (int)lcg(300, 2500);
+
+		for (int t = 0; t < width; t += dt) {
+			double ph = 3.14159265 * t / width;
+			int32_t mg = 1000 + (int32_t)(amp * sin(ph)) +
+				     (int32_t)lcg(0, 16) - 8;
+
+			steps_update(mg, now_ms);
+			now_ms += dt;
+		}
+		for (int t = 0; t < gap; t += dt) {
+			steps_update(1000 + (int32_t)lcg(0, 16) - 8, now_ms);
+			now_ms += dt;
+		}
+		events++;
+	}
+
+	CHECK(steps_count() <= 30,
+	      "%d irregular hand movements in 30 min counted %u steps",
+	      events, steps_count());
+}
+
+/*
+ * Walking that is less tidy than sim_wearer's steady march. Each sample is
+ * gravity + the footfall shape + an optional component at half the cadence
+ * -- a hand swinging once per stride, which is two steps -- + noise.
+ */
+static double walk_phase;
+
+static int32_t walk_sample(double spm, double swing_mg, double arm, int dt_ms)
+{
+	walk_phase += (spm / 60.0) * (dt_ms / 1000.0) * 2.0 * 3.14159265358979;
+
+	double s = 0.7 * sin(walk_phase) + 0.3 * sin(2.0 * walk_phase + 0.6) +
+		   arm * sin(0.5 * walk_phase + 0.3);
+
+	return 1000 + (int32_t)(swing_mg * s) + (int32_t)lcg(0, 16) - 8;
+}
+
+/* Returns the true step count: one per cycle of walk_phase. */
+static double walk_for(int secs, double spm_from, double spm_to, double arm)
+{
+	const int dt = 40;
+	int samples = secs * 1000 / dt;
+	double steps = 0;
+
+	for (int i = 0; i < samples; i++) {
+		double spm = spm_from + (spm_to - spm_from) * i / samples;
+
+		steps_update(walk_sample(spm, 150, arm, dt), now_ms);
+		steps += spm / 60.0 * dt / 1000.0;
+		now_ms += dt;
+	}
+	return steps;
+}
+
+static void still_for(int secs)
+{
+	for (int t = 0; t < secs * 1000; t += 40) {
+		steps_update(1000 + (int32_t)lcg(0, 16) - 8, now_ms);
+		now_ms += 40;
+	}
+}
+
+static void test_stop_and_go(void)
+{
+	double truth = 0;
+
+	sim_section("stop-and-go walking loses no steps to the rhythm check");
+
+	reset_all();
+	lcg_state = 777;
+	walk_phase = 0;
+	for (int i = 0; i < 10; i++) {
+		truth += walk_for(20, 105, 105, 0);
+		still_for(15);
+	}
+	CHECK_NEAR(steps_count(), truth, 5, "ten 20 s walks with stops");
+}
+
+static void test_cadence_ramp(void)
+{
+	sim_section("a cadence that drifts 80 -> 140 spm keeps its rhythm");
+
+	reset_all();
+	lcg_state = 4242;
+	walk_phase = 0;
+	double truth = walk_for(120, 80, 140, 0);
+
+	CHECK_NEAR(steps_count(), truth, 5, "two-minute ramp from 80 to 140 spm");
+}
+
+/*
+ * KNOWN LIMITATION, pinned rather than hidden. When the once-per-stride
+ * hand swing is as large as the footfall, the threshold follows the swing
+ * and the counter counts strides: about HALF the steps. The frozen v0.6.2
+ * counter does exactly the same (164 of 330 here), so this is not new.
+ *
+ * How strongly a ring actually sees the swing is unknown until
+ * tools/steps_record.py has recorded real walks -- the 0.7 here is a guess.
+ * Detecting on the rate of change instead was tried (2026-10-15) and was
+ * worse overall. So this test allows the halving and fails on anything
+ * worse, or on doubling. Tighten it once real walks say what to fix.
+ */
+static void test_arm_swing(void)
+{
+	sim_section("arm swing: KNOWN to halve when as large as the footfall");
+
+	reset_all();
+	lcg_state = 99;
+	walk_phase = 0;
+	double truth = walk_for(180, 110, 110, 0.7);
+	double ratio = steps_count() / truth;
+
+	CHECK(ratio >= 0.45 && ratio <= 1.08,
+	      "110 spm with arm swing 0.7: %u of %.0f steps (ratio %.2f) -- "
+	      "worse than the known halving, or doubled", steps_count(), truth,
+	      ratio);
+
+	/* A moderate swing must not cost anything. */
+	reset_all();
+	walk_phase = 0;
+	truth = walk_for(180, 110, 110, 0.3);
+	CHECK_NEAR(steps_count(), truth, 5, "110 spm with arm swing 0.3");
+}
+
+/*
+ * The documented price of regulation: a burst shorter than
+ * REGULATION_STEPS never establishes a rhythm, so it is never counted.
+ * Shuffling around a kitchen reads as nothing. Pinned so that changing the
+ * trade is a decision, not an accident.
+ */
+static void test_short_bursts_are_not_counted(void)
+{
+	sim_section("bursts of 4 steps are not counted (regulation needs 8)");
+
+	reset_all();
+	lcg_state = 31337;
+	walk_phase = 0;
+	for (int i = 0; i < 30; i++) {
+		(void)walk_for(2, 110, 110, 0);	/* ~3.7 steps */
+		still_for(8);
+	}
+	CHECK(steps_count() == 0,
+	      "30 bursts of ~4 steps counted %u", steps_count());
+}
+
 static void test_cadence(void)
 {
 	sim_section("cadence tracks, and decays when walking stops");
@@ -877,6 +1060,11 @@ int main(void)
 	test_step_accuracy();
 	test_slow_polling_is_known_bad();
 	test_no_false_steps_when_still();
+	test_no_steps_from_hand_movement();
+	test_stop_and_go();
+	test_cadence_ramp();
+	test_arm_swing();
+	test_short_bursts_are_not_counted();
 	test_cadence();
 	test_no_false_steps_across_a_gap();
 

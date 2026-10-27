@@ -18,7 +18,7 @@ SRC     := ../src/steps.c ../src/sleep.c ../src/calories.c ../src/hrv.c ../src/h
 COMMON  := sim.c $(SRC)
 
 TESTS   := test_activity test_mainloop test_hrv test_spo2 test_driver \
-	   test_profile
+	   test_profile test_history test_hr test_thermo test_spot
 
 # Every .c in src/, plus the GATT layout assertions.
 #
@@ -35,9 +35,19 @@ SYNTAX_FLAGS := -std=c11 -fsyntax-only -Wall -Wextra -Werror -Wno-unused-paramet
 		-DCONFIG_BT_DIS_FW_REV_STR='"0.0.0"' \
 		-DCONFIG_BT_DEVICE_NAME='"Ring PPG"' \
 		-DCONFIG_BT_ID_MAX=1 \
+		-DCONFIG_RING_HISTORY_EPOCH_S=300 \
+		-DCONFIG_RING_MEASURE_PERIOD_S=60 \
+		-DCONFIG_BT_ATT_TX_COUNT=3 \
+		-DCONFIG_RING_ADV_SLOW_AFTER_S=0 \
+		-DCONFIG_RING_PPG_LED_PA=255 -DCONFIG_RING_PPG_AVG_LOG2=2 \
+		-DCONFIG_RING_SPOT_NIGHT_MIN=0 -DCONFIG_RING_SPOT_DAY_MIN=0 \
+		-DCONFIG_RING_SPOT_WINDOW_S=180 \
+		-DCONFIG_RING_HOT_FLASH_MODE=0 -DCONFIG_RING_HOT_FLASH_RISE_C10=10 \
 		-DCONFIG_SETTINGS
 SYNTAX_BENCH := -DCONFIG_RING_BENCH -DCONFIG_RING_BENCH_POWER_LED \
 		-DCONFIG_RING_IMU_WAKE_DIAG -DCONFIG_RING_GSR_MONITOR \
+		-DCONFIG_RING_DIAG_OPCODES=1 -DCONFIG_RING_GSR_STATUS=1 \
+		-DCONFIG_RING_CONN_PARAM_MGMT=1 \
 		-DCONFIG_RING_WATCHDOG -DCONFIG_RING_WATCHDOG_TIMEOUT_MS=10000
 
 .PHONY: all run clean check-constants syntax
@@ -59,12 +69,34 @@ test_spo2: test_spo2.c $(COMMON)
 # The driver, not a pure-logic module: it needs the I2C and kernel calls
 # stubbed, which test_driver.c supplies itself.
 test_driver: test_driver.c sim.c ../src/maxm86161.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(CFLAGS) -DCONFIG_RING_PPG_AVG_LOG2=2 -o $@ $^ $(LDLIBS)
 
 # Flash persistence. Also not pure logic: test_profile.c fakes the settings
 # backend, and profile.c is built with its settings path switched on.
 test_profile: test_profile.c sim.c ../src/profile.c ../src/calories.c
 	$(CC) $(CFLAGS) -DCONFIG_SETTINGS -DPROFILE_TESTING -o $@ $^ $(LDLIBS)
+
+# The history log against a fake NOR flash that counts any write landing on
+# unerased bytes. history.c is built as-is; the flash and kernel calls it
+# makes are supplied by test_history.c.
+test_history: test_history.c sim.c ../src/history.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# The heart-rate detector against synthetic PPG: range, glitches, drift,
+# no finger, noise without a pulse, strong harmonic, rate change.
+test_hr: test_hr.c sim.c ../src/hr.c
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# Hot-flash detection against synthetic ring temperature traces.
+test_thermo: test_thermo.c sim.c ../src/thermo.c
+	$(CC) $(CFLAGS) -DCONFIG_RING_HOT_FLASH_MODE=1 \
+		-DCONFIG_RING_HOT_FLASH_RISE_C10=10 -o $@ $^ $(LDLIBS)
+
+# The spot-reading scheduler and its validity rules.
+test_spot: test_spot.c sim.c ../src/spot.c
+	$(CC) $(CFLAGS) -DCONFIG_RING_SPOT_NIGHT_MIN=60 \
+		-DCONFIG_RING_SPOT_DAY_MIN=60 -DCONFIG_RING_SPOT_WINDOW_S=180 \
+		-o $@ $^ $(LDLIBS)
 
 run: $(TESTS)
 	@fail=0; \

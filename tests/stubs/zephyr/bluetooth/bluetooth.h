@@ -32,9 +32,22 @@ struct bt_data {
 	BT_DATA(_type, ((const uint8_t []){ _bytes }),			\
 		sizeof((const uint8_t []){ _bytes }))
 
-struct bt_le_adv_param { uint32_t options; };
+struct bt_le_adv_param {
+	uint32_t options;
+	uint32_t interval_min;
+	uint32_t interval_max;
+	const void *peer;
+};
 #define BT_LE_ADV_OPT_CONN	BIT(0)
 extern const struct bt_le_adv_param *BT_LE_ADV_CONN_FAST_1;
+/* A compound literal, as in Zephyr: the parameters for one advertiser. */
+#define BT_LE_ADV_PARAM(_options, _int_min, _int_max, _peer)		\
+	((const struct bt_le_adv_param[]) { {				\
+		.options = (_options), .interval_min = (_int_min),	\
+		.interval_max = (_int_max), .peer = (_peer) } })
+#define BT_GAP_ADV_SLOW_INT_MIN		0x0640
+#define BT_GAP_ADV_SLOW_INT_MAX		0x0780
+int bt_le_adv_stop(void);
 
 int bt_enable(void (*cb)(int err));
 int bt_le_adv_start(const struct bt_le_adv_param *param,

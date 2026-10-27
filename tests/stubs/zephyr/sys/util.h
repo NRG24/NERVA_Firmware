@@ -26,6 +26,16 @@
 #define BUILD_ASSERT(expr, ...)	_Static_assert(expr, "" __VA_ARGS__)
 #endif
 
+/*
+ * Zephyr's IS_ENABLED(): 1 when the macro is defined to 1, else 0, usable
+ * in an ordinary if(). The same preprocessor trick as util_macro.h.
+ */
+#define IS_ENABLED(config_macro)	Z_IS_ENABLED1(config_macro)
+#define Z_IS_ENABLED1(config_macro)	Z_IS_ENABLED2(_XXXX##config_macro)
+#define _XXXX1				_YYYY,
+#define Z_IS_ENABLED2(one_or_two_args)	Z_IS_ENABLED3(one_or_two_args 1, 0)
+#define Z_IS_ENABLED3(ignore_this, val, ...)	val
+
 #define MAX(a, b)	(((a) > (b)) ? (a) : (b))
 #define MIN(a, b)	(((a) < (b)) ? (a) : (b))
 #define ARRAY_SIZE(a)	(sizeof(a) / sizeof((a)[0]))

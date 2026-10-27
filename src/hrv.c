@@ -125,3 +125,41 @@ uint8_t hrv_diffs(void)
 {
 	return hv.count;
 }
+
+void hrv_session_begin(struct hrv_session *s)
+{
+	memset(s, 0, sizeof(*s));
+}
+
+void hrv_session_add(struct hrv_session *s, uint16_t ibi_ms, bool successive)
+{
+	/* Same rules as hrv_add_interval(). */
+	if (ibi_ms == 0) {
+		s->prev_valid = false;
+		return;
+	}
+
+	if (successive && s->prev_valid && s->count < UINT16_MAX) {
+		int32_t diff = (int32_t)ibi_ms - (int32_t)s->prev_ibi_ms;
+
+		s->sum += (uint64_t)(diff * diff);
+		s->count++;
+	}
+
+	s->prev_ibi_ms = ibi_ms;
+	s->prev_valid = true;
+}
+
+uint16_t hrv_session_rmssd_x10(const struct hrv_session *s)
+{
+	if (s->count < HRV_MIN_DIFFS) {
+		return 0;
+	}
+
+	return (uint16_t)isqrt64(s->sum * 100U / s->count);
+}
+
+uint16_t hrv_session_diffs(const struct hrv_session *s)
+{
+	return s->count;
+}

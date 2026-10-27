@@ -26,6 +26,8 @@ confirmed on hardware.
 | 6 | **100k pull-up on BOOST_EN** | VLED collapses on every reset, so the PPG restarts from scratch after each flash. |
 | 4 | **Bring RESET_N out** | No connect-under-reset recovery path today. |
 | 2 | **Consider 3.0 V rail** | Optional, see item 2. Buys SWD safety, OPA2333 margin and ~2x GSR span, at the cost of a different PMIC variant. |
+| 14 | **Antenna: matching pads, trimmable strip, more ground** | ~17 dB below a WHOOP on the same body (2026-10-07); links drop at -80 dBm. No pi network exists today and the RF pins are under the module. See ANTENNA_TUNING.md. |
+| 15 | **Quiet supply for the PPG** | ~10-20 % of PPG samples glitch on a 70 ms rhythm (2026-10-07/08). 4x averaging hides most of it; the source is not found. |
 
 ### Explicitly NOT needed -- decided 2026-08-24
 
@@ -41,7 +43,7 @@ confirmed on hardware.
 |---|---|---|
 | 3 | MAXM86161 INTB to a GPIO | Ends FIFO polling. |
 | 9 | BQ25120A INT (D2) to a GPIO | Charger events without polling. |
-| 12 | R5 as 0402 rather than 0201 | The **value (91k) is correct** -- it just needs to be readable. Not being able to read it sent a whole investigation down a wrong path. |
+| 12 | R5 ~470k-1M, as 0402 | 91k is ~10x too little gain for a ring's dry pads (2026-10-15), and an 0201 cannot be read. Fix the ADC-reference noise first. |
 | 12 | ESD protection on SKIN_SENSE | A skin electrode currently runs straight into an op-amp input. |
 | 8 | Confirm the IMU part in the BOM | The board is an LSM6DSV16BX; the filed datasheet is the LSM6DSV. |
 
@@ -322,7 +324,26 @@ clamped, with no human in the loop.
 | 50 kOhm | 20 uS | 1410 mV |
 | 36 kOhm | 28 uS | 1764 mV, saturated |
 
-That covers 1-28 uS over the usable span. **Do not change R5.**
+That covers 1-28 uS over the usable span.
+
+> **Superseded 2026-10-15 -- change R5 on the next spin.** The range above
+> is right for a palm with gel electrodes. It is wrong for this ring.
+> Worn and streaming, the front end showed:
+>
+> * **Sensitivity of 45 mV per uS.** A worn ring's small dry pads sit well
+>   under 1 uS. A real skin-conductance response is a few percent of that,
+>   so about **0.2-2 mV at the output**. One ADC step is 0.44 mV.
+> * **Noise of ~14 mV peak to peak, identical with the finger off and on.**
+>   It is electrical (most likely the ADC reference, VDD/4, moving with
+>   radio and supply activity), not skin, and it sits 10-50x above the
+>   signal.
+>
+> So the stage cannot resolve skin conductance as built. Production
+> firmware (v0.7.0) stopped sampling it. For the next board: **R5 of about
+> 470 kOhm** (5x the gain, saturating near 5 uS) or **1 MOhm** (10x,
+> saturating near 2.5 uS), C4 scaled to keep the bandwidth, a quiet ADC
+> reference, and the largest electrodes the ring allows. Fix the noise
+> first: gain only amplifies it.
 
 ### What the finger test actually showed
 
@@ -337,10 +358,10 @@ on a worn ring before any component is changed.
 
 ### For the next board
 
-1. **Keep R5 at 91 kOhm** -- the value is right. But fit it as an **0402 or
-   larger**. It is currently an unmarked 0201, and not being able to read
-   the one component that sets sensitivity is what sent this whole
-   investigation down a wrong path.
+1. **Raise R5 to ~470 kOhm-1 MOhm** (see the 2026-10-15 note above), and
+   fit it as an **0402 or larger**. It is currently an unmarked 0201, and
+   not being able to read the one component that sets sensitivity is what
+   sent this whole investigation down a wrong path.
 2. **Give the op-amp supply margin.** OPA2333's minimum is 1.8 V and the
    rail *is* 1.8 V -- zero margin, and it is fed through a GPIO. Item 2
    already argues for a 3.0 V rail; this is another reason. Note that
@@ -426,3 +447,58 @@ transimpedance stage needs.
   happy to 5.5 V and the extra headroom makes the whole measurement easier.
 * Re-derive R3/R4 for whatever rail you settle on, targeting V_REF at
   roughly a quarter of the supply so the output has room to swing up.
+
+## 14. The antenna is ~17 dB down, and nothing on the board can tune it
+
+Measured 2026-10-07/08: worn on the same hand as a WHOOP, the ring's
+advertising read **-79 dBm** median against the WHOOP's **-62**. A Windows
+link dropped within seconds at -80 to -89 dBm. Production firmware now runs
++8 dBm, the nRF52833's maximum, to compensate.
+
+What the board has (2026-08-21 netlist and Gerbers; full write-up in
+`ANTENNA_TUNING.md`):
+
+* **No matching network.** `ANT` (pin 6) is tied straight to `ANT_INT`
+  (pin 5), both **under the LGA module**, so there is nowhere to fit a
+  part, even as a bodge.
+* The internal antenna is completed by a **~10 mm C-shaped `ANT_PCB` strip**
+  (pin 1, "module in a corner" option), 0.29 mm wide, to the left of the
+  module. Trimming it is the only tuning knob on existing boards.
+* A 7 mm-wide flex with **hatched ground** is far from the ground plane a
+  chip antenna is designed around.
+
+**Next spin:**
+
+* Route `ANT` out to **three 0201 pads (series 0 Ohm, two DNP shunts)**
+  before it returns to `ANT_INT`, plus a way to break in for a conducted
+  measurement.
+* Make the `ANT_PCB` strip **trimmable by solder links**, not by cutting.
+* **Solid ground** pour, as wide as the flex allows. Check the ANNA-B4
+  system integration manual's ground-plane guidance (UBX ref [3]).
+* Put the module on the **back of the finger**, away from the palm-side
+  PPG.
+
+## 15. The PPG has electrical glitches on a 70 ms rhythm
+
+Measured on ring 2 (2026-10-07, 28,610 raw samples, and 2026-10-08 sweep).
+Roughly **10-20 % of green PPG samples** jump 500-1,600 counts for a single
+sample. They are mostly downward, and most often exactly **7 samples
+(70 ms) apart**. They are not physiological.
+
+* **4x on-chip averaging** (production default since v0.6.2) cut them to
+  ~3 % at 31 mA. A 5-sample median in the heart-rate detector removes the
+  rest. So firmware copes; the hardware still has a problem.
+* **Raising ADC sensitivity** (16 -> 8 uA range) brought them back to
+  ~19 %. That points at the photodiode or ADC side picking something up,
+  rather than at the LED.
+* **Not yet tested:** whether they follow the radio. Opcode 0x11 (TX power)
+  was built for this, but is suspected of one reboot and the test never
+  ran. Suspects in order: radio TX current pulses on the shared supply;
+  ripple from the TPS61240 boost under LED load; I2C activity during
+  conversion.
+
+**Next spin:**
+
+* Give **VLED and the MAXM86161's supply local bulk decoupling**, and keep
+  the boost's switching loop away from the module.
+* Add a **test point on VLED** so ripple can be scoped against the radio.

@@ -80,6 +80,22 @@ uint16_t bt_gatt_get_mtu(struct bt_conn *conn);
 int bt_gatt_notify(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 		   const void *data, uint16_t len);
 
+/* notify_nowait() in ble.c: the callback form, so a sent PDU is counted. */
+typedef void (*bt_gatt_complete_func_t)(struct bt_conn *conn, void *user_data);
+struct bt_gatt_notify_params {
+	const struct bt_uuid *uuid;
+	const struct bt_gatt_attr *attr;
+	const void *data;
+	uint16_t len;
+	bt_gatt_complete_func_t func;
+	void *user_data;
+};
+int bt_gatt_notify_cb(struct bt_conn *conn,
+		      struct bt_gatt_notify_params *params);
+const struct bt_gatt_attr *bt_gatt_find_by_uuid(const struct bt_gatt_attr *attr,
+						uint16_t attr_count,
+						const struct bt_uuid *uuid);
+
 #define BT_GATT_ERR(_att_err)	(-(_att_err))
 
 #define BT_GATT_ATTRIBUTE(_uuid, _perm, _read, _write, _user_data)	\

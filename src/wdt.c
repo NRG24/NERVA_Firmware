@@ -16,11 +16,15 @@
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/logging/log.h>
 
+#include <hal/nrf_wdt.h>
+
 LOG_MODULE_REGISTER(wdt, LOG_LEVEL_INF);
 
 static const struct device *const wdt_dev = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 
-/* Negative until the watchdog is running, so feeding early is harmless. */
+/* Negative until ring_wdt_start(); until then a feed goes to whatever
+ * watchdog the previous image left running -- see kick_inherited().
+ */
 static int wdt_channel = -1;
 
 int ring_wdt_start(void)
@@ -88,9 +92,39 @@ int ring_wdt_start(void)
 	return 0;
 }
 
+/*
+ * Reload a watchdog this image did not start.
+ *
+ * Only a power-on or watchdog reset stops the nRF52 watchdog. A soft reset
+ * -- the one pyOCD issues after flashing, or a fatal-error reboot -- leaves
+ * the previous image's watchdog counting, and nothing in this image can
+ * feed it through the driver until ring_wdt_start() has run. Seen on
+ * hardware 2026-10-07: the first v0.6 boot spent ~4 s formatting the
+ * history partition before ring_wdt_start(), and the v0.5 watchdog it
+ * inherited reset the ring part-way through.
+ *
+ * Every enabled reload register has to be written for a reload to count.
+ * A watchdog that is not running is left alone.
+ */
+static void kick_inherited(void)
+{
+	if (!nrf_wdt_started_check(NRF_WDT)) {
+		return;
+	}
+
+	for (int rr = 0; rr < NRF_WDT_CHANNEL_NUMBER; rr++) {
+		if (nrf_wdt_reload_request_enable_check(
+			    NRF_WDT, (nrf_wdt_rr_register_t)rr)) {
+			nrf_wdt_reload_request_set(NRF_WDT,
+						   (nrf_wdt_rr_register_t)rr);
+		}
+	}
+}
+
 void ring_wdt_feed(void)
 {
 	if (wdt_channel < 0) {
+		kick_inherited();
 		return;
 	}
 

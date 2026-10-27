@@ -37,6 +37,7 @@
 
 #include "ble.h"
 #include "calories.h"
+#include "history.h"
 #include "hr.h"
 #include "hrv.h"
 #include "imu.h"
@@ -45,7 +46,9 @@
 #include "selftest.h"
 #include "sleep.h"
 #include "spo2.h"
+#include "spot.h"
 #include "steps.h"
+#include "thermo.h"
 #include "wdt.h"
 
 #include <zephyr/device.h>
@@ -58,6 +61,9 @@
 #include <zephyr/sys/util.h>
 
 #include <stdlib.h>
+#include <string.h>
+
+#include <mpsl_temp.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -76,8 +82,13 @@ BUILD_ASSERT((int)SLEEP_WEAR_NOT_WORN == RING_WEAR_NOT_WORN);
 
 /* Which LED drives the exposure. LED1 green 530nm gives the best pulse SNR. */
 #define PPG_LED		LEDC_LED1
-/* 0.12 mA per LSB in the 31 mA range: 0x80 is about 15.4 mA. */
-#define PPG_LED_PA	0x80
+/*
+ * Green LED drive, 0.12 mA per LSB in the 31 mA range: 0xFF is ~30.6 mA,
+ * 0x80 ~15.4 mA. See CONFIG_RING_PPG_LED_PA for the trade: the test builds
+ * run 0xFF with 4x averaging (the 2026-10-08 sweep's pick), production a
+ * quarter of that LED energy until an A/B against a WHOOP decides.
+ */
+#define PPG_LED_PA	CONFIG_RING_PPG_LED_PA
 
 /*
  * Drive currents for the SpO2 pair. Starting points, not calibrated: the
@@ -119,13 +130,18 @@ BUILD_ASSERT((int)SLEEP_WEAR_NOT_WORN == RING_WEAR_NOT_WORN);
 /* --- duty cycle defaults, overridable from the app --------------------- */
 
 /*
- * How long the PPG runs each time it wakes. Has to cover DC settling plus
- * enough beats for a stable median: roughly 4 s to settle, then 8 beats,
- * which at 50 bpm is another 10 s.
+ * How long the PPG runs each time it wakes. The v0.6.2 detector (hr.c)
+ * needs 10 s of signal for its first spectrum and three agreeing estimates
+ * after that, so ~12-13 s before any reading; 25 s leaves ~12 s of heart
+ * rate per window. It was 15 s, sized for the old detector, which would
+ * now yield at most a couple of seconds.
  */
-#define MEASURE_WINDOW_MS	15000
-/* How often a measurement window starts while the ring is being worn. */
-#define MEASURE_PERIOD_MS	60000
+#define MEASURE_WINDOW_MS	25000
+/*
+ * How often a measurement window starts while the ring is being worn.
+ * 60 s by default; daily.conf stretches it. See CONFIG_RING_MEASURE_PERIOD_S.
+ */
+#define MEASURE_PERIOD_MS	((uint32_t)CONFIG_RING_MEASURE_PERIOD_S * 1000U)
 /* Abandon a window early if no finger shows up. */
 #define NO_FINGER_TIMEOUT_MS	6000
 /* Charger state is cheap to poll and needs to be responsive. */
@@ -239,6 +255,39 @@ BUILD_ASSERT((int)SLEEP_WEAR_NOT_WORN == RING_WEAR_NOT_WORN);
 #define WEAR_CHECK_INTERVAL_MS	0U
 #define WEAR_CHECK_WINDOW_MS	0U
 #endif
+
+/*
+ * Heart-rate test builds: one window, opened at boot, never closed. Same
+ * 1/0 shape as WEAR_CHECK_ENABLED so the off path is still compiled. See
+ * CONFIG_RING_HR_CONTINUOUS.
+ */
+#if defined(CONFIG_RING_HR_CONTINUOUS)
+#define HR_CONTINUOUS		1
+#else
+#define HR_CONTINUOUS		0
+#endif
+
+/* Demo builds: no window opens unless the app asks. See
+ * CONFIG_RING_PPG_ON_DEMAND.
+ */
+#if defined(CONFIG_RING_PPG_ON_DEMAND)
+#define PPG_ON_DEMAND		1
+#else
+#define PPG_ON_DEMAND		0
+#endif
+
+/*
+ * Red held on while charging; see CONFIG_RING_CHARGE_LED. ~15.4 mA peak in
+ * the 31 mA range, ~2 mA average at led_solid()'s ~12.7 % duty. Higher than
+ * BENCH_LED_PA because the eye is roughly a tenth as sensitive at 660 nm as
+ * at 530 nm, so the green figure would read as barely lit in red.
+ */
+#if defined(CONFIG_RING_CHARGE_LED)
+#define CHARGE_LED		1
+#else
+#define CHARGE_LED		0
+#endif
+#define CHARGE_LED_PA		0x80
 
 /*
  * Shortest window whose DC reading is worth recording. Matches the ~4 s
@@ -443,6 +492,26 @@ static uint32_t measure_window_ms = MEASURE_WINDOW_MS;
 static uint32_t measure_period_ms = MEASURE_PERIOD_MS;
 static atomic_t force_measure;
 
+/* Set by control opcode 0x0C; acted on by the main loop. */
+static atomic_t ship_request;
+
+/*
+ * Opcodes 0x10 (PPG tune) and 0x11 (TX power), handed to the main loop like
+ * everything else that touches I2C or waits on an HCI reply. One atomic
+ * each, with REQ_PENDING marking a request so that 0 means "none":
+ *   ppg_tune_request  REQ_PENDING | pa | led_rge << 8 | adc_rge << 12 |
+ *                     avg_log2 << 16
+ *   tx_power_request  REQ_PENDING | (uint8_t)dbm
+ */
+#define REQ_PENDING		BIT(24)
+static atomic_t ppg_tune_request;
+static atomic_t tx_power_request;
+
+/* Green LED drive for heart-rate windows. Opcode 0x10 changes it; RAM only. */
+static uint8_t ppg_led_pa = PPG_LED_PA;
+/* Ship mode written: stop polling the PMIC, which would park CD low. */
+static bool shipping;
+
 /*
  * steps.c/sleep.c/calories.c have no locking of their own -- unlike
  * latest_status/latest_activity in ble.c, their state is more than one
@@ -506,6 +575,79 @@ static int64_t workout_started_ms;
 /* Heart rate collected by report() once a second, drained every minute. */
 static uint32_t minute_hr_sum_x10;
 static uint16_t minute_hr_count;
+
+/* --- on-ring history --------------------------------------------------- */
+
+/*
+ * One record goes to flash every epoch whether or not a phone is
+ * connected -- see history.h. Heart rate is the mean of report()'s
+ * once-a-second readings over the epoch, collected beside the workout
+ * minute's; the flags are ORed in on every pass by history_epoch().
+ */
+#define HISTORY_EPOCH_MS	((int64_t)CONFIG_RING_HISTORY_EPOCH_S * 1000)
+
+static uint32_t epoch_hr_sum_x10;
+static uint16_t epoch_hr_count;
+static uint8_t epoch_flags;
+/* The rest of a v2 record, gathered the same way. 0 = none for HR. */
+static uint8_t epoch_hr_min;
+static uint8_t epoch_hr_max;
+static int32_t epoch_temp_sum;
+static uint16_t epoch_temp_count;
+static int32_t epoch_skin_sum;
+static uint16_t epoch_skin_count;
+static uint32_t epoch_imu_ms;		/* time covered by accelerometer reads */
+static uint32_t epoch_motion_ms;	/* of which moving */
+static uint8_t epoch_hot_flashes;
+static struct spot_result epoch_spot;	/* last valid night/day reading */
+
+/* --- temperature, hot flashes, spot readings ------------------------------ */
+
+/*
+ * The nRF die temperature, every THERMO_SAMPLE_MS in every state but ship
+ * mode, feeds thermo.c and the history; see thermo.h. ~50 us a read.
+ *
+ * mpsl_temperature_get() is called from the main thread. Its header asks
+ * for MPSL's low-priority context, but Nordic's own sensor driver for the
+ * same peripheral (nrf/drivers/mpsl/temp_nrf5) calls it from whichever
+ * thread fetches the sample, which is what this does without pulling in
+ * the sensor subsystem.
+ */
+#define THERMO_SAMPLE_MS	10000
+
+/*
+ * The PPG sensor face's own temperature, once per window this far in: by
+ * then the part has been powered for a while and is against the skin if
+ * it is going to be. Only kept when the window sees a finger -- otherwise
+ * it is the temperature of the air in front of the sensor.
+ */
+#define SKIN_TEMP_AT_MS		15000
+/* Passes (20 ms each) to wait for that conversion before giving up. */
+#define SKIN_TEMP_MAX_POLLS	10
+
+static int16_t skin_c100 = THERMO_NONE;
+
+/*
+ * The last wear verdict a window produced, judged the way sleep_note_wear()
+ * judges it, at the close of a settled window. Thermo and spot readings
+ * act on it. Cleared on the charger: whatever comes off it has to be
+ * found on a finger again.
+ */
+static bool worn_verdict;
+
+/*
+ * The open spot reading's own RMSSD (see hrv_session). Which reading is
+ * open, if any, is spot_active().
+ */
+static struct hrv_session spot_hrv;
+static struct spot_result last_spot;
+static uint32_t last_spot_uptime_s;
+
+/* Opcode 0x12 and 0x13 settings, handed over from the BT RX thread. */
+#define SPOT_REQ_PENDING	BIT(30)
+static atomic_t spot_cfg_request;
+static atomic_t hot_flash_request;
+static atomic_t spot_now_request;
 
 /*
  * Requested GSR stream state, handed over from the BLE callback.
@@ -591,6 +733,46 @@ static void cb_workout(uint8_t type)
 	}
 }
 
+static void cb_ship_mode(void)
+{
+	atomic_set(&ship_request, 1);
+}
+
+static void cb_ppg_tune(uint8_t led_pa, uint8_t led_rge, uint8_t adc_rge,
+			uint8_t avg_log2)
+{
+	atomic_set(&ppg_tune_request,
+		   REQ_PENDING | led_pa | ((atomic_val_t)led_rge << 8) |
+		   ((atomic_val_t)adc_rge << 12) |
+		   ((atomic_val_t)avg_log2 << 16));
+}
+
+static void cb_tx_power(int8_t dbm)
+{
+	atomic_set(&tx_power_request, REQ_PENDING | (uint8_t)dbm);
+}
+
+/* All three are at most 720, ten bits each. */
+static void cb_spot_config(uint16_t night_min, uint16_t day_min,
+			   uint16_t window_s)
+{
+	atomic_set(&spot_cfg_request,
+		   SPOT_REQ_PENDING | (night_min & 0x3FF) |
+		   ((atomic_val_t)(day_min & 0x3FF) << 10) |
+		   ((atomic_val_t)(window_s & 0x3FF) << 20));
+}
+
+static void cb_hot_flash_config(uint8_t mode, uint8_t rise_c10)
+{
+	atomic_set(&hot_flash_request,
+		   REQ_PENDING | mode | ((atomic_val_t)rise_c10 << 8));
+}
+
+static void cb_spot_now(void)
+{
+	atomic_set(&spot_now_request, 1);
+}
+
 static void cb_stream_gsr(bool on)
 {
 	atomic_set(&gsr_stream_request, on ? 1 : 0);
@@ -619,6 +801,12 @@ static const struct ble_control_cbs control_cbs = {
 	.spo2_mode = cb_spo2_mode,
 	.set_body = cb_set_body,
 	.workout = cb_workout,
+	.ship_mode = cb_ship_mode,
+	.ppg_tune = cb_ppg_tune,
+	.tx_power = cb_tx_power,
+	.spot_config = cb_spot_config,
+	.hot_flash_config = cb_hot_flash_config,
+	.spot_now = cb_spot_now,
 };
 
 /* --- status ------------------------------------------------------------ */
@@ -850,6 +1038,36 @@ static void publish_workout(void)
 	ble_publish_workout(&out);
 }
 
+static void publish_wellness(void)
+{
+	struct ring_wellness w = {
+		.temp_c100 = thermo_temp_c100(),
+		.baseline_c100 = thermo_baseline_c100(),
+		.skin_c100 = skin_c100,
+		.hot_flashes = thermo_hot_flash_count(),
+		.spot_kind = last_spot.kind,
+		.spot_hr_bpm = last_spot.hr_bpm,
+		.spot_rmssd_ms = last_spot.rmssd_ms,
+		.spot_beats = last_spot.beats,
+		.spot_uptime_s = last_spot_uptime_s,
+	};
+
+	if (thermo_ready()) {
+		w.flags |= WELLNESS_FLAG_THERMO_READY;
+	}
+	if (thermo_in_hot_flash()) {
+		w.flags |= WELLNESS_FLAG_HOT_FLASH;
+	}
+	if (spot_active() != SPOT_NONE) {
+		w.flags |= WELLNESS_FLAG_SPOT_RUNNING;
+	}
+	if (last_spot.valid) {
+		w.flags |= WELLNESS_FLAG_SPOT_VALID;
+	}
+
+	ble_publish_wellness(&w);
+}
+
 /* Every call site that used to publish_status() alone now also publishes
  * activity, so the two characteristics never drift out of sync on the app
  * side -- a status update with stale steps/sleep data would be confusing
@@ -968,6 +1186,10 @@ static void report(uint32_t raw)
 	if (beat && hr_last_ibi_trusted(&hr_state)) {
 		hrv_add_interval(hr_last_ibi_ms(&hr_state),
 				 hr_last_ibi_successive(&hr_state));
+		if (spot_active() != SPOT_NONE) {
+			hrv_session_add(&spot_hrv, hr_last_ibi_ms(&hr_state),
+					hr_last_ibi_successive(&hr_state));
+		}
 	}
 
 	win_count++;
@@ -988,6 +1210,23 @@ static void report(uint32_t raw)
 				minute_hr_sum_x10 += bpm_x10;
 				minute_hr_count++;
 			}
+			/* And for the history epoch. */
+			if (epoch_hr_count < UINT16_MAX) {
+				epoch_hr_sum_x10 += bpm_x10;
+				epoch_hr_count++;
+			}
+			{
+				uint8_t bpm = (uint8_t)MIN((bpm_x10 + 5U) / 10U,
+							   UINT8_MAX);
+
+				if (epoch_hr_min == 0 || bpm < epoch_hr_min) {
+					epoch_hr_min = bpm;
+				}
+				if (bpm > epoch_hr_max) {
+					epoch_hr_max = bpm;
+				}
+			}
+			spot_feed_hr(bpm_x10);
 			ble_notify_hr((uint16_t)((bpm_x10 + 5U) / 10U));
 			LOG_INF("dc %d  ac %d  PI %d.%d%%  HR %u.%u bpm %s",
 				dc, amp, pi / 10, pi % 10,
@@ -1088,7 +1327,7 @@ static int ppg_on(bool green_only)
 	if (spo2_window) {
 		err = maxm86161_start_spo2(&ppg, SPO2_IR_PA, SPO2_RED_PA);
 	} else {
-		err = maxm86161_start_ppg(&ppg, PPG_LED, PPG_LED_PA);
+		err = maxm86161_start_ppg(&ppg, PPG_LED, ppg_led_pa);
 	}
 
 	if (err) {
@@ -1114,6 +1353,24 @@ static void ppg_off(void)
 	last_hr_x10 = 0;
 }
 
+/*
+ * Undo the charge indicator on every way out of RING_CHARGING. Releases the
+ * boost enable taken when the state was entered; a bench power LED, if one
+ * is built in, relights on the enable it holds for itself.
+ */
+static void charge_led_off(void)
+{
+	if (!CHARGE_LED) {
+		return;
+	}
+
+	(void)maxm86161_leds_off(&ppg);
+	(void)regulator_disable(VLED_BOOST);
+#if BENCH_POWER_LED
+	(void)maxm86161_led_solid(&ppg, LEDC_LED1, BENCH_LED_PA);
+#endif
+}
+
 static void slow_sense(void)
 {
 	uint8_t pct_of_reg;
@@ -1128,9 +1385,178 @@ static void slow_sense(void)
 		LOG_INF("battery %d mV", mv);
 	}
 
-	int g = selftest_gsr_mv();
+	/* See CONFIG_RING_GSR_STATUS: off in production. */
+	if (IS_ENABLED(CONFIG_RING_GSR_STATUS)) {
+		int g = selftest_gsr_mv();
 
-	gsr_mv = (g >= 0) ? (int16_t)g : -1;
+		gsr_mv = (g >= 0) ? (int16_t)g : -1;
+	} else {
+		gsr_mv = -1;
+	}
+}
+
+/*
+ * Every accelerometer read, idle or measuring: the history's motion share
+ * and a running spot reading's stillness test. Time-weighted, because the
+ * poll runs 5x faster while the ring moves and counting reads would make
+ * every epoch look restless. A gap (charging, a failed read) is charged
+ * at most one second.
+ */
+static void note_motion(int mg, int64_t now)
+{
+	static int64_t last_read;
+	int64_t dt = now - last_read;
+	bool moving = abs(mg - 1000) > STEP_MOTION_MG;
+
+	last_read = now;
+	if (dt < 0 || dt > 1000) {
+		dt = 1000;
+	}
+
+	epoch_imu_ms += (uint32_t)dt;
+	if (moving) {
+		epoch_motion_ms += (uint32_t)dt;
+	}
+	spot_feed_motion(moving);
+}
+
+/*
+ * Close the spot reading the window was taking. `usable` is false when the
+ * window ended some other way than running its course -- a charger, a
+ * dead PPG, ship mode -- and spot.c then retries it sooner.
+ */
+static void finish_spot(int64_t now, bool usable)
+{
+	struct spot_result r;
+
+	if (spot_active() == SPOT_NONE) {
+		return;
+	}
+
+	spot_end(now, hrv_session_rmssd_x10(&spot_hrv),
+		 (uint8_t)MIN(hrv_session_diffs(&spot_hrv), UINT8_MAX),
+		 usable && !calories_workout_active(), &r);
+
+	last_spot = r;
+	last_spot_uptime_s = (uint32_t)(now / 1000);
+
+	/* A hot-flash reading is not a resting one; its heart rate is
+	 * already in the epoch's hr fields. A manual one is an awake
+	 * reading like a day one, and goes in the record as one.
+	 */
+	if (r.valid && r.kind != SPOT_HOT_FLASH) {
+		epoch_spot = r;
+	}
+
+	LOG_INF("spot %s: HR %u, RMSSD %u ms over %u, motion %u%% -> %s",
+		r.kind == SPOT_NIGHT ? "night" : r.kind == SPOT_DAY ? "day"
+		: r.kind == SPOT_MANUAL ? "manual" : "hot flash",
+		r.hr_bpm, r.rmssd_ms, r.beats, r.motion_pct,
+		r.valid ? "kept" : "rejected");
+
+	publish_wellness();
+}
+
+/*
+ * Write one history record per CONFIG_RING_HISTORY_EPOCH_S.
+ *
+ * Called on every pass, not just when a record is due: the charging,
+ * asleep and workout flags mean "at any point in the epoch", so every pass
+ * has to be looked at. The worn flag is set where a window finds a finger.
+ *
+ * BLOCKING: history_append() erases a 4 kB page (~85 ms, a little more
+ * with the radio's flash timeslots) once every 128 records -- 10.7 hours
+ * at the default epoch -- and otherwise writes 32 bytes.
+ */
+static void history_epoch(int64_t now, int64_t *next_epoch,
+			  uint32_t *steps_at_epoch)
+{
+	if (state == RING_CHARGING) {
+		epoch_flags |= HIST_FLAG_CHARGING;
+	}
+	if (sleep_is_asleep()) {
+		epoch_flags |= HIST_FLAG_ASLEEP;
+	}
+	if (calories_workout_active()) {
+		epoch_flags |= HIST_FLAG_WORKOUT;
+	}
+	if (thermo_in_hot_flash()) {
+		epoch_flags |= HIST_FLAG_HOT_FLASH;
+	}
+
+	if (now < *next_epoch) {
+		return;
+	}
+
+	*next_epoch = now + HISTORY_EPOCH_MS;
+
+	uint32_t steps_now = steps_count();
+	/* Clamped: opcode 0x07 can zero the counter mid-epoch. */
+	uint32_t steps = (steps_now >= *steps_at_epoch)
+			 ? steps_now - *steps_at_epoch : 0;
+	uint32_t hr_bpm = (epoch_hr_count > 0)
+			  ? (epoch_hr_sum_x10 / epoch_hr_count + 5U) / 10U : 0;
+	/*
+	 * RMSSD is a rolling window that keeps its last value between
+	 * windows, so it is only recorded for an epoch that saw beats --
+	 * otherwise every quiet epoch would repeat the last one.
+	 */
+	uint32_t rmssd_ms = (epoch_hr_count > 0)
+			    ? (hrv_rmssd_x10() + 5U) / 10U : 0;
+
+	struct hist_record rec = {
+		.hr_bpm = (uint8_t)MIN(hr_bpm, UINT8_MAX),
+		.hr_min_bpm = epoch_hr_min,
+		.hr_max_bpm = epoch_hr_max,
+		.rmssd_ms = (uint8_t)MIN(rmssd_ms, UINT8_MAX),
+		.steps = (uint16_t)MIN(steps, UINT16_MAX),
+		.temp_c100 = epoch_temp_count
+			     ? (int16_t)(epoch_temp_sum / epoch_temp_count)
+			     : HIST_TEMP_NONE,
+		.skin_c100 = epoch_skin_count
+			     ? (int16_t)(epoch_skin_sum / epoch_skin_count)
+			     : HIST_TEMP_NONE,
+		.rest_hr_bpm = epoch_spot.hr_bpm,
+		.rest_rmssd_ms = epoch_spot.rmssd_ms,
+		.rest_beats = epoch_spot.beats,
+		.temp_rise_c10 = thermo_take_peak_rise_c10(),
+		/* 255: no accelerometer reads at all, as on the charger. */
+		.motion_pct = epoch_imu_ms
+			      ? (uint8_t)((uint64_t)epoch_motion_ms * 100U /
+					  epoch_imu_ms)
+			      : 255U,
+		.battery_20mv = (uint8_t)MIN(battery_mv / 20U, UINT8_MAX),
+		.flags = epoch_flags,
+		.hot_flashes = epoch_hot_flashes,
+	};
+
+	if (epoch_spot.kind == SPOT_NIGHT) {
+		rec.flags |= HIST_FLAG_SPOT_NIGHT;
+	} else if (epoch_spot.kind == SPOT_DAY ||
+		   epoch_spot.kind == SPOT_MANUAL) {
+		rec.flags |= HIST_FLAG_SPOT_DAY;
+	}
+
+	*steps_at_epoch = steps_now;
+	epoch_hr_sum_x10 = 0;
+	epoch_hr_count = 0;
+	epoch_flags = 0;
+	epoch_hr_min = 0;
+	epoch_hr_max = 0;
+	epoch_temp_sum = 0;
+	epoch_temp_count = 0;
+	epoch_skin_sum = 0;
+	epoch_skin_count = 0;
+	epoch_imu_ms = 0;
+	epoch_motion_ms = 0;
+	epoch_hot_flashes = 0;
+	memset(&epoch_spot, 0, sizeof(epoch_spot));
+
+	int err = history_append(&rec);
+
+	if (err) {
+		LOG_WRN("history: epoch not stored (%d)", err);
+	}
 }
 
 /*
@@ -1184,6 +1610,8 @@ int main(void)
 	int64_t next_imu_retry = 0;
 	int64_t next_activity_min = 0;
 	int64_t next_gsr_sample = 0;
+	int64_t next_history = 0;
+	uint32_t steps_at_epoch = 0;
 	int64_t window_started = 0;
 	int64_t last_motion = 0;
 	int64_t last_step_motion = 0;
@@ -1196,6 +1624,10 @@ int main(void)
 	bool wear_check_window = false;
 	/* Last time an open window saw a finger; see WORKOUT_NO_FINGER_MS. */
 	int64_t last_finger_seen = 0;
+	int64_t next_temp = 0;
+	/* SKIN_TEMP_AT_MS: 0 not yet, 1 converting, 2 done this window. */
+	int skin_temp_step = 0;
+	int skin_temp_polls = 0;
 
 	LOG_INF("ring firmware starting");
 	report_reset_cause();
@@ -1288,6 +1720,17 @@ int main(void)
 	}
 
 	/*
+	 * Before the watchdog: the first boot of this layout formats the
+	 * history partition, ~4 s of page erases. Every boot after that is a
+	 * few milliseconds of scanning. A failure costs the history and
+	 * nothing else -- appends then return -ENODEV and are logged.
+	 */
+	if (history_init() != 0) {
+		LOG_ERR("history unavailable -- nothing will be stored while "
+			"no phone is connected");
+	}
+
+	/*
 	 * Three quick attempts, not sixty slow ones. ppg_on() re-probes when a
 	 * window opens, so a sensor that is late or briefly wedged is no longer
 	 * written off until the next reset.
@@ -1366,6 +1809,8 @@ int main(void)
 
 	hrv_init();
 	spo2_init();
+	thermo_init();
+	spot_init();
 
 	/* Nothing to measure yet: shut the optics down and wait for motion. */
 	ppg_off();
@@ -1388,7 +1833,12 @@ int main(void)
 	 * at 0 this would instead depend on how long boot happened to take.
 	 */
 	last_step_motion = k_uptime_get();
-	next_window = k_uptime_get() + measure_period_ms;
+	next_window = k_uptime_get() + (HR_CONTINUOUS ? 0 : measure_period_ms);
+
+	if (HR_CONTINUOUS) {
+		LOG_WRN("HR_CONTINUOUS test build: PPG and boost run "
+			"permanently, HRS notifies every second -- not for use");
+	}
 
 	/*
 	 * A minute from now, not immediately. The other periodic timers start
@@ -1397,6 +1847,9 @@ int main(void)
 	 * a minute of resting calories to a minute that has not happened.
 	 */
 	next_activity_min = k_uptime_get() + 60000;
+
+	/* Same reasoning: the first record covers a full epoch. */
+	next_history = k_uptime_get() + HISTORY_EPOCH_MS;
 
 	/*
 	 * Watchdog last, once every subsystem has had its chance.
@@ -1472,10 +1925,25 @@ int main(void)
 		 * magnitude below the margin -- but it is a blocking call, so
 		 * it is recorded here.
 		 *
+		 * history_epoch() is the same order of cost: one page erase,
+		 * ~85 ms, once every 128 records, and a 32-byte write
+		 * otherwise. Recorded here for the same reason.
+		 *
+		 * The temperature sample is ~50 us with no I2C. The sensor-face
+		 * temperature is two or three MAXM86161 register accesses once
+		 * per window, and only on a pass whose FIFO read just succeeded,
+		 * so a stalled bus fails the FIFO first and never reaches them.
+		 *
 		 * Add a blocking call longer than the remaining margin and either
 		 * put a feed beside it or raise CONFIG_RING_WATCHDOG_TIMEOUT_MS.
 		 */
 		ring_wdt_feed();
+
+		/* Keep the wall clock where a soft reset will not clear it. */
+		history_clock_save();
+
+		/* Advertising and connection-interval power management. */
+		ble_service(now);
 
 		/*
 		 * --- activity control, checked in every state ---
@@ -1494,6 +1962,7 @@ int main(void)
 			sleep_reset();
 			calories_reset();
 			steps_at_last_min = 0;
+			steps_at_epoch = 0;
 			LOG_INF("activity counters reset (app request)");
 		}
 
@@ -1557,8 +2026,123 @@ int main(void)
 		service_gsr_stream(now, &next_gsr_sample);
 		ring_wdt_feed();	/* the start path holds 800 ms */
 
+		/*
+		 * --- ship mode, on request (control opcode 0x0C) ---
+		 *
+		 * Optics and the boost off first, so nothing is lit or drawing
+		 * when the battery goes. On battery the PMIC write is the last
+		 * thing that runs; on a charger the ring carries on until it is
+		 * unplugged, so stop polling the PMIC -- pmic_service() would
+		 * park CD low for charging, and ship mode needs CD high.
+		 */
+		/*
+		 * --- PPG tune and TX power, on request (opcodes 0x10, 0x11) ---
+		 *
+		 * A green window already running is restarted, so a sweep sees
+		 * each setting within one pass instead of at the next window.
+		 * That re-primes the beat detector: the first ~10 s after a
+		 * change carry no heart rate. An SpO2 window is left alone; the
+		 * tune never applies to it.
+		 */
+		{
+			atomic_val_t t = atomic_set(&ppg_tune_request, 0);
+
+			if (t & REQ_PENDING) {
+				struct maxm86161_ppg_tune tune = {
+					.led_rge = (uint8_t)((t >> 8) & 0x0F),
+					.adc_rge = (uint8_t)((t >> 12) & 0x0F),
+					.avg_log2 = (uint8_t)((t >> 16) & 0x0F),
+				};
+
+				if (maxm86161_set_ppg_tune(&tune) != 0) {
+					LOG_WRN("PPG tune refused: out of range");
+				} else {
+					ppg_led_pa = (uint8_t)t;
+					if (state == RING_MEASURING && !spo2_window) {
+						int rc = maxm86161_start_ppg(
+							&ppg, PPG_LED, ppg_led_pa);
+
+						if (rc) {
+							LOG_ERR("PPG restart after tune "
+								"failed (%d)", rc);
+						}
+						hr_init(&hr_state, SAMPLE_RATE_HZ);
+					}
+				}
+			}
+
+			atomic_val_t p = atomic_set(&tx_power_request, 0);
+
+			if (p & REQ_PENDING) {
+				int8_t want = (int8_t)(uint8_t)p;
+				int8_t got = 0;
+				int rc = ble_set_tx_power(want, &got);
+
+				if (rc) {
+					LOG_WRN("TX power %d dBm failed (%d)", want,
+						rc);
+				} else {
+					LOG_INF("TX power now %d dBm (asked %d)", got,
+						want);
+				}
+			}
+		}
+
+		/* --- spot schedule and hot-flash settings (0x12, 0x13) --- */
+		{
+			atomic_val_t c = atomic_set(&spot_cfg_request, 0);
+
+			if (c & SPOT_REQ_PENDING) {
+				struct spot_config cfg = {
+					.night_min = (uint16_t)(c & 0x3FF),
+					.day_min = (uint16_t)((c >> 10) & 0x3FF),
+					.window_s = (uint16_t)((c >> 20) & 0x3FF),
+				};
+
+				if (spot_set_config(&cfg) != 0) {
+					LOG_WRN("spot schedule refused");
+				}
+			}
+
+			atomic_val_t h = atomic_set(&hot_flash_request, 0);
+
+			if (h & REQ_PENDING) {
+				if (thermo_set_config((uint8_t)h,
+						      (uint8_t)(h >> 8)) != 0) {
+					LOG_WRN("hot-flash settings refused");
+				}
+				publish_wellness();
+			}
+
+			if (atomic_cas(&spot_now_request, 1, 0)) {
+				spot_request_now();
+			}
+		}
+
+		if (atomic_cas(&ship_request, 1, 0) && !shipping) {
+			LOG_WRN("ship mode: optics off, disconnecting battery");
+			if (state == RING_MEASURING) {
+				ppg_off();
+				state = RING_IDLE;
+			} else if (state == RING_CHARGING) {
+				charge_led_off();
+			}
+
+			int ship_rc = pmic_ship_mode(I2C_BUS);
+
+			if (ship_rc) {
+				LOG_ERR("ship mode: PMIC write failed (%d), "
+					"staying on", ship_rc);
+			} else {
+				shipping = true;
+				LOG_WRN("ship mode armed: off now on battery, or "
+					"when the charger is unplugged. Plug the "
+					"charger in to wake it.");
+			}
+		}
+
 		/* --- charger, checked in every state --- */
-		if (now >= next_pmic) {
+		if (now >= next_pmic && !shipping) {
 			bool charging = false;
 			int pmic_rc = pmic_service(I2C_BUS, &charging);
 
@@ -1602,6 +2186,7 @@ int main(void)
 							"confirmed",
 							(PMIC_FAIL_LIMIT *
 							 PMIC_POLL_MS) / 1000U);
+						charge_led_off();
 						state = RING_IDLE;
 						next_window = now;
 						publish_all();
@@ -1631,22 +2216,38 @@ int main(void)
 					}
 					LOG_INF("state -> %s",
 						state_name[RING_CHARGING]);
+					worn_verdict = false;
 					(void)regulator_enable(VLED_BOOST);
 					k_msleep(20);
-					(void)maxm86161_indicate(&ppg, LEDC_LED3,
-								3000);
-					(void)regulator_disable(VLED_BOOST);
+					if (CHARGE_LED) {
+						/*
+						 * Red until the charger comes off.
+						 * This boost enable is held, and
+						 * charge_led_off() releases it.
+						 */
+						(void)maxm86161_led_solid(
+							&ppg, LEDC_LED3,
+							CHARGE_LED_PA);
+					} else {
+						(void)maxm86161_indicate(
+							&ppg, LEDC_LED3, 3000);
+						(void)regulator_disable(VLED_BOOST);
 #if BENCH_POWER_LED
-					/* indicate() ends in leds_off; relight. */
-					(void)maxm86161_led_solid(&ppg, LEDC_LED1,
-								 BENCH_LED_PA);
+						/* indicate() ends in leds_off;
+						 * relight.
+						 */
+						(void)maxm86161_led_solid(
+							&ppg, LEDC_LED1,
+							BENCH_LED_PA);
 #endif
+					}
 					state = RING_CHARGING;
 					publish_all();
 				} else if (!charging &&
 					   state == RING_CHARGING) {
 					LOG_INF("state -> %s",
 						state_name[RING_IDLE]);
+					charge_led_off();
 					state = RING_IDLE;
 					next_window = now;
 					publish_all();
@@ -1733,6 +2334,54 @@ int main(void)
 			next_activity_min = now + 60000;
 
 			log_activity();
+			publish_wellness();
+		}
+
+		/* --- temperature and hot flashes, every THERMO_SAMPLE_MS --- */
+		if (!shipping && now >= next_temp) {
+			int16_t t = (int16_t)(mpsl_temperature_get() * 25);
+			bool was_in_flash = thermo_in_hot_flash();
+
+			next_temp = now + THERMO_SAMPLE_MS;
+			if (epoch_temp_count < UINT16_MAX) {
+				epoch_temp_sum += t;
+				epoch_temp_count++;
+			}
+
+			thermo_feed(t, now, worn_verdict,
+				    state == RING_CHARGING ||
+				    calories_workout_active(),
+				    sleep_is_asleep());
+
+			if (thermo_take_hot_flash_start()) {
+				epoch_flags |= HIST_FLAG_HOT_FLASH;
+				if (epoch_hot_flashes < UINT8_MAX) {
+					epoch_hot_flashes++;
+				}
+				int tc = thermo_temp_c100();
+				int bc = thermo_baseline_c100();
+
+				/* Sign apart: -0.50 would print as 0.50. */
+				LOG_INF("hot flash: %s%d.%02d C, baseline "
+					"%s%d.%02d C", tc < 0 ? "-" : "",
+					abs(tc) / 100, abs(tc) % 100,
+					bc < 0 ? "-" : "", abs(bc) / 100,
+					abs(bc) % 100);
+				spot_request_hot_flash();
+			}
+			if (thermo_in_hot_flash() != was_in_flash) {
+				publish_wellness();
+			}
+		}
+
+		/*
+		 * --- history, every epoch ---
+		 *
+		 * Not once ship mode is armed: the ring is about to lose power
+		 * and has nothing left to measure.
+		 */
+		if (!shipping) {
+			history_epoch(now, &next_history, &steps_at_epoch);
 		}
 
 		/*
@@ -1746,6 +2395,16 @@ int main(void)
 		 */
 		imu_wake_diag();
 		selftest_gsr_monitor();
+
+		/*
+		 * Every way out of a window but its normal close -- a charger, a
+		 * PPG that stopped answering, ship mode -- lands here with a
+		 * spot reading still marked open. Close it as unusable, or
+		 * spot.c would wait on it for ever.
+		 */
+		if (state != RING_MEASURING) {
+			finish_spot(now, false);
+		}
 
 		switch (state) {
 		case RING_CHARGING:
@@ -1892,6 +2551,7 @@ int main(void)
 				}
 				steps_update(mg, now);
 				sleep_feed(mg, now);
+				note_motion(mg, now);
 			}
 
 			if (ble_imu_streaming()) {
@@ -1910,8 +2570,20 @@ int main(void)
 			}
 
 			bool forced = atomic_cas(&force_measure, 1, 0);
-			bool stale = (now - last_motion) > STILL_TIMEOUT_MS;
-			bool scheduled = (now >= next_window) && !stale;
+			/*
+			 * A continuous test build is never stale: its window
+			 * only reaches IDLE if the PPG failed, and next_window
+			 * still spaces those retries a period apart.
+			 */
+			bool stale = !HR_CONTINUOUS &&
+				     (now - last_motion) > STILL_TIMEOUT_MS;
+			/*
+			 * An on-demand build never schedules: only `forced`
+			 * below -- PPG streaming or measure-now -- opens a
+			 * window.
+			 */
+			bool scheduled = !PPG_ON_DEMAND &&
+					 (now >= next_window) && !stale;
 
 			/*
 			 * The one thing that opens a window while the ring is
@@ -1940,28 +2612,62 @@ int main(void)
 			bool workout_due = calories_workout_active() &&
 					   now >= next_window;
 
-			bool wear_only = wear_due && !forced && !scheduled &&
+			/*
+			 * A spot reading takes the place of a scheduled window
+			 * that falls due at the same moment -- it is the same
+			 * green window, only longer -- but never of one the app
+			 * asked for, or of a workout window. On-demand builds
+			 * take none.
+			 */
+			struct spot_inputs spot_in = {
+				.now_ms = now,
+				.asleep = sleep_is_asleep(),
+				.worn = worn_verdict,
+				.still_ms = now - last_step_motion,
+				.blocked = shipping || PPG_ON_DEMAND ||
+					   calories_workout_active(),
+			};
+			enum spot_kind spot = spot_due(&spot_in);
+			bool spot_only = spot != SPOT_NONE && !forced &&
 					 !workout_due;
 
-			if (forced || scheduled || wear_due || workout_due) {
-				if (ppg_on(wear_only ||
+			bool wear_only = wear_due && !forced && !scheduled &&
+					 !workout_due && spot == SPOT_NONE;
+
+			/* Nothing lights up once ship mode is armed and the ring
+			 * is only waiting for its charger to be unplugged.
+			 */
+			if (!shipping &&
+			    (forced || scheduled || wear_due || workout_due ||
+			     spot_only)) {
+				if (ppg_on(wear_only || spot_only ||
 					   calories_workout_active()) == 0) {
 					state = RING_MEASURING;
 					window_started = now;
 					last_finger_seen = now;
 					wear_check_window = wear_only;
 					waiting_for_finger = !forced && !wear_only;
+					skin_temp_step = 0;
+					skin_temp_polls = 0;
 					/* Each window gets its own budget of
 					 * accelerometer retries.
 					 */
 					act_fail_count = 0;
+					if (spot_only) {
+						spot_begin(spot, now);
+						hrv_session_begin(&spot_hrv);
+					}
 					LOG_INF("state -> %s%s", state_name[state],
 						forced ? " (app requested)"
+						: spot_only ? " (spot reading)"
 						: wear_only ? " (sleep wear check)"
 						: "");
 					publish_all();
 				} else {
 					next_window = now + measure_period_ms;
+					if (spot_only) {
+						spot_not_started(spot, now);
+					}
 
 					/*
 					 * Restart the interval so a PPG that
@@ -2083,9 +2789,49 @@ int main(void)
 					}
 					steps_update(act_mg, now);
 					sleep_feed(act_mg, now);
+					note_motion(act_mg, now);
 				} else {
 					/* Bounded by the enclosing condition. */
 					act_fail_count++;
+				}
+			}
+
+			/*
+			 * Sensor-face temperature, once per window. Only on a
+			 * pass whose FIFO read worked: see the blocking audit.
+			 */
+			if (count > 0 && skin_temp_step == 0 &&
+			    (now - window_started) >= SKIN_TEMP_AT_MS) {
+				skin_temp_step =
+					maxm86161_temp_start(&ppg) == 0 ? 1 : 2;
+			} else if (count > 0 && skin_temp_step == 1) {
+				int16_t c100;
+				int rc = maxm86161_temp_read(&ppg, &c100);
+
+				/*
+				 * A conversion takes about a millisecond, so
+				 * one poll a pass normally finds it done.
+				 * A part reset or shut down mid-conversion
+				 * may never clear TEMP_EN; give up rather
+				 * than read it every pass for the rest of
+				 * the window.
+				 */
+				if (rc != -EBUSY ||
+				    ++skin_temp_polls >= SKIN_TEMP_MAX_POLLS) {
+					skin_temp_step = 2;
+				}
+				/*
+				 * 15-45 C: a part reset mid-conversion (a PPG
+				 * tune restarts it) reads back 0.00 C.
+				 */
+				if (rc == 0 && c100 > 1500 && c100 < 4500 &&
+				    (spo2_window ? spo2_finger_present()
+						 : hr_finger_present(&hr_state))) {
+					skin_c100 = c100;
+					if (epoch_skin_count < UINT16_MAX) {
+						epoch_skin_sum += c100;
+						epoch_skin_count++;
+					}
 				}
 			}
 
@@ -2093,6 +2839,7 @@ int main(void)
 					: hr_finger_present(&hr_state)) {
 				waiting_for_finger = false;
 				last_finger_seen = now;
+				epoch_flags |= HIST_FLAG_WORN;
 
 				/*
 				 * A wear check must NOT refresh last_motion,
@@ -2122,15 +2869,20 @@ int main(void)
 
 			/*
 			 * A wear check runs only as long as the DC tracker needs
-			 * to settle; it is not trying to find a heart rate.
+			 * to settle; it is not trying to find a heart rate. A
+			 * spot reading runs its own length, or until motion has
+			 * already spoilt it.
 			 */
 			uint32_t window_len = wear_check_window
 					    ? WEAR_CHECK_WINDOW_MS
+					    : spot_active() != SPOT_NONE
+					    ? spot_window_ms()
 					    : measure_window_ms;
 
 			bool give_up = waiting_for_finger &&
 				(now - window_started) > NO_FINGER_TIMEOUT_MS;
-			bool done = (now - window_started) >= window_len;
+			bool done = (now - window_started) >= window_len ||
+				    spot_should_stop();
 
 			/*
 			 * A workout window runs until the workout ends, unless
@@ -2153,8 +2905,13 @@ int main(void)
 				       WORKOUT_NO_FINGER_MS;
 			}
 
-			/* Keep measuring as long as the app wants raw data. */
-			if (ble_ppg_streaming()) {
+			/*
+			 * Keep measuring as long as the app wants raw data, or
+			 * for good in a continuous test build -- except a wear
+			 * check, which has its own short length.
+			 */
+			if (ble_ppg_streaming() ||
+			    (HR_CONTINUOUS && !wear_check_window)) {
 				done = false;
 				give_up = false;
 			}
@@ -2193,12 +2950,14 @@ int main(void)
 					       WEAR_SETTLE_MS;
 
 				if (settled && hr_primed(&hr_state)) {
-					sleep_note_wear(
-						hr_finger_present(&hr_state), now);
+					worn_verdict =
+						hr_finger_present(&hr_state);
+					sleep_note_wear(worn_verdict, now);
 				} else {
 					sleep_note_wear_unavailable(now);
 				}
 
+				finish_spot(now, true);
 				ppg_off();
 				state = RING_IDLE;
 				next_window = now + measure_period_ms;

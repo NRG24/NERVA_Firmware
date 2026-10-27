@@ -38,6 +38,21 @@ LOG_MODULE_REGISTER(imu, LOG_LEVEL_INF);
 /* CTRL1: OP_MODE_XL 000 (high performance) | ODR_XL 0110 (120 Hz) */
 #define CTRL1_120HZ_HP		0x06
 
+/*
+ * CTRL1: OP_MODE_XL 101 (low power, 4-sample average) | ODR_XL 0101
+ * (60 Hz). Field layout and codes from ST's own LSM6DSV16BX driver
+ * (lsm6dsv16bx_reg.h: odr_xl bits 0-3, op_mode_xl bits 4-6,
+ * LOW_POWER_4_AVG_MD = 0x5, ODR_AT_60Hz = 0x5), checked 2026-10-15 because
+ * the datasheet filed here is the LSM6DSV, not the 16BX on the board.
+ *
+ * The LSM6DSV datasheet puts this at ~20 uA against 190 uA for high
+ * performance -- and the accelerometer runs all day, for wake-on-motion
+ * and steps, so that difference is several mAh a day. 60 Hz is still well
+ * above what the step counter needs (a sample every 60 ms or faster).
+ * See CONFIG_RING_IMU_LOW_POWER.
+ */
+#define CTRL1_60HZ_LP4		0x55
+
 #define FUNC_INTERRUPTS_ENABLE	BIT(7)
 #define IF_CFG_H_LACTIVE	BIT(5)
 #define IF_CFG_PP_OD		BIT(4)
@@ -130,7 +145,8 @@ int imu_init(const struct device *i2c)
 	 */
 	(void)wr(REG_CTRL3, BIT(6) | BIT(2));
 
-	return wr(REG_CTRL1, CTRL1_120HZ_HP);
+	return wr(REG_CTRL1, IS_ENABLED(CONFIG_RING_IMU_LOW_POWER)
+			     ? CTRL1_60HZ_LP4 : CTRL1_120HZ_HP);
 }
 
 int imu_read_accel(struct imu_accel *out)

@@ -1174,6 +1174,32 @@ int pmic_service(const struct device *i2c, bool *charging)
 	return 0;
 }
 
+/*
+ * Ship mode: the PMIC latches its BAT FET off and draws ~150 nA until a
+ * charger is plugged in (datasheet 9.3.1). This board has no MR button, so
+ * the charger is the only way back.
+ *
+ * Entry needs VIN absent, CD high and MR high, held for tQUIET (1 ms); CD
+ * high is also what keeps the PMIC's I2C alive on battery. With a charger
+ * attached the bit is accepted and the PMIC enters ship mode when the
+ * charger is removed -- provided CD is still high then, so the caller must
+ * stop calling pmic_service(), which parks CD low for charging.
+ *
+ * On battery the write is the last thing the MCU does: SYS, and the MCU
+ * with it, go down about a millisecond later.
+ */
+int pmic_ship_mode(const struct device *i2c)
+{
+	const struct device *gpio1 = DEVICE_DT_GET(DT_NODELABEL(gpio1));
+	/* Every other bit of register 0x00 is read-only. */
+	uint8_t w[2] = { PMIC_REG_STATUS, BIT(5) };	/* EN_SHIPMODE */
+
+	gpio_pin_configure(gpio1, CD_PIN, GPIO_OUTPUT_ACTIVE);
+	k_msleep(5);
+
+	return i2c_write(i2c, w, sizeof(w), PMIC_ADDR);
+}
+
 #if defined(CONFIG_RING_BENCH)
 void selftest_run(const struct device *i2c)
 {

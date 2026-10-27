@@ -115,7 +115,7 @@ Three states in `main.c`:
 | State | Behaviour |
 |---|---|
 | `RING_IDLE` | PPG off, boost disabled, IMU wake armed. CPU sleeps. |
-| `RING_MEASURING` | 15 s window every 60 s (25% duty). Gives up after 6 s if no finger. |
+| `RING_MEASURING` | 25 s window every 60 s (~42% duty; 15 s before v0.6.2). Gives up after 6 s if no finger. |
 | `RING_CHARGING` | All optics off. Red LED flashes 3 s when charger detected. |
 
 Duty cycle is runtime-adjustable from the app (control opcode `0x04`).
@@ -290,6 +290,103 @@ stuck SDA was the same bad joint.
   hardware cannot provide. HRS and BAS are deliberately still open.
 * Respin the PCB with the nine changes in `HARDWARE_NOTES.md`, especially
   the debug connector and the TS divider
+* **v0.6 on-ring history (2026-10-07): working on ring 2.**
+  `src/history.c` keeps a 16-byte record every 5 min in a new 176 kB
+  partition at `0x50000` (the image shrank to 320 kB; bonds untouched at
+  `0x7c000`), and the phone syncs it with opcodes `0x0D`/`0x0E` --
+  `APP_INTEGRATION.md` §16. First boot formats the partition (~4 s). To
+  verify at the jig: flash `release/ring-fw-v0.6.1-daily.hex`, watch RTT for
+  `history: ... records, next seq ...`, leave it 15 min, then
+  `python tools/history_sync.py` should show 3 contiguous records with
+  good CRCs. `tests/test_history.c` covers the ring buffer against a fake
+  flash but has not been run (no host compiler on the PC).
+  **Verified on ring 2, 2026-10-07:** 58 records synced in 0.1 s, no bad
+  CRCs, no gaps; dating of the current boot's records correct. The first
+  flash also exposed an inherited-watchdog reset during the format, fixed
+  in `wdt.c` (`kick_inherited()`).
+* **Heart rate is not usable yet (2026-10-07, ring 2 vs a WHOOP).** The
+  ring read about half, then about double, a steady 67-78 bpm. Raw PPG
+  shows ~10 % single-sample glitches on a 70 ms rhythm (electrical) and a
+  pulse barely above drift: pulse SNR -9 to -16 dB. v0.6.1 adds opcodes
+  `0x10` (LED current / ADC range / averaging) and `0x11` (TX power) so
+  `tools/ppg_sweep.py` can tune the front end and test whether the
+  glitches follow the radio, one flash instead of one per setting.
+* **v0.6.2 (2026-10-08): new heart-rate detector, built, not yet flashed.**
+  The sweep showed the signal carried the true rate (50-100 % of 10 s
+  windows with a still hand) while the old detector was 25-57 bpm off, so
+  `src/hr.c` was rewritten: median-of-5 despike, band-pass, a 10 s
+  Goertzel spectrum once a second, confidence gates, median of recent
+  estimates; beats for HRV are trusted only against the spectral rate.
+  Replayed against the WHOOP recordings (`tools/hr_eval.py`, which builds
+  the real hr.c with Clang): 6.8 bpm mean error / 60 % within 5 bpm,
+  against 46 bpm / 0 % for the old one. Defaults moved with it: 31 mA,
+  4x on-chip averaging (glitches ~22 % -> ~3 %), 25 s windows. Host tests
+  now run on this PC: `pip install ziglang`, then
+  `python tests/run_tests.py` -- all 7 suites pass, including
+  `test_history` for the first time. Opcode `0x11` (TX power) is still
+  suspected of one reboot; untested since.
+  **Flashed on ring 2 (2026-10-08). Live against a WHOOP: 4.3 bpm mean
+  error, 68 % within 5 bpm, reading 71 % of the time.**
+* **Test firmware frozen, 2026-10-12:** `../ring-fw-test-v0.6.2/` (see its
+  FROZEN.md), with the exact hex on ring 2 hash-verified. This tree is
+  production from here on.
+* **v0.7.0 production (2026-10-12): built, not flashed.**
+  `.\build.ps1` now uses `prod.conf`, which sets +8 dBm, a 25 s window every
+  300 s, the charge LED, and no GSR status sampling or diagnostic opcodes.
+  The new options default to the old behaviour, so the test builds resolve
+  to the v0.6.2 configuration exactly (verified by diffing the resolved
+  .config). Two source changes are shared by every build:
+  * **Steps are rhythm-gated.** The user reported the step count as
+    "garbage". In simulation, 30 min of hand movement read as 545 steps.
+    `steps.c` now holds candidates until 8 arrive in rhythm, then credits
+    them. The same simulation now reads 0, and simulated walks stay within
+    1-3 %. Pinned by `test_no_steps_from_hand_movement`. Real-walk
+    validation still to do, with `tools/steps_record.py` and
+    `tools/steps_eval.py` (which also replays the frozen counter).
+  * Heart-rate bias checked: there is no consistent offset (-3.4 to +2.9
+    bpm per clean recording). A differenced spectrum was tried and
+    rejected.
+* **2026-10-15, more v0.7.0 work (host-tested, still not flashed).
+  `ROADMAP.md` is the game plan; read it next.**
+  * `test_hr` found two detector bugs, both fixed. Spectral averaging cut
+    false readings on noise from 50 % to 5 %.
+  * Steps credit a missed footfall.
+  * Power: advertising slows after 30 s; the connection interval is
+    managed; the accelerometer runs in low-power mode at 60 Hz (CTRL1 0x55,
+    from ST's 16BX driver, **unverified on hardware**); the PPG runs 15 mA
+    with 2x averaging (provisional). Estimates are in `POWER.md`.
+  * New docs: `ANTENNA_TUNING.md` (there is no pi network; the knob is the
+    ANT_PCB strip), `POWER.md`, `ROADMAP.md`. `HARDWARE_NOTES` gains items
+    14 and 15, and §12's "do not change R5" is superseded.
+  * New tools: `ppg_sweep.py --ab`, `prod_check.py`, `rssi_ab.py`,
+    `gerber_render.py`. `tests/run_tests.py` now runs the syntax pass too.
+* **2026-10-24: every MAXM86161 on hand is dead.** Board 3 got v0.7.0
+  flashed and its green/red LED test lit once, but the modules tried since
+  give no light. The boards are fine (5 V boost present). Replacements are
+  ordered; nothing that needs a heart rate or a wear verdict can be tested
+  until they arrive.
+* **v0.8.0 production (2026-10-25): built, not flashed.**
+  `release/ring-fw-v0.8.0-prod.hex`. For the app's burnout, stress and
+  night hot-flash features; the app-side design is
+  `../mac-handoff/WELLNESS_ANALYTICS.md`.
+  * **History v2:** 32-byte records (HR min/max, temperatures, motion,
+    spot readings, hot flashes), packet `0x03`, 19 days. **The first boot
+    reformats a v1 log: sync before flashing.** Offsets pinned by
+    `_Static_assert`s in `test_history.c`; `history_sync.py` parses both.
+  * `src/thermo.c`: hot flashes from the nRF die temperature
+    (`mpsl_temperature_get()`, every 10 s), gated on 30 min worn, the
+    charger, workouts, and by default sleep. `test_thermo` (59 checks).
+  * `src/spot.c`: 3-minute green windows for resting HR and RMSSD, asleep
+    hourly, awake-and-still hourly, on demand (`0x14`), after a hot flash.
+    `test_spot` (57 checks).
+  * MAXM86161 die temperature (regs 0x40-0x42) read once per window as
+    `skin_c100`.
+  * Wellness characteristic `f0a1000b` (GATT table now 33 attributes);
+    opcodes `0x12`, `0x13`, `0x14`. `tools/wellness_watch.py` watches it.
+  * Kconfig `RING_SPOT_*`, `RING_HOT_FLASH_*` default off; `prod.conf`
+    turns them on. A history sync below MTU 37 is refused with ATT `0x11`.
+  * Wear verdicts for both come from PPG windows, so **with a dead MAXM
+    neither feature ever runs** (the temperature is still logged).
 
 ---
 

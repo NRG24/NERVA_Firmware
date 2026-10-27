@@ -150,6 +150,36 @@ struct ring_workout {
 	uint32_t kcal_x1000;		/* this workout only */
 } __packed;
 
+/* Bits in ring_wellness.flags */
+#define WELLNESS_FLAG_THERMO_READY	BIT(0)	/* baseline settled, see thermo.h */
+#define WELLNESS_FLAG_HOT_FLASH		BIT(1)	/* a hot flash is in progress */
+#define WELLNESS_FLAG_SPOT_RUNNING	BIT(2)	/* a spot reading is under way */
+#define WELLNESS_FLAG_SPOT_VALID	BIT(3)	/* the spot_* fields passed */
+
+/*
+ * Wellness payload: temperature, hot flashes and the last spot reading
+ * (thermo.h, spot.h). Notified when a hot flash starts or ends, when a
+ * spot reading finishes, and once a minute; read at any time.
+ *
+ * Temperatures are 0.01 C, INT16_MIN for "none". spot_kind is SPOT_* from
+ * spot.h (4 = a manual reading, opcode 0x14), 0 until the first reading this boot. spot_uptime_s is when it
+ * finished, on the same clock as ring_status.uptime_s.
+ *
+ * 16 bytes, every field on its natural alignment.
+ */
+struct ring_wellness {
+	int16_t temp_c100;	/* ring (nRF die), smoothed */
+	int16_t baseline_c100;	/* settled baseline */
+	int16_t skin_c100;	/* PPG sensor face, last window */
+	uint8_t flags;		/* WELLNESS_FLAG_* */
+	uint8_t hot_flashes;	/* since boot, wraps at 256 */
+	uint8_t spot_kind;
+	uint8_t spot_hr_bpm;
+	uint8_t spot_rmssd_ms;
+	uint8_t spot_beats;
+	uint32_t spot_uptime_s;
+} __packed;
+
 /* Callbacks the phone can trigger by writing to the control characteristic. */
 struct ble_control_cbs {
 	void (*stream_ppg)(bool on);
@@ -162,7 +192,34 @@ struct ble_control_cbs {
 	void (*spo2_mode)(bool on);
 	void (*set_body)(uint8_t age_years, uint8_t sex);
 	void (*workout)(uint8_t type);	/* 0 = stop */
+	void (*ship_mode)(void);	/* power off until a charger wakes it */
+	/* Heart-rate PPG front end, already range-checked (opcode 0x10). */
+	void (*ppg_tune)(uint8_t led_pa, uint8_t led_rge, uint8_t adc_rge,
+			 uint8_t avg_log2);
+	void (*tx_power)(int8_t dbm);	/* opcode 0x11 */
+	/* Spot reading schedule, already range-checked (opcode 0x12). */
+	void (*spot_config)(uint16_t night_min, uint16_t day_min,
+			    uint16_t window_s);
+	/* Hot-flash detection, already range-checked (opcode 0x13). */
+	void (*hot_flash_config)(uint8_t mode, uint8_t rise_c10);
+	void (*spot_now)(void);		/* opcode 0x14 */
 };
+
+/*
+ * Radio housekeeping, every pass of the main loop: slows advertising after
+ * CONFIG_RING_ADV_SLOW_AFTER_S, and with CONFIG_RING_CONN_PARAM_MGMT asks
+ * the central for an idle or a fast connection interval to suit what is
+ * being sent. Main loop only: both send HCI commands and wait.
+ */
+void ble_service(int64_t now_ms);
+
+/*
+ * Set the radio's transmit power on the current connection. Sends an HCI
+ * command and waits for the reply, so main loop only -- never the BT RX
+ * thread. *selected is what the controller actually chose (it rounds to the
+ * nearest supported level). -ENOTCONN with nobody connected.
+ */
+int ble_set_tx_power(int8_t dbm, int8_t *selected);
 
 int ble_start(void);
 void ble_set_control_cbs(const struct ble_control_cbs *cbs);
@@ -181,6 +238,7 @@ void ble_publish_activity(const struct ring_activity *activity);
 void ble_publish_hrv(const struct ring_hrv *hrv);
 void ble_publish_spo2(const struct ring_spo2 *spo2);
 void ble_publish_workout(const struct ring_workout *workout);
+void ble_publish_wellness(const struct ring_wellness *wellness);
 
 /*
  * Raw GSR, in ADC counts. Sized by the caller to the negotiated MTU --

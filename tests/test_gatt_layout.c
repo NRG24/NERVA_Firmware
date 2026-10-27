@@ -37,8 +37,10 @@
  *  18  gsr      decl  19 value  20 CCC
  *  21  spo2     decl  22 value  23 CCC
  *  24  workout  decl  25 value  26 CCC
+ *  27  history  decl  28 value  29 CCC
+ *  30  wellness decl  31 value  32 CCC
  */
-#define EXPECTED_ATTRS	27
+#define EXPECTED_ATTRS	33
 
 _Static_assert(ARRAY_SIZE(ring_svc_attrs) == EXPECTED_ATTRS,
 	       "Ring Service attribute count changed -- the ATTR_* indices in "
@@ -50,6 +52,8 @@ _Static_assert(15 < EXPECTED_ATTRS, "ATTR_HRV out of range");
 _Static_assert(18 < EXPECTED_ATTRS, "ATTR_GSR out of range");
 _Static_assert(21 < EXPECTED_ATTRS, "ATTR_SPO2 out of range");
 _Static_assert(24 < EXPECTED_ATTRS, "ATTR_WORKOUT out of range");
+_Static_assert(27 < EXPECTED_ATTRS, "ATTR_HISTORY out of range");
+_Static_assert(30 < EXPECTED_ATTRS, "ATTR_WELLNESS out of range");
 
 /*
  * No main(): this translation unit exists for its assertions and is only

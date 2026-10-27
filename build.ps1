@@ -1,7 +1,10 @@
 # Build (and optionally flash) the ring firmware.
 #
-#   .\build.ps1            # build (production: no bench instruments)
+#   .\build.ps1            # production (prod.conf): what testing taught
 #   .\build.ps1 -Bench     # build with bench instrumentation
+#   .\build.ps1 -HrTest    # PPG always on, live BPM over HRS (hr-test.conf)
+#   .\build.ps1 -Demo      # PPG only when the dashboard asks (demo.conf)
+#   .\build.ps1 -Daily     # all-day wear: light duty cycle + history (daily.conf)
 #   .\build.ps1 -Flash     # build, then flash over the Debug Probe
 #   .\build.ps1 -Rtt       # build, flash, then attach the RTT viewer
 #
@@ -23,6 +26,9 @@ param(
 	[switch]$Flash,
 	[switch]$Rtt,
 	[switch]$Bench,
+	[switch]$HrTest,
+	[switch]$Demo,
+	[switch]$Daily,
 	[int]$Freq          = 1000000,
 	[string]$NcsVersion = "v3.4.0",
 	[string]$Ncs        = "C:\ncs"
@@ -39,9 +45,23 @@ if ($Bench) {
 	$build = Join-Path $app "build-bench"
 	$extra = @("-DBOARD_ROOT=$app", "-DEXTRA_CONF_FILE=bench.conf")
 	Write-Output "=== BENCH build: instrumented, not shippable ==="
+} elseif ($HrTest) {
+	$build = Join-Path $app "build-hrtest"
+	$extra = @("-DBOARD_ROOT=$app", "-DEXTRA_CONF_FILE=hr-test.conf")
+	Write-Output "=== HR TEST build: PPG never stops, not shippable ==="
+} elseif ($Demo) {
+	$build = Join-Path $app "build-demo"
+	$extra = @("-DBOARD_ROOT=$app", "-DEXTRA_CONF_FILE=demo.conf")
+	Write-Output "=== DEMO build: PPG only on request, not shippable ==="
+} elseif ($Daily) {
+	$build = Join-Path $app "build-daily"
+	$extra = @("-DBOARD_ROOT=$app", "-DEXTRA_CONF_FILE=daily.conf")
+	Write-Output "=== DAILY build: light duty cycle for all-day wear ==="
 } else {
+	# Production: prod.conf carries what the v0.6 test campaign taught.
 	$build = Join-Path $app "build"
-	$extra = @("-DBOARD_ROOT=$app")
+	$extra = @("-DBOARD_ROOT=$app", "-DEXTRA_CONF_FILE=prod.conf")
+	Write-Output "=== PRODUCTION build (prod.conf) ==="
 }
 
 $hex = Join-Path $build "ring-fw\zephyr\zephyr.hex"

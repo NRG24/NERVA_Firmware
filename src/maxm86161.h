@@ -51,6 +51,13 @@
 #define FIFO_CFG2_A_FULL_TYPE	BIT(2)
 #define FIFO_CFG2_FIFO_RO	BIT(1)
 
+/* Die temperature */
+#define REG_DIE_TEMP_CONFIG	0x40
+#define REG_DIE_TEMP_INT	0x41
+#define REG_DIE_TEMP_FRAC	0x42
+
+#define DIE_TEMP_EN		BIT(0)
+
 /* System */
 #define REG_SYSTEM_CONTROL	0x0D
 
@@ -180,6 +187,32 @@ int maxm86161_probe(struct maxm86161 *dev, const struct device *i2c);
 int maxm86161_start_ppg(struct maxm86161 *dev, uint8_t ledc, uint8_t pa);
 
 /*
+ * Front-end settings for the single-LED (heart-rate) path, adjustable at run
+ * time so they can be tuned against a reference monitor without a reflash
+ * per setting -- control opcode 0x10, tools/ppg_sweep.py. They take effect
+ * at the next maxm86161_start_ppg(). SpO2 and the LED indicators keep their
+ * own fixed settings.
+ *
+ * Output stays 100 sps whatever avg_log2 is: averaging 2^n pulses runs the
+ * part at 100 x 2^n sps and decimates on chip, which buys SNR for LED
+ * energy, not a lower sample rate under hr.c's feet.
+ */
+struct maxm86161_ppg_tune {
+	uint8_t led_rge;	/* LED_RGE_*: 31 / 62 mA full scale */
+	uint8_t adc_rge;	/* PPG_ADC_RGE_*: 4 / 8 / 16 / 32 uA full scale */
+	uint8_t avg_log2;	/* 0, 1, 2: average 1, 2, 4 pulses per sample */
+};
+
+/* Ranges a tune must fall inside; anything else is refused. */
+#define PPG_TUNE_LED_RGE_MAX	LED_RGE_62MA
+#define PPG_TUNE_ADC_RGE_MAX	PPG_ADC_RGE_32uA
+#define PPG_TUNE_AVG_LOG2_MAX	2
+
+/* -EINVAL if outside the ranges above, and nothing changes. */
+int maxm86161_set_ppg_tune(const struct maxm86161_ppg_tune *tune);
+void maxm86161_get_ppg_tune(struct maxm86161_ppg_tune *tune);
+
+/*
  * Configure a two-slot sequence for SpO2: IR in slot 1, red in slot 2, at
  * the same 100 sps. Each frame therefore produces TWO FIFO samples, so the
  * FIFO fills twice as fast -- 128 entries is 0.64 s of headroom rather
@@ -217,6 +250,21 @@ int maxm86161_fifo_count(struct maxm86161 *dev);
 
 /* Pop up to max_samples 24-bit words. Returns the count read. */
 int maxm86161_fifo_read(struct maxm86161 *dev, uint32_t *out, uint8_t max_samples);
+
+/*
+ * Die temperature. The sensor face sits on the skin, so while a window is
+ * running this reads close to skin temperature -- better than the nRF die,
+ * which is buried in the ring. Only while the part is powered and out of
+ * shutdown, which on this board means only inside a measurement window:
+ * it has no supply but VLED.
+ *
+ * maxm86161_temp_start() asks for one conversion; maxm86161_temp_read()
+ * returns -EBUSY until it has finished (TEMP_EN self-clears), then the
+ * result in 0.01 C. Both are register-pointer transactions -- never a
+ * bare read, which wedges this part (see HANDOFF.md).
+ */
+int maxm86161_temp_start(struct maxm86161 *dev);
+int maxm86161_temp_read(struct maxm86161 *dev, int16_t *c100);
 
 int maxm86161_read_reg(struct maxm86161 *dev, uint8_t reg, uint8_t *val);
 int maxm86161_write_reg(struct maxm86161 *dev, uint8_t reg, uint8_t val);

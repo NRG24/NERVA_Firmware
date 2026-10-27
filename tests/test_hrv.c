@@ -361,7 +361,8 @@ static void test_outlier_interval_is_not_trusted(void)
 
 	CHECK(flagged_untrusted > 0,
 	      "the abrupt rate change produced no untrusted interval at all, "
-	      "so the agreement gate is not gating anything");
+	      "so the agreement gate is not gating anything (%d trusted, %d "
+	      "successive after the change)", trusted_after, successive_after);
 }
 
 
@@ -448,9 +449,53 @@ static void test_artifact_does_not_invent_hrv(void)
 	      hrv_rmssd_x10() / 10, hrv_rmssd_x10() % 10);
 }
 
+static void test_session(void)
+{
+	struct hrv_session s;
+	uint16_t ibi[180];
+
+	sim_section("spot-reading session: whole-reading RMSSD, window untouched");
+
+	/* A rolling window already holding a steady rate. */
+	hrv_init();
+	for (int i = 0; i < 30; i++) {
+		hrv_add_interval(1000, i > 0);
+	}
+	uint16_t before = hrv_rmssd_x10();
+	uint8_t before_n = hrv_diffs();
+
+	/* 180 beats of alternating 950/1050: every difference is 100 ms. */
+	hrv_session_begin(&s);
+	for (int i = 0; i < 180; i++) {
+		ibi[i] = (i % 2) ? 1050 : 950;
+		hrv_session_add(&s, ibi[i], i > 0);
+	}
+	CHECK(hrv_session_diffs(&s) == 179, "session diffs %u, expected 179",
+	      hrv_session_diffs(&s));
+	CHECK(hrv_session_rmssd_x10(&s) == (uint16_t)(rmssd_reference(ibi, 180)
+						      * 10 + 0.5),
+	      "session RMSSD x10 %u, reference %.1f", hrv_session_rmssd_x10(&s),
+	      rmssd_reference(ibi, 180) * 10);
+	CHECK(hrv_rmssd_x10() == before && hrv_diffs() == before_n,
+	      "a session changed the rolling window (%u/%u -> %u/%u)", before,
+	      before_n, hrv_rmssd_x10(), hrv_diffs());
+
+	/* Same rules as the window: a break forms no difference. */
+	hrv_session_begin(&s);
+	hrv_session_add(&s, 1000, false);
+	hrv_session_add(&s, 1200, false);
+	hrv_session_add(&s, 0, true);
+	hrv_session_add(&s, 900, true);
+	CHECK(hrv_session_diffs(&s) == 0, "non-successive gave %u diffs",
+	      hrv_session_diffs(&s));
+	CHECK(hrv_session_rmssd_x10(&s) == 0, "RMSSD from no differences");
+}
+
 int main(void)
 {
 	printf("HRV / RMSSD tests\n");
+
+	test_session();
 
 	test_matches_the_definition();
 	test_not_enough_beats();

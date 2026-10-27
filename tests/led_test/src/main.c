@@ -56,6 +56,20 @@ static int wv(uint8_t reg, uint8_t val, const char *name)
 	return 1;
 }
 
+/*
+ * Raw SDA (P0.20) / SCL (P0.14) levels straight from P0.IN, no bus traffic.
+ * R1/R2 pull both to 1V8, so an idle healthy bus reads 1/1. A 0 means
+ * something is holding that line down -- and an I2C timeout (-116) rather
+ * than a NACK (-5) says exactly that.
+ */
+static void bus(const char *when)
+{
+	uint32_t in = *(volatile uint32_t *)0x50000510UL;
+
+	LOG_INF("BUS   %-26s SDA=%u SCL=%u", when, (in >> 20) & 1U,
+		(in >> 14) & 1U);
+}
+
 static void show_activity(void)
 {
 	uint8_t wp = 0, ovf = 0, cnt = 0, s1 = 0, f[3] = { 0 };
@@ -99,6 +113,8 @@ int main(void)
 		return 0;
 	}
 
+	bus("at boot");
+
 	/* CD high keeps the PMIC out of Hi-Z so its I2C answers. */
 	gpio_pin_configure(gpio1, CD_PIN, GPIO_OUTPUT_HIGH);
 	k_msleep(10);
@@ -110,9 +126,14 @@ int main(void)
 	LOG_INF("PMIC  CD=P1.00 high: status 0x%02x (err %d)  faults 0x%02x "
 		"(err %d)", st, ep1, fl, ep2);
 
+	bus("after PMIC reads");
+
 	/* Boost on, input buffer connected so the readback is the real pin. */
 	gpio_pin_configure(gpio0, BOOST_EN_PIN, GPIO_OUTPUT_HIGH | GPIO_INPUT);
-	k_msleep(50);
+	k_busy_wait(1000);
+	bus("1 ms after boost on");
+	k_msleep(49);
+	bus("50 ms after boost on");
 	LOG_INF("BOOST_EN P0.12 driven high, pin reads %d",
 		gpio_pin_get_raw(gpio0, BOOST_EN_PIN));
 
@@ -125,6 +146,9 @@ int main(void)
 			break;
 		}
 		LOG_WRN("PART_ID try %d: err %d id 0x%02x", i, e, id);
+		bus("after failed try");
+		LOG_INF("BUS   i2c_recover_bus -> %d", i2c_recover_bus(i2c));
+		bus("after recovery");
 		k_msleep(100);
 	}
 	if (e != 0 || id != 0x36) {

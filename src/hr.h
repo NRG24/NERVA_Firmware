@@ -1,10 +1,27 @@
 /*
- * Minimal heart-rate estimator for a single PPG channel.
+ * Heart rate from a single green PPG channel.
  *
- * Feeds on raw 19-bit MAXM86161 samples at a fixed rate and reports beats
- * per minute. Deliberately simple: a DC tracker to remove the (large)
- * static reflection, a light low-pass, and adaptive-threshold peak
- * detection with a refractory period.
+ * Feeds on raw 19-bit MAXM86161 samples at 100 sps and reports beats per
+ * minute, plus beat-to-beat intervals for HRV.
+ *
+ * Two paths share one despiked input:
+ *
+ *  - RATE. Decimated to 25 sps, band-passed, and once a second a 10 s
+ *    spectrum over 42-198 bpm picks the heart rate: strongest peak, credited
+ *    with its second harmonic, gated on how clearly it stands out, then the
+ *    median of the last five estimates. A rhythm has to be in the signal for
+ *    10 s before anything is reported, and "no reading" is the answer
+ *    whenever it is not clear -- never a guess.
+ *
+ *  - BEATS. Band-passed at 100 sps and peak-picked, with the refractory
+ *    window set from the spectral rate. Intervals feed HRV only when they
+ *    agree with that rate, so beat timing never decides the heart rate
+ *    itself.
+ *
+ * Replaced a threshold-crossing detector in v0.6.2 that, measured against a
+ * WHOOP, read half or double the true rate: single-sample glitches crossed
+ * its threshold, and drift inflated the threshold until real beats did not.
+ * See tools/hr_eval.py for the recordings and the scores.
  */
 
 #ifndef HR_H_
@@ -13,27 +30,56 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* 10 s at 25 sps. */
+#define HR_WIN		250
+/* 0.70-3.30 Hz in 0.025 Hz steps: 42-198 bpm, 1.5 bpm a bin. */
+#define HR_BINS		105
+/* Spectral estimates the reported rate is the median of. */
+#define HR_RECENT	5
+
 struct hr {
 	/* configuration */
 	uint32_t sample_rate_hz;
 
-	/* DC tracker and filtered AC signal */
-	int32_t baseline;
-	int32_t smooth;
-	int32_t amplitude;	/* EMA of recent peak-to-peak */
-	int32_t last_min;
-	int32_t last_max;
 	bool primed;
-	bool above;
+	uint32_t ticks;
+
+	/* Despiking: the last five raw samples, median taken. */
+	int32_t med[5];
+	uint8_t med_i;
+
+	/* DC level of the despiked signal, for finger detection and status. */
+	int32_t baseline;
+
+	/* Beat path, 100 sps, Q4: two high-pass stages then a low-pass. */
+	int32_t b_hp1;
+	int32_t b_hp2;
+	int32_t b_lp;
+	int32_t y1, y2;			/* the last two outputs, for peak picking */
+	int32_t pp_min, pp_max;		/* this second's swing */
+	int32_t amplitude;		/* EMA of that swing, raw counts */
+	int32_t peak_level;		/* EMA of accepted beat heights */
+
+	/* Rate path, 25 sps. */
+	int32_t dec_acc;
+	uint8_t dec_n;
+	int32_t s_hp1;
+	int32_t s_hp2;
+	int32_t win[HR_WIN];		/* ring of band-passed samples */
+	uint16_t win_i;
+	uint16_t win_n;
+	uint8_t since_spectrum;		/* decimated samples since the last */
+
+	/* Time-averaged spectrum, each bin relative to its window's median. */
+	int64_t spec_avg[HR_BINS];
+	bool spec_avg_primed;
+
+	uint16_t recent[HR_RECENT];	/* bpm x10, 0 = no confident estimate */
+	uint8_t recent_i;
+	uint16_t bpm_x10;		/* what hr_update() reports */
 
 	/* beat timing, in samples */
-	uint32_t ticks;
 	uint32_t last_beat_tick;
-
-	/* inter-beat intervals, in samples */
-	uint32_t ibi[8];
-	uint8_t ibi_count;
-	uint8_t ibi_next;
 
 	/*
 	 * The interval accepted on the most recent beat, for HRV. Only
@@ -53,7 +99,10 @@ void hr_init(struct hr *hr, uint32_t sample_rate_hz);
 /*
  * Feed one raw sample. Returns true when a beat was detected on this
  * sample. *bpm_x10 is updated with the current estimate in tenths of a BPM
- * (0 when there is not enough data yet).
+ * (0 when there is no confident estimate).
+ *
+ * Built for 100 sps. Once a second this runs the spectrum: ~26,000
+ * multiply-adds, a few milliseconds on the nRF52833.
  */
 bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10);
 
@@ -65,24 +114,20 @@ bool hr_update(struct hr *hr, uint32_t raw, uint16_t *bpm_x10);
 uint16_t hr_last_ibi_ms(const struct hr *hr);
 
 /*
- * True when that interval passed both gates the beat detector applies:
- * the 30-220 bpm plausibility range, and agreement with the median of the
- * recent intervals. An interval that fails either is real enough to keep
- * a heart rate honest but not clean enough for HRV, where the error would
- * enter squared.
+ * True when that interval is within 20 % of the period the spectral rate
+ * implies -- clean enough for HRV, where the error enters squared. Nothing
+ * is trusted while there is no confident rate.
  */
 bool hr_last_ibi_trusted(const struct hr *hr);
 
 /*
  * True when that interval AND the one before it were both trusted and
  * genuinely adjacent -- which is what makes their difference a successive
- * difference. A beat that was detected and then rejected still moves the
- * beat clock, so the interval following it is measured from a suspect
- * beat and is adjacent to nothing.
+ * difference. A peak that was seen and then rejected breaks the run.
  */
 bool hr_last_ibi_successive(const struct hr *hr);
 
-/* Current AC amplitude. */
+/* Current AC amplitude, peak to peak, raw counts. */
 int32_t hr_amplitude(const struct hr *hr);
 
 /* True when the DC level says something is on the sensor. */

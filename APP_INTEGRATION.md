@@ -1,7 +1,8 @@
 # App integration guide
 
-Everything a phone app needs to talk to the ring. Firmware as of v0.4.1
-(2026-09-17).
+Everything a phone app needs to talk to the ring. Firmware as of v0.7.0
+(2026-10-12). New in v0.6: the ring keeps its own history in flash and a
+phone syncs it -- section 16.
 
 ---
 
@@ -56,7 +57,7 @@ which firmware you are talking to before you decide what to trust.
 
 | Characteristic | UUID | Value |
 |---|---|---|
-| Firmware Revision | `0x2A26` | `0.5.0` |
+| Firmware Revision | `0x2A26` | `0.8.0` (production; see `prj.conf`) |
 | Manufacturer Name | `0x2A29` | `Ring project` |
 | Model Number | `0x2A24` | `Ring ANNA-B402` |
 
@@ -79,6 +80,8 @@ this service now requires an encrypted link** — see Pairing, below.
 | GSR stream | `f0a10007-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
 | SpO2 | `f0a10008-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
 | Workout | `f0a10009-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read |
+| History | `f0a1000a-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Notify | Encrypted CCC |
+| Wellness | `f0a1000b-1e5c-4a2b-8d3f-9c7b6e5a4d21` | Read, Notify | Encrypted read (v0.8.0+, section 17) |
 
 ### Pairing
 
@@ -136,7 +139,7 @@ measuring and on every state change.
 | 1 | u8 | `flags` | see below |
 | 2 | u16 | `hr_x10` | BPM x10. **0 means no valid reading** |
 | 4 | u16 | `battery_mv` | millivolts, the trustworthy battery number |
-| 6 | i16 | `gsr_mv` | millivolts, **-1 = not measured** |
+| 6 | i16 | `gsr_mv` | millivolts, **-1 = not measured**. Always -1 in production from v0.7.0: the GSR front end cannot resolve skin conductance on this board |
 | 8 | u32 | `ppg_dc` | PPG DC level, the wear-detection signal |
 | 12 | u16 | `ppg_ac` | PPG AC amplitude |
 | 14 | u16 | `perfusion_x10` | perfusion index in tenths of a percent |
@@ -219,11 +222,18 @@ Sample rate is **100 Hz** per channel. Packet size adapts to the negotiated MTU:
 | MTU | Samples per notification |
 |---|---|
 | 23 (default) | 4 |
-| 247 (requested) | up to 40 |
+| 247 (requested) | 10, one notification every ~100 ms (up to 40 after a backlog) |
 
 **Request a 247-byte MTU.** At the default you get ~25 notifications per
 second, which most phones will struggle to sustain and which will drop
 packets. Watch `seq` for gaps.
+
+**The ring drops, it never waits.** It has three ATT transmit buffers. When
+the link cannot keep up, a notification that finds no free buffer is
+discarded and `seq` still advances, so the loss shows as a gap. This applies
+to every notification the ring sends, including Heart Rate and Status. It
+used to wait for a buffer instead, which on a weak link stalled the main
+loop long enough for the watchdog to reset the ring.
 
 Enabling the PPG stream forces the ring into a measurement window and
 **keeps it there** — normal duty cycling is suspended for as long as you
@@ -264,9 +274,17 @@ Write (with or without response). First byte is the opcode.
 | `0x09` | `u8 on` | SpO2 mode on/off. Runs red+IR instead of green; **heart rate pauses** while on |
 | `0x0A` | `u8 age`, `u8 sex` | Age in years (0 = not given, else clamped to 10-100) and sex (0 not given, 1 female, 2 male) for workout calories. Saved to flash like weight |
 | `0x0B` | `u8 type` | Start a workout: 1 running, 2 rowing, 3 cycling, 4 other. `0` stops it. See section 11 |
+| `0x0C` | none | Power off (PMIC ship mode). On battery the ring turns off at once and the link drops; on a charger it turns off when the charger is unplugged. ~150 nA while off. **Only plugging a charger in wakes it** — this board has no button |
+| `0x0D` | `u32 unix_s` | Set the ring's clock to Unix time (seconds, UTC), little-endian. **Send on every connection.** History records are stamped with it until the next reboot. See section 16 |
+| `0x10` | `u8 led_pa, u8 led_rge, u8 adc_rge, u8 avg_log2` | **Diagnostic, test builds only** (refused with ATT `0x13` in production, v0.7.0+). Tune the heart-rate PPG front end: green LED current code, LED range (0 = 31 mA, 1 = 62 mA full scale), ADC range (0-3 = 4/8/16/32 µA), on-chip averaging (0-2 = 1/2/4 pulses; output stays 100 sps). A running window restarts with the new settings. RAM only, a reboot restores the defaults: `0xFF, 0, 2, 2` from v0.6.2 (31 mA, 4x averaging), `0x80, 0, 2, 0` in v0.6.1. Out-of-range values get ATT `0x13`. For `tools/ppg_sweep.py`, not for an app's settings screen |
+| `0x11` | `i8 dbm` | **Diagnostic, test builds only** (refused in production, v0.7.0+). Radio TX power on this connection, -40 to +8 dBm (the controller rounds to a supported level). RAM only, this connection only |
+| `0x0E` | `u32 from_seq` | Sync history: the ring notifies every stored record with `seq >= from_seq` on the History characteristic, oldest first, then an end-of-sync summary. Subscribe to History first, or the write fails with ATT `0xFD`; from v0.8.0 an MTU under 37 fails it with ATT `0x11`. See section 16 |
+| `0x12` | `u16 night_min, u16 day_min, u16 window_s` | v0.8.0+, every build. Spot reading schedule (section 17): minutes between night readings and between daytime still readings (0 = off, else 10-720), and the length of each (60-600 s). RAM only: send on every connection if you want something other than the build's defaults. Production defaults `60, 60, 180`; test builds `0, 0, 180`. Out of range: ATT `0x13` |
+| `0x13` | `u8 mode, u8 rise_c10` | v0.8.0+, every build. Hot-flash detection (section 17): mode 0 off, 1 while asleep only, 2 always; onset threshold in tenths of a degree, 3-50. RAM only. Production default `1, 10`; test builds `0, 10`. Out of range: ATT `0x13` |
+| `0x14` | none | v0.8.0+. Take a spot reading now (section 17): the "check my stress" button. A 3-minute green window, judged like a daytime reading; the result arrives on Wellness (`spot_kind` 4) and in the history as a `SPOT_DAY` reading. Needs the ring on a finger and the hand still |
 
 Duty cycle values are clamped in firmware: window 5-300 s, period
-window-3600 s. Defaults are a **15 s window every 60 s**, i.e. 25% duty.
+window-3600 s. Defaults are a **25 s window every 60 s**, i.e. ~42% duty (15 s before v0.6.2; the new heart-rate detector needs ~12 s before its first reading). The daily build runs 25 s every 600 s, ~4%.
 
 Weight is clamped to 20.0-250.0 kg and defaults to 70.0 kg until set —
 without it the calorie estimate in the Activity characteristic (section 7)
@@ -406,6 +424,23 @@ such as rowing or cycling, needs a workout (section 11). Treat every field
 here as a rough, uncalibrated trend line, not a number to show without a
 caveat.
 
+**Steps arrive in bursts of eight (v0.7.0).** Worn on 2026-10-12, the step
+count was far too high: every hand movement that crossed the detector's
+threshold counted. In simulation, 30 minutes of irregular hand movement
+read as 545 steps. The counter now holds candidate steps back until eight
+have arrived in a steady rhythm, each interval within 30 % of the one
+before. It then credits all eight at once and counts live while the rhythm
+holds. The same simulation now reads 0, and simulated walks are still
+counted to within 1-3 %. For an app this means:
+
+* The count jumps by 8 at the start of a walk, rather than ticking from 1.
+* Fewer than eight steps -- crossing a room -- are not counted at all.
+* Anything rhythmic with the hand counts. Brushing teeth, for example,
+  will still read as walking. Every pedometer shares this limitation.
+
+These are simulated numbers. `tools/steps_record.py` and
+`tools/steps_eval.py` exist to measure them on real walks.
+
 Three specific behaviours are worth designing around, because they are
 confirmed in simulation rather than hypothetical:
 
@@ -448,6 +483,12 @@ confirmed in simulation rather than hypothetical:
   the counters, and do not interpolate across it.
 
 ### Counters are since-boot, and a reboot zeroes them
+
+> **v0.6:** the live counters below still reset, but every 5 minutes the
+> ring now writes a summary (steps in that interval, heart rate, flags) to
+> flash, and those survive reboots. For anything historical -- a day's
+> steps, last night -- build from the history sync in section 16 rather
+> than from these counters.
 
 **None of this is stored in flash.** Every field in this characteristic
 lives in RAM and starts again from zero on any reset — a watchdog reboot,
@@ -555,7 +596,7 @@ differences between low readings as meaningful.
 
 ### It is not a 60-second RMSSD
 
-The power model runs the PPG for 15 s in every 60, which is not enough
+The power model runs the PPG for 25 s in every 60, which is not enough
 beats for a conventional window, so the ring keeps a rolling window of the
 last 64 successive differences instead. At the default duty cycle that
 window can span several minutes of wall time. No difference is ever
@@ -790,7 +831,7 @@ off for 45 seconds out of every 60. That is deliberate — the LEDs plus the
 
 What shuts it down entirely is the ring coming **off a finger**, not the
 ring being still. Finding a finger during a window refreshes the motion
-timeout, so a ring that is worn keeps its 15 s-in-60 duty cycle however
+timeout, so a ring that is worn keeps its 25 s-in-60 duty cycle however
 motionless the wearer is, all night. A ring that is off a hand stops
 finding one and falls silent about three minutes later, until the
 accelerometer wakes it.
@@ -808,10 +849,10 @@ Consequences:
   are normal, not a fault.
 * If the user opens your app and wants a reading *now*, send opcode
   `0x03`. Do not wait for the next scheduled window.
-* After a window starts it takes roughly **4 seconds to settle** and
-  another **8 beats** before a BPM appears. Budget 10-15 s from request to
-  first reading, and show a progress state rather than a spinner that
-  looks stuck.
+* After a window starts it takes roughly **12 seconds** before a BPM
+  appears (v0.6.2: 10 s of signal for the first spectrum, then agreeing
+  estimates). Budget 15 s from request to first reading, and show a
+  progress state rather than a spinner that looks stuck.
 
 **Wake on motion.** The ring sleeps until the IMU sees roughly 80 mg of
 movement, then immediately opens a window to look for a finger. Picking the
@@ -844,11 +885,24 @@ length extension if your stack exposes it.
 These are real limitations of the current hardware and firmware, not
 things to paper over in the UI.
 
-**Heart rate is not validated.** The algorithm is a DC tracker, a 4 Hz
-low-pass, adaptive-threshold peak detection, and a median of the last 8
-intervals. It has been sanity-checked against plausible resting rates only
-— never against a reference monitor. Do not present it as medical-grade,
-and do not build clinical features on it until it has been validated.
+**Heart rate is only lightly validated.** Since v0.6.2 the rate comes from
+a spectrum: the raw PPG is despiked, band-passed, and once a second a 10 s
+spectrum picks the strongest rhythm, gated on how clearly it stands out,
+reported as the median of recent estimates. Replayed offline against ~8
+minutes of WHOOP-referenced recordings (`tools/hr_eval.py`) it averaged
+6.8 bpm of error with 60 % of readings within 5 bpm, against 46 bpm and 0 %
+for the v0.6.1 detector -- and 2-4 bpm with the hand still and close. It
+has not yet run on a ring against a reference, nor during exercise, and
+motion is the known weak spot. Expect:
+
+* **Nothing for the first ~12 s** of a window: 10 s of signal, then agreeing
+  estimates. "No reading" is the answer whenever the spectrum is unclear --
+  the detector is built to stay silent rather than guess.
+* **About 12 s of reading per window.** Windows are 25 s from v0.6.2, so
+  roughly half of each one carries a heart rate.
+
+Do not present it as medical-grade, and do not build clinical features on
+it.
 
 **Battery percentage is a voltage bar.** See section 2. `battery_mv` is a
 real measurement from the PMIC with roughly +/-42 mV resolution. The
@@ -914,3 +968,255 @@ and no bond has ever been cleared.
    quality; show the user a "hold still, don't squeeze" prompt while
    `hr_x10` is still 0
 8. Read `battery_mv` from Status, not the Battery Service percentage
+9. Write `[0x0D, <u32 unix time>]` to set the ring's clock — every
+   connection
+10. Subscribe to History (`f0a1000a-...`), then write
+    `[0x0E, <u32 last stored seq + 1>]` and store what arrives. Section 16
+
+---
+
+## 16. On-ring history and sync
+
+New in v0.6; **record layout v2 from v0.8.0**. v0.6 history has been
+verified on ring 2 (58 records, no gaps, no bad CRCs); v2 is host-tested
+and compile-verified, not yet run on a ring.
+
+Every `CONFIG_RING_HISTORY_EPOCH_S` seconds (300 by default) the ring
+writes one 32-byte record to its own flash, whether or not anything is
+connected. The log holds **5,504 records, about 19 days at 5 minutes**,
+and when it is full the oldest 4 kB page (128 records, ~10.7 hours) is
+erased to make room. The app downloads whatever it has not seen yet.
+
+> **Upgrading to v0.8.0 erases the log.** The first boot of the new layout
+> sees a v1 header and reformats. Sync before flashing.
+
+### Record format (v2, v0.8.0+)
+
+32 bytes, little-endian, identical in flash and on the wire. Pinned by
+compile-time assertions in `tests/test_history.c`; `tools/history_sync.py`
+`parse_record_v2()` is the reference parser.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | u32 | `seq` | 1, 2, 3, ... never repeats, **survives reboots**. The sync cursor |
+| 4 | u32 | `time_s` | **End** of the epoch. Unix seconds if flag bit 0 is set, otherwise seconds since that boot |
+| 8 | u16 | `steps` | Steps **during this epoch**, not a running total |
+| 10 | i16 | `temp_c100` | Ring temperature (nRF die), mean over the epoch, 0.01 C. `-32768` = none. Reads a few degrees under skin once worn; on the charger it reads the charger's heat |
+| 12 | i16 | `skin_c100` | PPG sensor face temperature, mean of the readings taken in windows that saw a finger, 0.01 C. `-32768` = none (no window, or no finger) |
+| 14 | u8 | `hr_bpm` | Mean of the once-a-second heart rates during the epoch. **0 = no reading** |
+| 15 | u8 | `hr_min_bpm` | Lowest one-second heart rate. 0 = none |
+| 16 | u8 | `hr_max_bpm` | Highest one-second heart rate. 0 = none |
+| 17 | u8 | `rmssd_ms` | Rolling RMSSD at the end of the epoch (section 8). 0 = none. Only set when the epoch had heart rate |
+| 18 | u8 | `rest_hr_bpm` | Mean heart rate of a **spot reading** that finished in this epoch and passed (section 17). 0 = none |
+| 19 | u8 | `rest_rmssd_ms` | RMSSD of that spot reading, from its own beats only. 0 = fewer than 20 clean differences |
+| 20 | u8 | `rest_beats` | Successive differences behind `rest_rmssd_ms`: every clean beat of the reading, ~150 for 3 min at rest, capped at 255 |
+| 21 | u8 | `temp_rise_c10` | Highest ring temperature above its settled baseline during the epoch, 0.1 C. 0 until the baseline has settled |
+| 22 | u8 | `motion_pct` | Share of the epoch the accelerometer read more than 50 mg away from 1 g, time-weighted. **255 = not read** (charging) |
+| 23 | u8 | `battery_20mv` | Battery millivolts / 20 (190 = 3.80 V). 0 = not measured yet this boot |
+| 24 | u8 | `flags` | See below |
+| 25 | u8 | `hot_flashes` | Hot flashes that **started** in this epoch |
+| 26 | u8 | `boot_id` | Which boot wrote it, +1 per boot that wrote records, wraps at 256 |
+| 27 | 4 bytes | reserved | 0 |
+| 31 | u8 | `crc` | CRC-8 over bytes 0-30: poly `0x07`, init `0x00`, no reflection, no final XOR (CRC-8/SMBUS; `"123456789"` gives `0xF4`) |
+
+`flags`:
+
+| Bit | Meaning |
+|---|---|
+| 0 | `TIME_VALID`: `time_s` is Unix time |
+| 1 | `WORN`: a measurement window found a finger during the epoch |
+| 2 | `CHARGING`: on the charger at some point in the epoch |
+| 3 | `ASLEEP`: the sleep tracker said asleep at some point in the epoch |
+| 4 | `WORKOUT`: a workout was running |
+| 5 | `HOT_FLASH`: a hot flash was in progress at some point in the epoch |
+| 6 | `SPOT_NIGHT`: `rest_*` came from a night spot reading |
+| 7 | `SPOT_DAY`: `rest_*` came from a daytime still spot reading |
+
+Bits 1-5 mean "at any point in the epoch". Absence of `WORN` is "not
+seen", not "not worn".
+
+**Verify the CRC and drop records that fail it.** The ring already
+discards torn records, so a failure on the phone means a transport bug.
+
+The v1 layout (16 bytes: `seq, time_s, u8 hr_bpm, u8 rmssd_ms, u16 steps,
+u8 battery_20mv, u8 flags, u8 boot_id, u8 crc`, CRC over bytes 0-14) is
+what v0.6-v0.7 rings send, in packet type `0x01`. An app that wants to
+read an older ring keeps both parsers; `history_sync.py` does.
+
+### Sync protocol
+
+1. Subscribe to the History characteristic (`f0a1000a-…`). It is
+   notify-only and, like the rest of the Ring Service, needs the encrypted
+   link.
+2. Write `[0x0D, unix_s (u32 LE)]` to Control. Do it first, so the end
+   summary carries a valid clock.
+3. Write `[0x0E, from_seq (u32 LE)]` to Control. Use `last_seq_stored + 1`,
+   or `0` the first time. A `from_seq` older than the oldest record simply
+   starts at the oldest.
+4. Notifications arrive on History. The first byte says which kind:
+
+   **Records, v2: `0x03`** (v0.8.0+)
+
+   ```
+   offset 0   u8   0x03
+   offset 1   u8   n                    records in this packet
+   offset 2   32 x n bytes              records, oldest first
+   ```
+
+   `n` is up to 7 at a 247-byte MTU. At the default 23 a 32-byte record
+   does not fit a notification at all, so **request a bigger MTU first**
+   (37 bytes is the minimum, 247 the useful size): below 37 the `0x0E`
+   write itself fails with ATT `0x11`, Insufficient Resources. iOS
+   negotiates a big MTU on its own; Android needs `requestMtu(247)`.
+
+   **Records, v1: `0x01`** (v0.6-v0.7): the same, with 16-byte records,
+   up to 15 a packet. The type changed with the layout so an app that only
+   knows `0x01` ignores v2 records instead of misreading them.
+
+   **End — `0x02`, always last, always 20 bytes**
+
+   | Offset | Type | Field |
+   |---|---|---|
+   | 0 | u8 | `0x02` |
+   | 1 | u32 | `oldest_seq` — oldest record still stored (0 = log empty) |
+   | 5 | u32 | `newest_seq` — newest record when the sync began (0 = empty) |
+   | 9 | u32 | `uptime_s` — ring's seconds since boot, now |
+   | 13 | u32 | `unix_s` — ring's clock now, 0 if not set this boot |
+   | 17 | u8 | `boot_id` — the boot running now |
+   | 18 | u16 | `epoch_s` — seconds per record |
+
+5. On the end packet, store `newest_seq` as your cursor **only after the
+   records are safely saved**. Next sync starts from `newest_seq + 1`.
+
+Records arrive in strictly increasing `seq`. They are contiguous except
+where the log wrapped (`oldest_seq` > your cursor + 1 — you were away
+longer than ~19 days; the gap is lost) or where a record failed in flash.
+Records written *during* a sync are left for the next one.
+
+Unlike the live streams, the sync **never drops**: a notification that
+finds the link full is held and resent, so a sync is either complete or
+interrupted, never holey. If the link drops mid-sync, keep the records
+you have, advance your cursor to the last one, and sync again from there.
+While a sync runs, the live notifications (Status, HR, …) share the same
+buffers and may drop — expect a gap in live data for the few seconds a
+sync takes.
+
+### Turning `time_s` into wall-clock time
+
+There is no RTC. The ring knows Unix time only after a phone has sent
+`0x0D` in the current boot. It keeps that time across a watchdog or crash
+reset (in RAM the reset does not clear), but **a power loss or ship mode
+loses it** — and a battery-contact bounce on this board revision is a
+power loss.
+
+Per record:
+
+```
+if flags & TIME_VALID:
+    t = time_s                                   # Unix seconds
+elif boot_id == end.boot_id and end.unix_s != 0:
+    t = end.unix_s - (end.uptime_s - time_s)     # same boot as now: exact
+else:
+    t = unknown                                  # a past boot nobody synced
+```
+
+For the last case the order is still right (`seq`), and the record is
+still `epoch_s` long, so a chain of them can be placed by walking
+backwards in steps of `epoch_s` from the first dated record after them —
+an estimate that ignores however long the ring was off between boots.
+Show such records as "approximate" or leave them off a timeline.
+
+`boot_id` only advances on a boot that writes a record, so a ring that
+reboots twice within 5 minutes shows one boot.
+
+### What it costs, and limits
+
+* One 32-byte flash write per epoch; a 4 kB page erase (~85 ms) every 128
+  records. Negligible power. The partition wears one page-cycle per
+  ~19 days; the flash is rated for 10,000.
+* Nothing is recorded while the ring is powered off (ship mode or a flat
+  battery) — that is a gap in `time_s`, not missing `seq`s.
+* A record holds a heart rate only if a measurement window ran in its
+  epoch. In the daily build (`.\build.ps1 -Daily`) that is one 25 s window
+  every 10 minutes, about 12 s of it with a heart rate; the demo build runs none unless the app asks.
+* The log lives at flash `0x50000`-`0x7BFFF`, separate from the bonds at
+  `0x7C000`. Reflashing the firmware over SWD does not erase it; the first
+  boot of v0.6 formats it once (~4 s at boot, before measuring starts; a
+  chip erase over SWD means one more format).
+
+---
+
+## 17. Temperature, hot flashes and spot readings
+
+New in v0.8.0. **Host-tested and compile-verified only.** Production
+builds have both features on; test builds have them off until the app
+turns them on with `0x12`/`0x13`. Ring temperature is logged in every
+build.
+
+### Wellness characteristic, `f0a1000b-...`
+
+Read, Notify. 16 bytes, little-endian. Notified when a hot flash starts
+or ends, when a spot reading finishes, when `0x13` is written, and once a
+minute.
+
+| Offset | Type | Field | Notes |
+|---|---|---|---|
+| 0 | i16 | `temp_c100` | Ring temperature, smoothed (tau 60 s), 0.01 C. `-32768` before the first sample |
+| 2 | i16 | `baseline_c100` | Settled baseline the hot-flash detector compares against. `-32768` until settled |
+| 4 | i16 | `skin_c100` | PPG sensor face, last window that saw a finger. `-32768` = none this boot |
+| 6 | u8 | `flags` | bit 0 baseline settled, bit 1 hot flash in progress, bit 2 spot reading running, bit 3 last spot reading passed |
+| 7 | u8 | `hot_flashes` | Since boot, wraps at 256 |
+| 8 | u8 | `spot_kind` | Last finished spot reading: 0 none yet, 1 night, 2 day, 3 hot flash, 4 manual (`0x14`) |
+| 9 | u8 | `spot_hr_bpm` | Its mean heart rate |
+| 10 | u8 | `spot_rmssd_ms` | Its RMSSD; 0 = fewer than 20 clean differences |
+| 11 | u8 | `spot_beats` | Differences behind it |
+| 12 | u32 | `spot_uptime_s` | When it finished, on the Status `uptime_s` clock. 0 = none |
+
+### Spot readings
+
+The ordinary windows are 25 s, too short for an HRV number worth
+trending. A spot reading is a 3-minute green window (`window_s`) at a
+moment chosen for it, with an RMSSD over its own beats only (the rolling
+HRV characteristic is left alone):
+
+* **Night**: 15 min after the sleep tracker says asleep, then every
+  `night_min` while asleep.
+* **Day**: awake, worn, and the accelerometer still for 3 minutes, at
+  most every `day_min`.
+* **Hot flash**: one straight after a hot flash starts.
+* **Manual**: one now, on opcode `0x14`. Leaves the schedule alone.
+
+A reading passes with at least 30 one-second heart rates and the
+accelerometer quiet (under 50 mg from 1 g) for 90 % of it; a night or day
+reading with sustained motion is cut short. A failed one is retried after
+10 minutes. Passing night and day readings land in that epoch's history
+record as `rest_hr_bpm` / `rest_rmssd_ms` / `rest_beats` with
+`SPOT_NIGHT` or `SPOT_DAY` set. These are the numbers for stress and
+burnout scores; see `../mac-handoff/WELLNESS_ANALYTICS.md`.
+
+Cost at the production schedule: ~5 % extra LED duty while asleep, less
+by day.
+
+### Hot flashes
+
+The ring watches its own temperature (nRF die, every 10 s) for the shape
+of a hot flash: at least `rise_c10` (default 1.0 C) above a settled
+baseline, three quarters of it gained within 10 minutes. It ends when the
+temperature is back within 0.3 C of the baseline, or after 30 minutes. 15
+minutes refractory after each.
+
+Measured on synthetic traces (`tests/test_thermo.c`): a 1.5 C flash is
+flagged ~3 min after it begins; a 1.0 C rise is not (threshold is
+inclusive of noise); steady warming slower than ~0.07 C/min, like the
+hands warming at sleep onset, never triggers.
+
+Nothing is judged until the ring has been worn, off the charger and out
+of a workout for 30 minutes, and in mode 1 until the wearer has been
+asleep for 20 (with 10 minutes' grace after waking, since hot flashes
+wake people).
+
+**Unvalidated.** The die reads the finger through the ring, attenuated
+and a minute or so late, at 0.25 C resolution, and nobody has worn this
+board through a hot flash. A hand around a hot mug or out from under a
+duvet looks the same. Ask the wearer to confirm or dismiss each event;
+that is the data that would tune `rise_c10`.

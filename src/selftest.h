@@ -38,6 +38,17 @@ int pmic_configure(const struct device *i2c);
  */
 int pmic_service(const struct device *i2c, bool *charging);
 
+/*
+ * Put the PMIC into ship mode: battery disconnected, ~150 nA, until a
+ * charger is plugged in. On battery the ring is off about a millisecond
+ * after this; on a charger it goes off when the charger is unplugged. Stop
+ * calling pmic_service() afterwards -- it would park CD low, which blocks
+ * entry.
+ *
+ * Returns 0 if the request was written, or a negative errno.
+ */
+int pmic_ship_mode(const struct device *i2c);
+
 /* Single GSR reading in millivolts, or a negative errno. */
 int selftest_gsr_mv(void);
 
