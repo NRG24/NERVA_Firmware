@@ -602,6 +602,8 @@ static uint32_t epoch_imu_ms;		/* time covered by accelerometer reads */
 static uint32_t epoch_motion_ms;	/* of which moving */
 static uint8_t epoch_hot_flashes;
 static struct spot_result epoch_spot;	/* last valid night/day reading */
+static uint8_t spot_manual_reason;	/* SPOT_REASON_* of the last 0x14 */
+static bool epoch_spot_breathing;	/* epoch_spot is a breathing exercise */
 
 /* --- temperature, hot flashes, spot readings ------------------------------ */
 
@@ -783,9 +785,10 @@ static void cb_hot_flash_config(uint8_t mode, uint8_t rise_c10)
 		   REQ_PENDING | mode | ((atomic_val_t)rise_c10 << 8));
 }
 
-static void cb_spot_now(void)
+/* 0 = none pending, else 1 + the SPOT_REASON_* that came with it. */
+static void cb_spot_now(uint8_t reason)
 {
-	atomic_set(&spot_now_request, 1);
+	atomic_set(&spot_now_request, 1 + (atomic_val_t)reason);
 }
 
 static void cb_stream_gsr(bool on)
@@ -1485,6 +1488,8 @@ static void finish_spot(int64_t now, bool usable)
 	 */
 	if (r.valid && r.kind != SPOT_HOT_FLASH) {
 		epoch_spot = r;
+		epoch_spot_breathing = r.kind == SPOT_MANUAL &&
+				       spot_manual_reason == SPOT_REASON_BREATHING;
 	}
 
 	LOG_INF("spot %s: HR %u, RMSSD %u ms over %u, motion %u%% -> %s",
@@ -1580,6 +1585,9 @@ static void history_epoch(int64_t now, int64_t *next_epoch,
 		if (epoch_spot.kind == SPOT_MANUAL) {
 			rec.flags2 |= HIST_FLAG2_SPOT_MANUAL;
 		}
+		if (epoch_spot_breathing) {
+			rec.flags2 |= HIST_FLAG2_SPOT_BREATHING;
+		}
 	}
 
 	*steps_at_epoch = steps_now;
@@ -1596,6 +1604,7 @@ static void history_epoch(int64_t now, int64_t *next_epoch,
 	epoch_motion_ms = 0;
 	epoch_hot_flashes = 0;
 	memset(&epoch_spot, 0, sizeof(epoch_spot));
+	epoch_spot_breathing = false;
 
 	int err = history_append(&rec);
 
@@ -2176,13 +2185,19 @@ int main(void)
 				publish_wellness();
 			}
 
-			if (atomic_cas(&spot_now_request, 1, 0)) {
+			atomic_val_t want = atomic_set(&spot_now_request, 0);
+
+			if (want != 0) {
 				if (state == RING_CHARGING) {
 					/* Nothing to measure on a charger; the
 					 * app sees no Wellness "running" bit.
 					 */
 					LOG_WRN("spot reading refused: charging");
 				} else {
+					/* The last press decides, if two come
+					 * before the reading finishes.
+					 */
+					spot_manual_reason = (uint8_t)(want - 1);
 					spot_request_now();
 				}
 			}

@@ -86,6 +86,7 @@ def parse_hex(h):
             "motion_pct": None if motion == 255 else motion,
             "flags": flags, "hot_flashes": hot,
             "spot_manual": bool(flags2 & 1),
+            "spot_breathing": bool(flags2 & 2),
             "crc_ok": crc8(raw[:31]) == crc}
 
 
@@ -97,7 +98,8 @@ def encode_hex(r):
                     r["temp_rise_c10"],
                     255 if r["motion_pct"] is None else r["motion_pct"],
                     190, r["flags"], r["hot_flashes"], 0,
-                    1 if r.get("spot_manual") else 0, 0)
+                    (1 if r.get("spot_manual") else 0) |
+                    (2 if r.get("spot_breathing") else 0), 0)
     return (raw[:31] + bytes([crc8(raw[:31])])).hex()
 
 
@@ -130,6 +132,8 @@ def load_csv(path):
                         "temp_rise_c10": num("temp_rise_c", 10, 0),
                         "motion_pct": num("motion_pct"),
                         "flags": flags, "hot_flashes": num("hot_flashes", none=0),
+                        "spot_manual": row.get("spot_manual") == "True",
+                        "spot_breathing": row.get("spot_breathing") == "True",
                         "crc_ok": True})
     return out
 
@@ -340,7 +344,8 @@ def strain_flags(all_nights, stress_readings, date):
     The section-5 flags for one calendar date. DECIDED: "the last 7 nights"
     are the qualifying nights dated date-6..date (at least 4 of them), and
     their baseline is the 28 qualifying nights dated before date-6 (at
-    least 7). Day stress needs 3 scored readings in the same 7 days.
+    least 7). Day stress needs 3 scored scheduled readings (not manual) in
+    the same 7 days.
     """
     d = datetime.date.fromisoformat(date)
     lo = (d - datetime.timedelta(days=6)).isoformat()
@@ -368,7 +373,7 @@ def strain_flags(all_nights, stress_readings, date):
     mean_sleep = statistics.fmean([n["sleep_min"] for n in recent])
     flags["sleep_short"] = mean_sleep < m_sleep - 30 or mean_sleep < 360
     scores = [s["score"] for s in stress_readings
-              if s["score"] is not None and lo <= s["date"] <= date]
+              if s["score"] is not None and not s["manual"] and lo <= s["date"] <= date]
     if len(scores) >= 3:
         flags["day_stress_high"] = statistics.fmean(scores) > 60
     flags["count"] = sum(1 for k, v in flags.items() if v is True)
@@ -418,20 +423,23 @@ def band(score):
 
 def stress(recs, all_nights):
     """
-    Every SPOT_DAY reading. DECIDED: excluded when its own record has
-    WORKOUT or SPOT_MANUAL (flags2 bit 0, v0.9.0+: a breathing exercise or
-    similar, not a resting state), or the records in the 30 min before it
-    hold more than 200 steps. The night RHR baseline is the median rhr of the last 28
+    Every SPOT_DAY reading. DECIDED: excluded (no score, no baseline) when
+    its own record has WORKOUT or SPOT_BREATHING (flags2 bit 1, v0.9.0+: a
+    breathing exercise raises RMSSD on purpose), or the records in the 30
+    min before it hold more than 200 steps. A SPOT_MANUAL reading that is
+    not breathing ("check my stress", flags2 bit 0) is scored but never
+    enters a baseline: people press the button when they already feel
+    stressed. The night RHR baseline is the median rhr of the last 28
     qualifying nights that ended before the reading (at least 7). The day
-    baseline is the last 28 days of non-excluded readings with an RMSSD
-    (at least 10); hr_up for each of those is taken against the same night
-    baseline as the reading being scored. z is clamped to +-3.
+    baseline is the last 28 days of scheduled, non-excluded readings with
+    an RMSSD (at least 10); hr_up for each of those is taken against the
+    same night baseline as the reading being scored. z is clamped to +-3.
     """
     readings = [r for r in recs if r["flags"] & F_SPOT_D and r["rest_hr_bpm"] > 0]
     for r in readings:
         before = sum(x["steps"] for x in recs
                      if r["t"] - STRESS_STEPS_WINDOW_S <= x["t"] < r["t"])
-        r["_excluded"] = (bool(r["flags"] & F_WORKOUT) or r.get("spot_manual", False)
+        r["_excluded"] = (bool(r["flags"] & F_WORKOUT) or r.get("spot_breathing", False)
                           or before > STRESS_STEPS_BEFORE)
 
     out = []
@@ -439,6 +447,7 @@ def stress(recs, all_nights):
         item = {"seq": r["seq"], "t": r["t"], "date": day_of(r["t"]).isoformat(),
                 "hour": hour_of(r["t"]), "hr": r["rest_hr_bpm"],
                 "rmssd": r["rest_rmssd_ms"] if r["rest_ok"] else None,
+                "manual": bool(r.get("spot_manual", False)),
                 "excluded": r["_excluded"], "score": None, "band": None,
                 "confidence": None}
         out.append(item)
@@ -448,7 +457,7 @@ def stress(recs, all_nights):
                 if n["qualifies"] and n["end_t"] < r["t"] and n["rhr"] is not None]
         rhrs = rhrs[-BASELINE_NIGHTS:]
         base = [x for x in readings if r["t"] - DAY_BASELINE_DAYS * 86400 <= x["t"] < r["t"]
-                and not x["_excluded"] and x["rest_ok"]]
+                and not x["_excluded"] and x["rest_ok"] and not x.get("spot_manual", False)]
         if len(rhrs) < CALIBRATING_BELOW or len(base) < DAY_BASELINE_MIN:
             continue
         rhr_base = median(rhrs)
@@ -527,6 +536,8 @@ HOT_FLASH_NIGHTS = (10, 20, 30, 40, 41, 42)
 WOKE_NIGHT = 41
 WORKOUT_WEEKDAY = 3         # days with day % 7 == 3 have a 17:00-18:00 workout
 WALK_WEEKDAY = 5            # ...and day % 7 == 5 a 10:30-11:00 walk before a reading
+CHECK_EVERY = 5             # a "check my stress" press at 15:30 on day % 5 == 2
+BREATHING_EVERY = 9         # a breathing exercise at 20:30 on day % 9 == 4
 
 
 def generate(seed=2026):
@@ -605,6 +616,22 @@ def generate(seed=2026):
                  hr_max_bpm=85,
                  temp_c100=int(p["skin"] * 100) - 150 + rng.randint(-10, 10),
                  motion_pct=rng.randint(5, 40))
+        # Manual readings, off the hour so they never meet a scheduled one.
+        if day >= 7 and day % CHECK_EVERY == 2 and m == 15 * 60 + 30:
+            r["flags"] |= F_SPOT_D
+            r["spot_manual"] = True
+            r["steps"] = 0
+            r["rest_hr_bpm"] = int(round(p["rhr"] + 22))      # pressed when tense
+            r["rest_rmssd_ms"] = max(5, int(round(math.exp(p["ln"] - 0.6))))
+            r["rest_beats"] = 160
+        if day >= 7 and day % BREATHING_EVERY == 4 and m == 20 * 60 + 30:
+            r["flags"] |= F_SPOT_D
+            r["spot_manual"] = True
+            r["spot_breathing"] = True
+            r["steps"] = 0
+            r["rest_hr_bpm"] = int(round(p["rhr"] + 2))
+            r["rest_rmssd_ms"] = max(5, int(round(math.exp(p["ln"] + 0.5))))
+            r["rest_beats"] = 160
         # Day readings on the hour, 09:00-17:00; afternoons run stressed.
         if 9 <= m // 60 <= 17 and m % 60 == 0:
             afternoon = m // 60 >= 13
@@ -711,8 +738,22 @@ def selftest():
             (datetime.date.fromisoformat(s["date"]) - d0).days % 7 == WALK_WEEKDAY]
     check(len(walk) == 7 and all(s["excluded"] for s in walk),
           "the 11:00 reading after each of the 7 walks is excluded")
-    check(not any(s["excluded"] for s in st if s not in workout and s not in walk),
+    breathing = [s for s in st if s["hour"] == 20]
+    checks = [s for s in st if s["hour"] == 15 and s["manual"]]
+    check(len(breathing) > 0 and all(s["excluded"] and s["score"] is None for s in breathing),
+          "%d breathing exercises: excluded, never scored" % len(breathing))
+    check(len(checks) > 0 and all(s["score"] is not None and s["band"] in ("elevated", "high")
+                                  for s in checks if not s["excluded"]),
+          "%d 'check my stress' presses are scored, and read stressed" % len(checks))
+    check(not any(s["excluded"] for s in st
+                  if s not in workout and s not in walk and s not in breathing),
           "nothing else is excluded")
+    # Manual readings must not move any scheduled reading's score.
+    plain = [dict(r) for r in records if not r.get("spot_manual")]
+    res2 = analyse([parse_hex(encode_hex(r)) for r in plain])
+    s2 = {s["seq"]: s["score"] for s in res2["stress"]}
+    check(all(s["score"] == s2[s["seq"]] for s in st if not s["manual"]),
+          "manual readings leave every scheduled score unchanged")
     print("selftest: %d failures" % len(fails))
     return not fails
 

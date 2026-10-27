@@ -666,12 +666,18 @@ static ssize_t write_control(struct bt_conn *conn,
 			p[1], p[2] / 10U, p[2] % 10U);
 		break;
 
-	case 0x14:
-		if (control_cbs && control_cbs->spot_now) {
-			control_cbs->spot_now();
+	case 0x14: {
+		uint8_t reason = (len >= 2) ? p[1] : SPOT_REASON_UNSPECIFIED;
+
+		if (reason > SPOT_REASON_BREATHING) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		}
-		LOG_INF("control: spot reading now");
+		if (control_cbs && control_cbs->spot_now) {
+			control_cbs->spot_now(reason);
+		}
+		LOG_INF("control: spot reading now (reason %u)", reason);
 		break;
+	}
 
 	default:
 		LOG_WRN("control: unknown opcode 0x%02x", p[0]);

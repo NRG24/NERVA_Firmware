@@ -89,7 +89,7 @@ def parse_record_v2(raw):
         "temp_rise_c": rise / 10.0,
         "motion_pct": None if motion == 255 else motion,
         "battery_mv": batt * 20, "flags": flags, "hot_flashes": hot,
-        "spot_manual": bool(flags2 & 1),
+        "spot_manual": bool(flags2 & 1), "spot_breathing": bool(flags2 & 2),
         "boot_id": boot, "crc_ok": crc8(raw[:31]) == crc,
     }
 
@@ -179,7 +179,8 @@ async def run(args):
         cols = ["seq", "wall_time", "hr_bpm", "hr_min_bpm", "hr_max_bpm",
                 "rmssd_ms", "rest_hr_bpm", "rest_rmssd_ms", "rest_beats",
                 "steps", "temp_c", "skin_c", "temp_rise_c", "motion_pct",
-                "hot_flashes", "battery_mv", "flags", "boot_id", "crc_ok"]
+                "hot_flashes", "battery_mv", "flags", "spot_manual",
+                "spot_breathing", "boot_id", "crc_ok"]
         with open(name, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(cols)

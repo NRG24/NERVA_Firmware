@@ -55,6 +55,8 @@
  */
 #define HIST_FLAG2_SPOT_MANUAL	BIT(0)	/* the SPOT_DAY reading was asked for
 					 * with opcode 0x14, not scheduled */
+#define HIST_FLAG2_SPOT_BREATHING BIT(1) /* ...for a breathing exercise
+					  * (0x14 02): not a stress reading */
 
 /* "No reading" for the two temperature fields. */
 #define HIST_TEMP_NONE		INT16_MIN

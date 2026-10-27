@@ -213,7 +213,7 @@ struct ble_control_cbs {
 			    uint16_t window_s);
 	/* Hot-flash detection, already range-checked (opcode 0x13). */
 	void (*hot_flash_config)(uint8_t mode, uint8_t rise_c10);
-	void (*spot_now)(void);		/* opcode 0x14 */
+	void (*spot_now)(uint8_t reason);	/* opcode 0x14, SPOT_REASON_* */
 };
 
 /*
@@ -245,6 +245,16 @@ bool ble_is_connected(void);
  * keeps the packet inside the 20 bytes of a default MTU.
  */
 #define BLE_HRM_RR_MAX		8
+
+/*
+ * Why the app asked for a spot reading (opcode 0x14's optional byte,
+ * v0.9.0+). It decides only how the reading is marked in the history: a
+ * breathing exercise raises RMSSD on purpose and must stay out of stress
+ * scoring altogether.
+ */
+#define SPOT_REASON_UNSPECIFIED	0	/* a bare 0x14 */
+#define SPOT_REASON_CHECK	1	/* "check my stress" */
+#define SPOT_REASON_BREATHING	2	/* a breathing exercise */
 void ble_notify_hr(uint16_t bpm, const uint16_t *rr_ms, uint8_t n);
 void ble_notify_battery(uint8_t percent);
 
